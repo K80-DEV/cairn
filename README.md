@@ -73,8 +73,8 @@ CAIRN is licensed under the **GNU AGPL-3.0-or-later** (see `LICENSE`).
 - Free to use, fork, and modify — including running it as a network service
   for others, as long as you keep the source open under the same license.
 - Want to build a **closed-source** product on it? That requires a
-  commercial license. Talk to us: use the contact listed on
-  [github.com/K80-DEV](https://github.com/K80-DEV).
+  commercial license — see [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md)
+  or use the contact listed on [github.com/K80-DEV](https://github.com/K80-DEV).
 
 ## Built with AI assistance
 

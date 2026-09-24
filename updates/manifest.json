@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T05:17:48Z",
-  "version": "0.6j",
+  "released_utc": "2026-09-24T06:22:24Z",
+  "version": "0.6j1",
   "min_allowed_version": "0.6",
-  "nonce": 1,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6j/",
+  "nonce": 2,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6j1/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "86a26164656c55aa29cadcee1f00d071eb95a0626a20f4bc093ec3b6a60a7040",
-      "bytes": 768875
+      "sha256": "78a5f49d0de82989dec701cd06f54759b102da16a97d5217c39ac4be22fb9128",
+      "bytes": 776145
     }
   ],
-  "notes": "CAIRN v0.6j - per-user memory namespaces (0.7 Residents, slice 1). Pre-release build: security audit in progress.",
-  "sig": "mx8egafUWb9HAk/NfXiWItFcuOiN400T0ICJXcIM1y3wj3Y3wEkXryMsX/jqsZ1SlGi78jwL7lp5EjF3JJ0eDQ=="
+  "notes": "CAIRN v0.6j1 - F25 security slice: logs/settings reads owner-scoped, pre-wizard owner-cache poisoning fix, first-boot transport guidance. Also fixes a boot-time schema-migration crash when two daemons start on a fresh database. Pre-release build: security audit in progress.",
+  "sig": "J/DwPqncEWrAwgQuLMiakt2ciC+cbHTSadCwX+fWr3z/MejXn1+6rKzm0d8gk2txOQeHhJBpeRRwdfAhFiakAA=="
 }
