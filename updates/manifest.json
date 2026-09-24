@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "released_utc": "2026-09-24T05:17:48Z",
+  "version": "0.6j",
+  "min_allowed_version": "0.6",
+  "nonce": 1,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6j/",
+  "files": [
+    {
+      "path": "marahome.py",
+      "sha256": "86a26164656c55aa29cadcee1f00d071eb95a0626a20f4bc093ec3b6a60a7040",
+      "bytes": 768875
+    }
+  ],
+  "notes": "CAIRN v0.6j - per-user memory namespaces (0.7 Residents, slice 1). Pre-release build: security audit in progress.",
+  "sig": "mx8egafUWb9HAk/NfXiWItFcuOiN400T0ICJXcIM1y3wj3Y3wEkXryMsX/jqsZ1SlGi78jwL7lp5EjF3JJ0eDQ=="
+}
