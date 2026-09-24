@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T21:44:33Z",
-  "version": "0.6r",
+  "released_utc": "2026-09-24T22:24:45Z",
+  "version": "0.6s",
   "min_allowed_version": "0.6",
-  "nonce": 7,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6r/",
+  "nonce": 8,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6s/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "db54a3a49240d14e463cbe37d67fb69913d78dddbd1bbe9c5d9b72770d68afc9",
-      "size": 913899
+      "sha256": "cd746d77ef8788a1c788fb3afca180b21a55f7ae571ed34024439ddf7ce74f38",
+      "size": 926515
     }
   ],
-  "notes": "v0.6r // BASALT // GHOSTLIGHT: share grants (tools/memory/history, all off by default), approval inbox with ask-sharer flow, 60s presence dead-man (tools pause while the sharer is away); grants always intersect the sharer's live tool ceiling; 276/276 battery points on shipped bytes.",
-  "sig": "fmaiZDdXubfMM1q/fYH2ACvsEYioSN8vWiu0VBuhWeb709IwDZLCLrhRVQj5npbwI/lrRr9y12f6IHnWy7vHBw=="
+  "notes": "v0.6s // BASALT // GHOSTLIGHT: share memory namespace controls (allow_memory gates prompt projection and the memory tool), opt-in include-memories copy at share creation, per-share history box (default OFF: guests see only their latest thread), per-file merge-back review with provenance marks and collision-safe naming; 325/325 forge + 196/196 shipped-byte battery points.",
+  "sig": "JaB2QFUhZ4gEyR4sqXgF1odQfkAN5DGFrc9os592tKWQtXC5VXaDOl2lF9SpPNz7HVv8mZUS/Ajfr0yUBrB0Dw=="
 }
