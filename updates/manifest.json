@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T18:06:50Z",
-  "version": "0.6p",
+  "released_utc": "2026-09-24T21:00:40Z",
+  "version": "0.6q",
   "min_allowed_version": "0.6",
-  "nonce": 5,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6p/",
+  "nonce": 6,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6q/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "6b12878d9ae930089da65f09869a515966ab81315e1cdaff126e6bfe6720ac3a",
-      "bytes": 855662
+      "sha256": "e4ee1a356f029476927766c0f40d9193b37383598de9a3471730e2f2c269d6d8",
+      "bytes": 888044
     }
   ],
-  "notes": "v0.6p 'Ghostlight': house branding restored - Ghostlight is the held build name for the entire Basalt (0.X) series through 1.0; builds are distinguished by version + sha only. Identical feature set to 0.6o (tier scoping with owner-private Tier 0, first-boot personality walkthrough, Connection & TLS modes proxy/local/external with no built-in ACME by design, anonymous TLS + remote-access help pages). Pre-release: LAN-only, security audit in progress.",
-  "sig": "gljL1ciFDJ5RV3KUaZjlyTAPEyShPO29swCYOqlJmNuhH0jz+T1ICVIOCiAPBCZ5EErUEXx/3Dd2oU3T9eDeBw=="
+  "notes": "v0.6q 'GHOSTLIGHT': share clones (S06 core) - create password-protected share links from Settings, each guest session runs as its own isolated principal with pure-chat semantics (zero tools, fenced URL allowlist, per-share rate limits, owner can rotate password, disable, or delete at any time). Build name GHOSTLIGHT is now the held name for the entire BASALT series. 233/233 regression battery points green (boot, tiers, walkthrough, TLS modes, help pages, scrub gate, key-rotation rehearsal, 48-point share battery). Pre-release: LAN-only, security audit in progress.",
+  "sig": "/cATNqN6vVE4a62e9xfoATr/zaLmRTM6aTFLae2zNaMSZixNeHaw2+HDuyxlOaL37+kmf+eio/FnlDsrmg1jCw=="
 }
