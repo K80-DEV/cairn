@@ -43,6 +43,16 @@ python3 marahome.py           # starts on http://0.0.0.0:8470
 # open http://<your-box>:8470 and follow the first-boot wizard
 ```
 
+> **First boot: open it on the machine itself (`http://localhost:8470`) or
+> over HTTPS.** Session cookies carry the `Secure` flag, so browsers keep
+> them only on HTTPS connections or on `localhost`. Loading the app over a
+> plain-HTTP LAN address (e.g. `http://192.168.x.x:8470`) works, but logins
+> will not stick on that transport. Known limitation, fix planned before
+> 1.0; meanwhile either browse on the box itself, or put the daemon behind
+> any TLS terminator you control (a Cloudflare Tunnel, or a two-line Caddy
+> `tls internal`, both do it). Plain HTTP from another device is exactly
+> the transport we are refusing to hand a session token over.
+
 A `.deb` (with systemd unit + unprivileged service user) is the target
 install path for 1.0; manual run above already works on any box with
 Python 3.11+.
