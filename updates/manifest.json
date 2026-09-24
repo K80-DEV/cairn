@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T22:24:45Z",
-  "version": "0.6s",
+  "released_utc": "2026-09-24T23:33:05Z",
+  "version": "0.6t",
   "min_allowed_version": "0.6",
-  "nonce": 8,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6s/",
+  "nonce": 9,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6t/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "cd746d77ef8788a1c788fb3afca180b21a55f7ae571ed34024439ddf7ce74f38",
-      "size": 926515
+      "sha256": "7fd8381c829dd7373b506c461a4f0ff90663061e778f2b97295e9d11ffb90a15",
+      "size": 929233
     }
   ],
-  "notes": "v0.6s // BASALT // GHOSTLIGHT: share memory namespace controls (allow_memory gates prompt projection and the memory tool), opt-in include-memories copy at share creation, per-share history box (default OFF: guests see only their latest thread), per-file merge-back review with provenance marks and collision-safe naming; 325/325 forge + 196/196 shipped-byte battery points.",
-  "sig": "JaB2QFUhZ4gEyR4sqXgF1odQfkAN5DGFrc9os592tKWQtXC5VXaDOl2lF9SpPNz7HVv8mZUS/Ajfr0yUBrB0Dw=="
+  "notes": "v0.6t // BASALT // GHOSTLIGHT: security remediation build (external audit round 7, K80-approved). X: share clone tool ceiling now passes the SEC4 execution fence - a brain-only creator mints chat-only clones. Y: TLS SAN entries reject CR/LF/TAB and require strict hostname shape (openssl ext-file injection closed). N4: registry login refuses share principals with 403. AA: F20 pre-update snapshots prune to the newest 5. 361 forge + 130 shipped-byte battery points; 28-point R11 security battery.",
+  "sig": "lMRxoTkPsvZqDvbLrMOXLaMFPMgxbeih7iIa635GiPYD9djw/MB3j/yeZKiL+SyHZu9ch1kuNBttyuVO89ONAw=="
 }
