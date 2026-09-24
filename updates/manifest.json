@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T15:54:22Z",
-  "version": "0.6n",
+  "released_utc": "2026-09-24T17:44:26Z",
+  "version": "0.6o",
   "min_allowed_version": "0.6",
-  "nonce": 3,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6n/",
+  "nonce": 4,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6o/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "26774c368a3ef580a46c121191807ac22b9095138fbab5f156f8fb5d758a1d5f",
-      "bytes": 809673
+      "sha256": "8b652bb362d56c7b67daeb6b9b6a8deb217b98a738198601f9210103cf0b5217",
+      "bytes": 855649
     }
   ],
-  "notes": "v0.6n 'Cinder' community sync slice: owner identity derived from the instance registry (wizard answer wins; no personal defaults in shipped bytes); bare first-boot identity seed; updater pin = CAIRN master key (ceremony 2026-09-24); Nextcloud host-allowlist fix-forward: an unset suffix no longer matches EVERY host (0.6j/0.6j1 carried an allow-all suffix bug; mitigations held - https-only plus your own stored app password). Pre-release: LAN-only, security audit in progress.",
-  "sig": "Gxyp+FNeBdS4oNprKGX/Mwjb33Jstuj49LOuVpNPyj61QfdNgHKPD4OC+rFBU8IVFnQtGJn22vC+AJ8jUqWcBg=="
+  "notes": "v0.6o 'Clinker': tier scoping (owner-private Tier 0 layer, Q1/Q3 rulings), first-boot personality walkthrough with live agent-name substitution, Connection & TLS settings (proxy / local CA / existing certificate - the daemon never self-issues, no built-in ACME by design), new anonymous help: TLS walkthroughs (Caddy tls internal, certbot, acme.sh) and remote access & firewall (VPN-first guidance). Cookie Secure flag now follows real transport. Pre-release: LAN-only, security audit in progress.",
+  "sig": "2smhtzNOjK2IAbq28xifzT2dOlK7Gp9eQ9V7j92EaFKEbeSJpMm1h3okKpO9UcYMvau9AZtSCQuLFi0Fig9bAQ=="
 }
