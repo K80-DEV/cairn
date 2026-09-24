@@ -46,7 +46,7 @@ python3 marahome.py           # starts on http://0.0.0.0:8470
 > **First boot: open it on the machine itself (`http://localhost:8470`) or
 > over HTTPS.** Session cookies carry the `Secure` flag, so browsers keep
 > them only on HTTPS connections or on `localhost`. Loading the app over a
-> plain-HTTP LAN address (e.g. `http://192.168.x.x:8470`) works, but logins
+> plain-HTTP LAN address (e.g. `http://192.0.2.x:8470`) works, but logins
 > will not stick on that transport. Known limitation, fix planned before
 > 1.0; meanwhile either browse on the box itself, or put the daemon behind
 > any TLS terminator you control (a Cloudflare Tunnel, or a two-line Caddy

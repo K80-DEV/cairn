@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T06:22:24Z",
-  "version": "0.6j1",
+  "released_utc": "2026-09-24T15:54:22Z",
+  "version": "0.6n",
   "min_allowed_version": "0.6",
-  "nonce": 2,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6j1/",
+  "nonce": 3,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6n/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "78a5f49d0de82989dec701cd06f54759b102da16a97d5217c39ac4be22fb9128",
-      "bytes": 776145
+      "sha256": "26774c368a3ef580a46c121191807ac22b9095138fbab5f156f8fb5d758a1d5f",
+      "bytes": 809673
     }
   ],
-  "notes": "CAIRN v0.6j1 - F25 security slice: logs/settings reads owner-scoped, pre-wizard owner-cache poisoning fix, first-boot transport guidance. Also fixes a boot-time schema-migration crash when two daemons start on a fresh database. Pre-release build: security audit in progress.",
-  "sig": "J/DwPqncEWrAwgQuLMiakt2ciC+cbHTSadCwX+fWr3z/MejXn1+6rKzm0d8gk2txOQeHhJBpeRRwdfAhFiakAA=="
+  "notes": "v0.6n 'Cinder' community sync slice: owner identity derived from the instance registry (wizard answer wins; no personal defaults in shipped bytes); bare first-boot identity seed; updater pin = CAIRN master key (ceremony 2026-09-24); Nextcloud host-allowlist fix-forward: an unset suffix no longer matches EVERY host (0.6j/0.6j1 carried an allow-all suffix bug; mitigations held - https-only plus your own stored app password). Pre-release: LAN-only, security audit in progress.",
+  "sig": "Gxyp+FNeBdS4oNprKGX/Mwjb33Jstuj49LOuVpNPyj61QfdNgHKPD4OC+rFBU8IVFnQtGJn22vC+AJ8jUqWcBg=="
 }

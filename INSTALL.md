@@ -13,9 +13,9 @@ release was made with (`updates/manifest.json` in this repo is the *current*
 release; older ones are in the file's git history):
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6j1/marahome.py
+curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6n/marahome.py
 sha256sum marahome.py
-# expected: 78a5f49d0de82989dec701cd06f54759b102da16a97d5217c39ac4be22fb9128 (776145 bytes)
+# expected: 26774c368a3ef580a46c121191807ac22b9095138fbab5f156f8fb5d758a1d5f (809673 bytes)
 ```
 
 The manifest itself is Ed25519-signed; the daemon verifies signatures against
@@ -43,12 +43,12 @@ The updater is **off by default** and **pull-only**.
    `https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/manifest.json`
    (builds from 0.6j1 on know this URL already; only older builds need it
    pasted once).
-4. **Check** → you should see v0.6j1 with its notes. **Download** → it stages
+4. **Check** → you should see v0.6n with its notes. **Download** → it stages
    and verifies sha256 + signature. **Install** → the daemon takes a
    pre-update snapshot, gold-boot-smoke-tests the staged file in a scratch
    environment, swaps, and restarts itself.
 5. Watch the console/journal: the boot line should read
-   `mara-home daemon v0.6j1 ... (sha 96813ad5de64)`.
+   `mara-home daemon v0.6n // Basalt // Cinder ... (sha 26774c368a3e)`.
 6. The next Check should say you are up to date. From 0.6j1 onward, no URL
    pasting needed — the channel is compiled in.
 
