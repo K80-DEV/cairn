@@ -43,12 +43,14 @@ The updater is **off by default** and **pull-only**.
    `https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/manifest.json`
    (builds from 0.6j1 on know this URL already; only older builds need it
    pasted once).
-4. **Check** → you should see v0.6n with its notes. **Download** → it stages
+4. **Check** → the channel's current release should appear, with its notes. **Download** → it stages
    and verifies sha256 + signature. **Install** → the daemon takes a
    pre-update snapshot, gold-boot-smoke-tests the staged file in a scratch
    environment, swaps, and restarts itself.
 5. Watch the console/journal: the boot line should read
-   `mara-home daemon v0.6n // Basalt // Cinder ... (sha 26774c368a3e)`.
+   `mara-home daemon v<new-version> // Basalt // Ghostlight (sha <new-sha>)`.
+   "Ghostlight" is the held build name for the whole Basalt (0.X) series through 1.0;
+   each build differs only by its version letter and sha.
 6. The next Check should say you are up to date. From 0.6j1 onward, no URL
    pasting needed — the channel is compiled in.
 
