@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T17:44:26Z",
-  "version": "0.6o",
+  "released_utc": "2026-09-24T18:06:50Z",
+  "version": "0.6p",
   "min_allowed_version": "0.6",
-  "nonce": 4,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6o/",
+  "nonce": 5,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6p/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "8b652bb362d56c7b67daeb6b9b6a8deb217b98a738198601f9210103cf0b5217",
-      "bytes": 855649
+      "sha256": "6b12878d9ae930089da65f09869a515966ab81315e1cdaff126e6bfe6720ac3a",
+      "bytes": 855662
     }
   ],
-  "notes": "v0.6o 'Clinker': tier scoping (owner-private Tier 0 layer, Q1/Q3 rulings), first-boot personality walkthrough with live agent-name substitution, Connection & TLS settings (proxy / local CA / existing certificate - the daemon never self-issues, no built-in ACME by design), new anonymous help: TLS walkthroughs (Caddy tls internal, certbot, acme.sh) and remote access & firewall (VPN-first guidance). Cookie Secure flag now follows real transport. Pre-release: LAN-only, security audit in progress.",
-  "sig": "2smhtzNOjK2IAbq28xifzT2dOlK7Gp9eQ9V7j92EaFKEbeSJpMm1h3okKpO9UcYMvau9AZtSCQuLFi0Fig9bAQ=="
+  "notes": "v0.6p 'Ghostlight': house branding restored - Ghostlight is the held build name for the entire Basalt (0.X) series through 1.0; builds are distinguished by version + sha only. Identical feature set to 0.6o (tier scoping with owner-private Tier 0, first-boot personality walkthrough, Connection & TLS modes proxy/local/external with no built-in ACME by design, anonymous TLS + remote-access help pages). Pre-release: LAN-only, security audit in progress.",
+  "sig": "gljL1ciFDJ5RV3KUaZjlyTAPEyShPO29swCYOqlJmNuhH0jz+T1ICVIOCiAPBCZ5EErUEXx/3Dd2oU3T9eDeBw=="
 }
