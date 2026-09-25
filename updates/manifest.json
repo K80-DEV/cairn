@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-25T01:45:37Z",
-  "version": "0.6u",
+  "released_utc": "2026-09-25T04:31:55Z",
+  "version": "0.6u2",
   "min_allowed_version": "0.6",
-  "nonce": 11,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6u/",
+  "nonce": 12,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6u2/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "bfbd982c9ee8c29de32a0446c55167c91e9902112053c5dca9a46dc6ee47a3df",
-      "bytes": 942613
+      "sha256": "8b6e5fddde0f4334ed3b2c168664b94f2395f35120db9a11aeeabf876f447165",
+      "bytes": 963124
     }
   ],
-  "notes": "v0.6u // BASALT // GHOSTLIGHT: audit round 8 response + C02/C04 policy build (K80-approved). C02: staff kill-switch disables ALL shares of a user and halts in-flight generation immediately; all share management is sharer-only (non-owners 404); re-enable is sharer-only; staff account-break suspends account + kills sessions + kills shares in one motion. C04: share-safe tool floor - clones can never carry host-global tools (shell/file/credential) even when the sharer is the owner. M22/M23: Shares and Settings page script syntax errors fixed (node --check now gates every shipped script block). M21 over-cap memory merges are refused, never silently truncated. H13: grant revocation evicts stale projections at once. L31: auth-page error handling. L35: /health detail scrubbed for non-owners. 401 forge battery points; 320 battery points on these exact shipped bytes; manifest validator round-trip gate green.",
-  "sig": "/QAW29Dzr5tJlgef0op9N0k0yQzCnOglhSTz5Y6Rw3DO3zQAL+8SIp5E3Hsu1aq4wYDuLDyAUIkxDHzUTB20AQ=="
+  "notes": "v0.6u2 // BASALT // GHOSTLIGHT: audit round 8 H-series response (K80-approved scope: H05/H08/H09/H11/H12/H16/H18) + Nextcloud connector repair (hostnames now DNS-resolved and validated against a configurable allow-suffix, fail-closed; suffix ships empty and is set per-install via the nc_allow_suffix setting). Two JS defects caught by the widened syntax gate: the share guest-chat page script had an unclosed block since v0.6q (the whole page script failed to parse - sending messages from a share link never worked in a browser; fixed), and two esc() helpers had no-op HTML-entity arms (fixed with uncorruptible char-code construction). Gate upgrade: every shipped script block now passes node --check, including runtime-built pages. 439 forge + 233 shipped-byte battery points; manifest validator round-trip gate green. Nonce 12.",
+  "sig": "YXpskiwmNst+L7SnUp/KPEz3A0nyqrMyWPoL+oUXUV3SUJH/t2djNCFIbpTMM1+ceVc3J2HEW7nXuUPY9ZwoBw=="
 }
