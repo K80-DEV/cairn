@@ -7,14 +7,16 @@ keeping the lights on.
 
 > ## ⚠️ PRE-RELEASE — NOT YET FULLY SECURITY AUDITED
 > This build predates completion of the external security-audit process.
-> It has been through nine documented audit rounds (P1-A … P1-H) and every
-> finding to date is fixed and regression-tested — **but the audit is not
-> finished.** Do not expose an instance to the public internet yet. Run it
+> It has been through nine documented audit rounds; many findings from those
+> rounds are fixed and regression-tested, but review is ongoing — **the audit
+> is not finished.** Further hardening is expected before broad exposure. Do not expose an instance to the public internet yet. Run it
 > on your LAN (or behind a tunnel you control), pick strong passwords, and
 > understand that the assistant's tools execute with real local privileges.
 > What this is not: it is not telemetry-free-by-hope — it ships with **zero
-> outbound calls** except the model API *you* configure and an update check
-> that is **opt-in and off by default**.
+> telemetry and no background calls**. Network egress happens only through
+> features *you* configure or invoke: the model API you set up, the update
+> check (**opt-in, off by default**), and web search / fetch / connector /
+> media actions you trigger yourself.
 
 ## What you get
 
@@ -39,19 +41,19 @@ keeping the lights on.
 
 ```bash
 sudo apt install python3 python3-cryptography tesseract-ocr ffmpeg
-python3 marahome.py           # starts on http://0.0.0.0:8470
-# open http://<your-box>:8470 and follow the first-boot wizard
+python3 marahome.py           # listens on http://127.0.0.1:8470 (loopback)
+# open http://localhost:8470 on that machine and follow the first-boot wizard
 ```
 
 > **First boot: open it on the machine itself (`http://localhost:8470`) or
-> over HTTPS.** Session cookies carry the `Secure` flag, so browsers keep
-> them only on HTTPS connections or on `localhost`. Loading the app over a
-> plain-HTTP LAN address (e.g. `http://192.0.2.x:8470`) works, but logins
-> will not stick on that transport. Known limitation, fix planned before
-> 1.0; meanwhile either browse on the box itself, or put the daemon behind
-> any TLS terminator you control (a Cloudflare Tunnel, or a two-line Caddy
-> `tls internal`, both do it). Plain HTTP from another device is exactly
-> the transport we are refusing to hand a session token over.
+> over HTTPS.** The daemon marks session cookies `Secure` when it sees TLS —
+> its own socket, or `X-Forwarded-Proto: https` from a front you control.
+> Loaded over a plain-HTTP LAN address (e.g. `http://192.0.2.x:8470`) logins
+> *do* stick, but the session cookie then crosses your network **in
+> plaintext**; treat that as an explicit trusted-network choice, not a
+> default. Either browse on the box itself, or put the daemon behind any
+> TLS terminator you control (a Cloudflare Tunnel, or a two-line Caddy
+> `tls internal`, both do it).
 
 A `.deb` (with systemd unit + unprivileged service user) is the target
 install path for 1.0; manual run above already works on any box with

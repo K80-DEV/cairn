@@ -13,25 +13,34 @@ release was made with (`updates/manifest.json` in this repo is the *current*
 release; older ones are in the file's git history):
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6n/marahome.py
+curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6v/marahome.py
 sha256sum marahome.py
-# expected: 26774c368a3ef580a46c121191807ac22b9095138fbab5f156f8fb5d758a1d5f (809673 bytes)
+# expected: c6c124c49fb9ceab28ddff2a9607e2a08d392e665d3098120cab3f4177b42a40 (969152 bytes)
 ```
 
 The manifest itself is Ed25519-signed; the daemon verifies signatures against
-a key pinned inside the code, so you never have to trust the transport alone.
+a key pinned inside the code, which catches a tampered manifest. The pin ships
+inside the file you just downloaded, so to close the loop fully, confirm the
+signing key fingerprint over a channel separate from this download.
 
 ## 3. First boot
 ```bash
-python3 marahome.py            # listens on 0.0.0.0:8470
+python3 marahome.py            # listens on 127.0.0.1:8470 (loopback only)
 ```
 Open **http://localhost:8470 on the machine itself** (or behind any TLS you
 control — see README about the Secure-cookie rule) and follow the wizard:
 you will be asked to read and accept what an AI with local tools can do,
 create the owner account, and connect a model.
 
-State lives in `./state/` next to the file. Back it up any time from
-Settings → Backup (password-encrypted, everything included).
+State lives under `$MARA_HOME/state/` (default `/var/lib/cairn/state/`); the
+account registry is `$MARA_REGISTRY` (default `/var/lib/mara/users.db`). Back it
+all up any time from Settings → Backup (password-encrypted, everything included).
+Current builds export authenticated (v2) backup containers. Older v1 files
+carry no integrity signature: current builds verify their structure but
+refuse to restore them, because their provenance cannot be trusted. If you
+hold a v1 backup, restore it on the version that created it and re-export a
+v2 immediately; `--allow-legacy-v1` beside `--import-backup` is the deliberate
+one-off escape hatch for emergencies that accept that risk
 
 ## 4. Testing the updater (if you're here to do that)
 The updater is **off by default** and **pull-only**.
