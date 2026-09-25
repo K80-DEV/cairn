@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-24T23:33:05Z",
+  "released_utc": "2026-09-25T00:22:43Z",
   "version": "0.6t",
   "min_allowed_version": "0.6",
-  "nonce": 9,
+  "nonce": 10,
   "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6t/",
   "files": [
     {
       "path": "marahome.py",
       "sha256": "7fd8381c829dd7373b506c461a4f0ff90663061e778f2b97295e9d11ffb90a15",
-      "size": 929233
+      "bytes": 929233
     }
   ],
-  "notes": "v0.6t // BASALT // GHOSTLIGHT: security remediation build (external audit round 7, K80-approved). X: share clone tool ceiling now passes the SEC4 execution fence - a brain-only creator mints chat-only clones. Y: TLS SAN entries reject CR/LF/TAB and require strict hostname shape (openssl ext-file injection closed). N4: registry login refuses share principals with 403. AA: F20 pre-update snapshots prune to the newest 5. 361 forge + 130 shipped-byte battery points; 28-point R11 security battery.",
-  "sig": "lMRxoTkPsvZqDvbLrMOXLaMFPMgxbeih7iIa635GiPYD9djw/MB3j/yeZKiL+SyHZu9ch1kuNBttyuVO89ONAw=="
+  "notes": "v0.6t // BASALT // GHOSTLIGHT: security remediation build (external audit round 7, K80-approved). X: share clone tool ceiling now passes the SEC4 execution fence - a brain-only creator mints chat-only clones. Y: TLS SAN entries reject CR/LF/TAB and require strict hostname shape (openssl ext-file injection closed). N4: registry login refuses share principals with 403. AA: F20 pre-update snapshots prune to the newest 5. 353 forge + 130 shipped-byte battery points; 28-point R11 security battery.",
+  "sig": "bArjq6u77LlGPCRX54Baxj0v6/vckXbxvamV/fUndzKuXYlSKOBkMqIt+xmho1NFLUcVF4St42YJ3DTpwOF1Aw=="
 }
