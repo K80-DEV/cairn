@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-25T00:22:43Z",
-  "version": "0.6t",
+  "released_utc": "2026-09-25T01:45:37Z",
+  "version": "0.6u",
   "min_allowed_version": "0.6",
-  "nonce": 10,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6t/",
+  "nonce": 11,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6u/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "7fd8381c829dd7373b506c461a4f0ff90663061e778f2b97295e9d11ffb90a15",
-      "bytes": 929233
+      "sha256": "bfbd982c9ee8c29de32a0446c55167c91e9902112053c5dca9a46dc6ee47a3df",
+      "bytes": 942613
     }
   ],
-  "notes": "v0.6t // BASALT // GHOSTLIGHT: security remediation build (external audit round 7, K80-approved). X: share clone tool ceiling now passes the SEC4 execution fence - a brain-only creator mints chat-only clones. Y: TLS SAN entries reject CR/LF/TAB and require strict hostname shape (openssl ext-file injection closed). N4: registry login refuses share principals with 403. AA: F20 pre-update snapshots prune to the newest 5. 353 forge + 130 shipped-byte battery points; 28-point R11 security battery.",
-  "sig": "bArjq6u77LlGPCRX54Baxj0v6/vckXbxvamV/fUndzKuXYlSKOBkMqIt+xmho1NFLUcVF4St42YJ3DTpwOF1Aw=="
+  "notes": "v0.6u // BASALT // GHOSTLIGHT: audit round 8 response + C02/C04 policy build (K80-approved). C02: staff kill-switch disables ALL shares of a user and halts in-flight generation immediately; all share management is sharer-only (non-owners 404); re-enable is sharer-only; staff account-break suspends account + kills sessions + kills shares in one motion. C04: share-safe tool floor - clones can never carry host-global tools (shell/file/credential) even when the sharer is the owner. M22/M23: Shares and Settings page script syntax errors fixed (node --check now gates every shipped script block). M21 over-cap memory merges are refused, never silently truncated. H13: grant revocation evicts stale projections at once. L31: auth-page error handling. L35: /health detail scrubbed for non-owners. 401 forge battery points; 320 battery points on these exact shipped bytes; manifest validator round-trip gate green.",
+  "sig": "/QAW29Dzr5tJlgef0op9N0k0yQzCnOglhSTz5Y6Rw3DO3zQAL+8SIp5E3Hsu1aq4wYDuLDyAUIkxDHzUTB20AQ=="
 }
