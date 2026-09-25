@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-25T04:31:55Z",
-  "version": "0.6u2",
+  "released_utc": "2026-09-25T12:26:46Z",
+  "version": "0.6v",
   "min_allowed_version": "0.6",
-  "nonce": 12,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6u2/",
+  "nonce": 13,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6v/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "8b6e5fddde0f4334ed3b2c168664b94f2395f35120db9a11aeeabf876f447165",
-      "bytes": 963124
+      "sha256": "c6c124c49fb9ceab28ddff2a9607e2a08d392e665d3098120cab3f4177b42a40",
+      "bytes": 969152
     }
   ],
-  "notes": "v0.6u2 // BASALT // GHOSTLIGHT: audit round 8 H-series response (K80-approved scope: H05/H08/H09/H11/H12/H16/H18) + Nextcloud connector repair (hostnames now DNS-resolved and validated against a configurable allow-suffix, fail-closed; suffix ships empty and is set per-install via the nc_allow_suffix setting). Two JS defects caught by the widened syntax gate: the share guest-chat page script had an unclosed block since v0.6q (the whole page script failed to parse - sending messages from a share link never worked in a browser; fixed), and two esc() helpers had no-op HTML-entity arms (fixed with uncorruptible char-code construction). Gate upgrade: every shipped script block now passes node --check, including runtime-built pages. 439 forge + 233 shipped-byte battery points; manifest validator round-trip gate green. Nonce 12.",
-  "sig": "YXpskiwmNst+L7SnUp/KPEz3A0nyqrMyWPoL+oUXUV3SUJH/t2djNCFIbpTMM1+ceVc3J2HEW7nXuUPY9ZwoBw=="
+  "notes": "v0.6v // BASALT // GHOSTLIGHT: C03 per-guest identity for share links. Every share login now mints a fresh server-side guest id stored on the session, and conversations carry the id of the visit that created them. While a share's history grant is OFF (the default), a guest's conversation list, message reads, deletes, exports, stop and stream re-attach are fenced to threads belonging to that guest's own visit; a stale conversation id silently starts a fresh thread instead of touching a stranger's. Turning history ON is explicit consent to a group room: every guest sees and can join every thread of the share, including pre-existing ones. Threads created before this release belong to no visit - visible only with history ON, never attributed by guessing. The recall tool inherits identity from the executing conversation and fails closed when there is no stamp. Evidence: new R23 battery 57 checks green, 439-point regression suite green on forge bytes, 290 points on these exact shipped bytes, JS syntax gate 14/14 by byte-identity with the previously node-checked set. Nonce 13.",
+  "sig": "+ceGFyZBO7UglkbLMxIqu1Zf8WeopO1ja3Ga5hhQ8evrwFOL3r9z67uL7VFx2ruASDktKgyD/wi1boNnHLglAw=="
 }
