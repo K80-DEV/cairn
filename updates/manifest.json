@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-25T12:26:46Z",
-  "version": "0.6v",
+  "released_utc": "2026-09-26T15:13:17Z",
+  "version": "0.6w",
   "min_allowed_version": "0.6",
-  "nonce": 13,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6v/",
+  "nonce": 14,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6w/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "c6c124c49fb9ceab28ddff2a9607e2a08d392e665d3098120cab3f4177b42a40",
-      "bytes": 969152
+      "sha256": "837406e0f0a012dee5dc8837963601a3a493047442d404202b342870cab6d9a7",
+      "bytes": 1077504
     }
   ],
-  "notes": "v0.6v // BASALT // GHOSTLIGHT: C03 per-guest identity for share links. Every share login now mints a fresh server-side guest id stored on the session, and conversations carry the id of the visit that created them. While a share's history grant is OFF (the default), a guest's conversation list, message reads, deletes, exports, stop and stream re-attach are fenced to threads belonging to that guest's own visit; a stale conversation id silently starts a fresh thread instead of touching a stranger's. Turning history ON is explicit consent to a group room: every guest sees and can join every thread of the share, including pre-existing ones. Threads created before this release belong to no visit - visible only with history ON, never attributed by guessing. The recall tool inherits identity from the executing conversation and fails closed when there is no stamp. Evidence: new R23 battery 57 checks green, 439-point regression suite green on forge bytes, 290 points on these exact shipped bytes, JS syntax gate 14/14 by byte-identity with the previously node-checked set. Nonce 13.",
-  "sig": "+ceGFyZBO7UglkbLMxIqu1Zf8WeopO1ja3Ga5hhQ8evrwFOL3r9z67uL7VFx2ruASDktKgyD/wi1boNnHLglAw=="
+  "notes": "v0.6w // BASALT // GHOSTLIGHT (ALPHA): broad hardening pass across the daemon. Per-target system-prompt history buckets; credential-approval previews now show the full frozen canonical request and refuse what cannot be displayed; TLS listeners accept per-connection with a bounded handshake so an idle socket can no longer stall the door; UI base is prefix-agnostic (own slug or none, foreign prefixes 404); community installs activate residents in-daemon; uploads are claimed, quota-charged and stamped before any file write; imports dedupe repeated attachments, charge per reference, and publish in one transaction with rollback; backups can no longer export containers their own verifier refuses, and CLI restore now stages a whole tree and swaps it atomically (replace finally means replace); updater swaps journal first, advance anti-rollback state only after a verified swap, and boot reconciles or discards honestly; update snapshots redact secret settings; revocation is enforced mid-turn; guest identity carries an early conversation announcement, a SQL-scoped list with an index, and no guest id in responses; approval decide+grant is one transaction; first boot welds until an active owner exists with a one-time setup token when bound beyond loopback; per-guest memory layers stay private while share history is off; guests can only demolish their own threads; the log catalog is complete and loud about unknown codes; v1 tokens enforce length with per-IP failure buckets; header-read deadlines and a per-IP concurrency cap blunt slow clients; pinned connections follow resolver order through vetted answers; responses carry X-Frame-Options, CSP frame-ancestors, Referrer-Policy and no-store on /api; local CA gets nameConstraints; passwords get self-service change, owner reset, and a CLI recovery door; and each share can now opt guests out of the sharer's constitution and persona projection independently. Evidence: 40-check regression bed green on these exact bytes, 13-block JS syntax gate, manifest round-trip through the shipped validator with teeth-tested negative controls. Alpha: further hardening is in progress; expect continued fixes before 0.7. Nonce 14.",
+  "sig": "rCgbJnRzIU2bZz8ZeMoqcraHad8MCKF9IQE/7eLmxENjrf/Rk3N7CCkm00xPnqwuKBJZzQuThEl5M/xL/hKZDg=="
 }
