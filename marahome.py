@@ -187,6 +187,19 @@ TIER_TOOLS = {"owner": None, "admin": None, "user": frozenset(("web_search", "we
 # ─── Uploads & attachments (P3.2) ─────────────────────────────────────────────
 UPLOAD_MAX_BYTES = 15 * 1024 * 1024   # 15 MB per file (decoded)
 UPLOAD_BODY_MAX = 24 * 1024 * 1024    # hard JSON body cap (15 MB decodes to ~20 MB b64)
+# V15 (0.6w): the per-file cap above never bounded the SUM of files -
+# repeated 15 MB uploads grew disk without limit. Aggregate quotas, in
+# bytes, env-overridable for tests and small disks; 0 disables a tier.
+def _env_bytes(name, default):
+    try:
+        v = int((os.environ.get(name) or "").strip() or default)
+        return v if v >= 0 else default
+    except (ValueError, TypeError):
+        return default
+USER_UPLOAD_QUOTA = _env_bytes("MARA_USER_UPLOAD_QUOTA_BYTES", 256 * 1024 * 1024)
+GLOBAL_UPLOAD_QUOTA = _env_bytes("MARA_GLOBAL_UPLOAD_QUOTA_BYTES", 2 * 1024 * 1024 * 1024)
+UPLOAD_PENDING_SECS = 600   # V15: reserve expires if the file write never lands
+_QUOTA_GLOBAL = "*"         # sentinel user_quota row: instance-wide used_bytes
 TEXT_INLINE_MAX = 64 * 1024           # text files larger than this become tool pointers
 MAX_ATTACH_PER_MSG = 8
 IMAGE_MIME = {"image/png", "image/jpeg", "image/webp", "image/gif"}
@@ -491,7 +504,7 @@ def _tier_commit(path, text, note, who, pristine_src=None):
     Cache contract (relocation-map canon): every write clears _SP_CACHE via
     reload_identity() or the edit lands invisible."""
     try:
-        _sp_push_history(path.read_text() if path.exists() else "", "pre-" + note)
+        _sp_push_history(path.read_text() if path.exists() else "", "pre-" + note, _sp_hist_dir(path))
         tmp = path.with_suffix(".f26tmp")
         tmp.write_text(text)
         os.chmod(tmp, 0o600)   # tier artifacts are 0600 (P1-I doctrine)
@@ -536,25 +549,72 @@ def _f26_seed_tier_files():
         log.exception("F26: tier seed failed (non-fatal)")
 
 # ─── S4f3: system prompt history / pristine / commit ───────────────────────
-def _sp_push_history(text, note):
-    """Push one full prompt version into the history dir; prune to KEEP.
-    The newest entry is the 'crime scene' for whatever commit follows."""
+def _sp_hist_dir(target_path):
+    """T-A1 (0.6w): per-artifact history bucket. One shared pool let a
+    copy-scoped admin list and reset ANY principal's pre-image, including
+    the owner's Tier-0 text (Q1 break). global base -> 'global'; any tier
+    artifact -> its own house-sanitized stem (tier0 / tier0__x / tier1__y);
+    anything unexpected -> '_unsorted' (its own history, never mixed)."""
     try:
-        SP_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        if target_path is None or Path(target_path) == SYSTEM_PROMPT_PATH:
+            return SP_HISTORY_DIR / "global"
+        stem = Path(target_path).stem
+        if re.fullmatch(r"(tier0|tier0__|tier1__)[A-Za-z0-9-]{0,60}", stem):
+            return SP_HISTORY_DIR / stem
+        return SP_HISTORY_DIR / "_unsorted"
+    except Exception:
+        return SP_HISTORY_DIR / "_unsorted"
+def _sp_hist_bucket(scope, scope_user):
+    """T-A1 (0.6w): reader-side bucket. Computed from the REQUEST SCOPE, never
+    from a resolved file path - a copy-scoped admin whose copy does not exist
+    yet must see an empty own bucket, not the global one."""
+    if scope != "copy":
+        return SP_HISTORY_DIR / "global"
+    if isinstance(scope_user, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{2,31}", scope_user):
+        return SP_HISTORY_DIR / ("tier1__" + scope_user)
+    return SP_HISTORY_DIR / "_unsorted"
+def _sp_history_migrate():
+    """T-A1 (0.6w) one-time boot move: pre-buckets flat entries in the pool
+    root have ambiguous ownership (a 'pre-tier1 copy save' could be ANY
+    user) - they are archived, never served. The owner can read the archive
+    directly; no endpoint will."""
+    try:
+        if not SP_HISTORY_DIR.exists():
+            return
+        legacy = [f for f in SP_HISTORY_DIR.glob("*.md")]
+        if not legacy:
+            return
+        dest = SP_HISTORY_DIR / "legacy-unscoped"
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in legacy:
+            os.replace(f, dest / f.name)
+        log.info("T-A1: archived %d legacy unscoped history entr(ies) to %s", len(legacy), dest.name)
+    except Exception as e:
+        log.warning("T-A1 history migration failed: %s", e)
+def _sp_push_history(text, note, hist_dir=None):
+    """Push one full prompt version into ITS OWN bucket dir; prune to KEEP.
+    The newest entry is the 'crime scene' for whatever commit follows.
+    T-A1: hist_dir required-by-convention; None = 'global' (the S4f3
+    system-prompt surface only)."""
+    hist_dir = hist_dir if hist_dir is not None else (SP_HISTORY_DIR / "global")
+    try:
+        hist_dir.mkdir(parents=True, exist_ok=True)
         sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
         ts = time.strftime("%Y%m%d%H%M%S")
-        (SP_HISTORY_DIR / ("%s-%s-%s.md" % (ts, sha[:8], note))).write_text(text)
-        files = sorted(SP_HISTORY_DIR.glob("*.md"))
+        (hist_dir / ("%s-%s-%s.md" % (ts, sha[:8], note))).write_text(text)
+        files = sorted(hist_dir.glob("*.md"))
         for f in files[:-SP_HISTORY_KEEP] if len(files) > SP_HISTORY_KEEP else []:
             f.unlink()
     except Exception as e:
         log.warning("sp history push failed: %s", e)
 
-def _sp_history_list():
-    """Newest-first history entries (max SP_HISTORY_KEEP)."""
+def _sp_history_list(hist_dir=None):
+    """Newest-first history entries (max SP_HISTORY_KEEP) from ONE bucket.
+    T-A1: no arg = 'global'; endpoints always pass the caller's own bucket."""
+    hist_dir = hist_dir if hist_dir is not None else (SP_HISTORY_DIR / "global")
     out = []
-    if SP_HISTORY_DIR.exists():
-        for f in sorted(SP_HISTORY_DIR.glob("*.md"), reverse=True)[:SP_HISTORY_KEEP]:
+    if hist_dir.exists():
+        for f in sorted(hist_dir.glob("*.md"), reverse=True)[:SP_HISTORY_KEEP]:
             try:
                 stem = f.name[:-3]
                 parts = stem.split("-")
@@ -571,7 +631,7 @@ def _sp_commit(new_text, note, who):
     """Push current to history, atomically write new_text, reload identity."""
     try:
         if SYSTEM_PROMPT_PATH.exists():
-            _sp_push_history(SYSTEM_PROMPT_PATH.read_text(), "pre-" + note)
+            _sp_push_history(SYSTEM_PROMPT_PATH.read_text(), "pre-" + note, _sp_hist_dir(SYSTEM_PROMPT_PATH))
         tmp = SYSTEM_PROMPT_PATH.with_suffix(".tmp")
         tmp.write_text(new_text)
         os.chmod(tmp, 0o644)   # umask 002 scar (S4e): set before replace
@@ -699,9 +759,16 @@ def init_db():
             size INTEGER NOT NULL,
             source TEXT DEFAULT 'file',
             kind TEXT DEFAULT 'binary',
-            ts REAL NOT NULL
+            ts REAL NOT NULL,
+            user_id TEXT,
+            guest_id TEXT,
+            pending_until REAL
         );
         CREATE INDEX IF NOT EXISTS idx_attachments_conv ON attachments(conv_id);
+        CREATE TABLE IF NOT EXISTS user_quota (
+            username TEXT PRIMARY KEY,
+            used_bytes INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS vault (
             username TEXT NOT NULL,
             name TEXT NOT NULL,
@@ -760,6 +827,20 @@ def init_db():
         if "guest_id" not in ccols:
             if _add_col(db, "conversations", "guest_id", "TEXT"):
                 log.info("DB migration: added conversations.guest_id (C03)")
+        # V15 (0.6w): uploader identity + pending lifecycle on attachments.
+        # user_id/guest_id record WHO uploaded (per-visit for share guests);
+        # pending_until marks a reservation whose file write never finalized
+        # (boot hygiene expires those and recomputes quota from disk truth).
+        acols = {r[1] for r in db.execute("PRAGMA table_info(attachments)")}
+        if "user_id" not in acols:
+            if _add_col(db, "attachments", "user_id", "TEXT"):
+                log.info("DB migration: added attachments.user_id (V15)")
+        if "guest_id" not in acols:
+            if _add_col(db, "attachments", "guest_id", "TEXT"):
+                log.info("DB migration: added attachments.guest_id (V15)")
+        if "pending_until" not in acols:
+            if _add_col(db, "attachments", "pending_until", "REAL"):
+                log.info("DB migration: added attachments.pending_until (V15)")
         scols = {r[1] for r in db.execute("PRAGMA table_info(settings)")}
         if "username" not in scols:
             db.execute("CREATE TABLE IF NOT EXISTS settings_new (username TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY (username, key))")
@@ -790,6 +871,7 @@ def init_db():
                          db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
             except Exception as e:
                 log.error("S4f6: FTS5 index creation failed - recall degrades to clean errors: %s", e)
+        _v15_upload_hygiene(db)   # V15: expire unfinished upload reservations, recompute quota
         db.commit()
 
 # ─── API Key ─────────────────────────────────────────────────────────────────
@@ -880,7 +962,7 @@ form.addEventListener("submit", async (e) => {
     const d = await r.json();
     if (r.ok) {
       if (MODE === "signup") { show(d.message || "ok", "ok"); form.reset(); }
-      else { location.href = d.slug ? ("/" + d.slug + "/") : "."; }
+      else { location.href = d.redirect || "."; }  // T-A6: server names a target it serves
     } else {
       show(d.error || "something went wrong", "err");
     }
@@ -1063,7 +1145,13 @@ def share_delete(sh):
                 db.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
                 db.execute("DELETE FROM compactions WHERE conv_id=?", (cid,))
                 try:
+                    # V15: count the bytes, delete the rows, hand the quota
+                    # back - in that order, per conversation.
+                    _w_sz = db.execute(
+                        "SELECT COALESCE(SUM(size),0) FROM attachments WHERE conv_id=?",
+                        (cid,)).fetchone()[0]
                     db.execute("DELETE FROM attachments WHERE conv_id=?", (cid,))
+                    _quota_release(db, principal, _w_sz)
                 except Exception:
                     pass
                 db.execute("DELETE FROM conversations WHERE id=?", (cid,))
@@ -1216,6 +1304,32 @@ def _cancel_runs_for(principals):
     except Exception:
         pass
     return hits
+
+
+def _b19_still_allowed(username, tool_name):
+    """B19/H07: LIVE revocation re-check at every side-effecting tool
+    dispatch. The turn-start tool set is only a snapshot; this consults
+    the registry NOW: status must be active, the role fence must still
+    pass for the current row, and the tool must be in the LIVE effective
+    set (share enablement, presence, grants, per-user disables all flow
+    through effective_tool_names). Fail-closed on any registry error -
+    a dead registry must never become a grant. Cost: one small registry
+    read per tool call; calls are seconds apart, not per token."""
+    if not username or not tool_name:
+        return False
+    try:
+        with _reg_db() as db:
+            row = db.execute("SELECT * FROM users WHERE username=?",
+                             (username,)).fetchone()
+        if row is None or (row["status"] or "") != "active":
+            return False
+        if not allow_tools_for(row):
+            return False
+        return tool_name in effective_tool_names(username)
+    except Exception:
+        return False
+
+
 def _share_presence_touch(owner_username):
     try:
         with _reg_db() as db:
@@ -1314,26 +1428,42 @@ def _share_mem_list(sh):
 def _share_mem_read(sh, name):
     """Review pane: read ONE file inside the share namespace, capped. The
     name is validated here, never trusted from the caller otherwise.
-    M21 (audit round 8, 0.6u): returns (text, truncated). Reads CAP+1
-    characters so truncation is DETECTED not guessed - the merge path
-    refuses truncated files instead of shipping a partial 'success'."""
+    M21 (audit round 8, 0.6u): reads CAP+1 bytes so truncation is DETECTED
+    not guessed - the merge path refuses truncated files instead of
+    shipping a partial 'success'.
+    A8 (round-9): the read opens with O_NOFOLLOW (closes C7's
+    exists/resolve/open symlink TOCTOU: no window remains between a check
+    and the open) and returns the SHA-256 of the exact bytes read, so a
+    merge can be bound to what the owner actually reviewed."""
     d = _share_mem_dir(sh["principal"])
     if d is None or not isinstance(name, str) or "/" in name or ".." in name or not name.endswith(".md"):
-        return None, False
+        return None, False, None
     p = d / name
     try:
-        if not p.exists() or not p.resolve().is_relative_to(d.resolve()):
-            return None, False
-        with p.open("r", errors="replace") as _fh:
-            raw = _fh.read(SHARE_MEM_PREVIEW_CAP + 1)
-        return raw[:SHARE_MEM_PREVIEW_CAP], len(raw) > SHARE_MEM_PREVIEW_CAP
+        fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            buf = b""
+            while len(buf) <= SHARE_MEM_PREVIEW_CAP:
+                b = os.read(fd, SHARE_MEM_PREVIEW_CAP + 1 - len(buf))
+                if not b:
+                    break
+                buf += b
+        finally:
+            os.close(fd)
     except Exception:
-        return None, False
-def _share_mem_merge_back(sh, name, decided_by):
+        return None, False, None
+    digest = hashlib.sha256(buf).hexdigest()
+    text = buf.decode("utf-8", "replace")
+    return text[:SHARE_MEM_PREVIEW_CAP], len(buf) > SHARE_MEM_PREVIEW_CAP, digest
+def _share_mem_merge_back(sh, name, decided_by, digest=""):
     """Per-file human-reviewed merge-back into the OWNER's memory namespace,
     provenance-marked, never overwriting (collision gets a numbered suffix).
-    Returns (dest_name, None) or (None, error)."""
-    content, _trunc = _share_mem_read(sh, name)
+    Returns (dest_name, None) or (None, error).
+    A8 (round-9): the merge is BOUND to the reviewed bytes. The request must
+    carry the digest the review read returned; the file is re-read here under
+    O_NOFOLLOW and refused unless the digest still matches, so bytes
+    overwritten (or swapped) between review and merge can never ship."""
+    content, _trunc, cur = _share_mem_read(sh, name)
     if content is None:
         return None, "file not found in the share's memory"
     if _trunc:
@@ -1341,6 +1471,12 @@ def _share_mem_merge_back(sh, name, decided_by):
         return None, ("refusing to merge: file exceeds the %d-character "
                       "review cap (truncated copies are never merged)"
                       % SHARE_MEM_PREVIEW_CAP)
+    if not isinstance(digest, str) or len(digest) != 64:
+        return None, ("stale review: read the file before merging "
+                      "(merge is bound to the reviewed digest)")
+    if cur != digest:
+        return None, ("refusing to merge: file changed since review - "
+                      "read it again (merge is bound to the reviewed digest)")
     dst_dir = _user_memory_dir(sh["owner"])
     if dst_dir is None:
         return None, "owner namespace unavailable"
@@ -1360,7 +1496,14 @@ def _share_mem_merge_back(sh, name, decided_by):
     try:
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst_dir.chmod(0o700)
-        dest.write_text(prov + content)
+        # A8: O_CREAT|O_EXCL 0600 - the destination is created exactly once,
+        # never clobbers anything, and closes the exists()/write race on the
+        # numbered-collision path.
+        fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, (prov + content).encode("utf-8"))
+        finally:
+            os.close(fd)
     except Exception as e:
         return None, "write failed: %s" % e
     reload_identity()
@@ -1400,14 +1543,15 @@ def _share_memories_api_post(h):
     action = body.get("action")
     name = str(body.get("name") or "")
     if action == "read":
-        c, _tr = _share_mem_read(sh, name)
+        c, _tr, _dig = _share_mem_read(sh, name)
         if c is None:
             h._json(404, {"error": "not found"})
             return
-        h._json(200, {"name": name, "content": c, "truncated": _tr})
+        h._json(200, {"name": name, "content": c, "truncated": _tr, "digest": _dig})
         return
     if action == "merge":
-        dest, err = _share_mem_merge_back(sh, name, u["username"])
+        dest, err = _share_mem_merge_back(sh, name, u["username"],
+                                          str(body.get("digest") or ""))
         if err:
             h._json(400, {"error": err})
             return
@@ -1850,8 +1994,10 @@ def _share_pw_page(sh):
             "Enter the password they sent you.</p>"
             "<input id='pw' type='password' placeholder='share password' autocomplete='current-password'>"
             "<p><button id='go'>Enter</button> <span id='err' class='hint'></span></p></div>"
-            "<p class='hint'>This is a share: the agent here starts as chat-only and cannot see the sharer's "
-            "private chats, memories, or files. Any tools are the sharer's choice and "
+            "<p class='hint'>This is a share: the agent here starts as chat-only and cannot reach the sharer's "
+            "live chats, files, or memory - it works from copies of whatever the sharer chose to "
+            "include (persona, working directions, and memory only if the share enables it). Assume "
+            "anything included can be recited back to guests. Any tools are the sharer's choice and "
             "pause while the sharer is away. The sharer can close this share at any time.</p>"
             "<script>const SID='__SID__';const b=document.getElementById('go'),e=document.getElementById('err'),"
             "p=document.getElementById('pw');"
@@ -1939,7 +2085,7 @@ Keeping THIS tab open is also what keeps granted tools alive - step away over a 
 <div id="pwcard" class="card"><b>Share password (this is the only time it is shown)</b>
 <p class="mono" id="pwtext"></p><button id="pwcopy">Copy</button> <span class="hint" id="pwurl"></span></div>
 <div id="memcard" class="card" style="display:none"><b>Clone memories: <span id="mlabel"></span></b>
-<p class="hint">This is what <i>this clone</i> learned inside its own private memory namespace - never your memory, never another share's. Nothing merges automatically: review a file, then merge it back if it is worth keeping. Merged files are marked with their provenance in your own memory.</p>
+<p class="hint">This is what <i>this clone</i> learned inside its own private memory namespace - never your memory, never another share's. Nothing merges automatically: review a file, then merge it back if it is worth keeping. A merge is bound to the bytes you just read - if the file changed after you read it, the merge refuses and you must read it again. Merged files are marked with their provenance in your own memory.</p>
 <div id="mfiles"><p class="hint">No memory files in this share yet.</p></div>
 <pre id="mpane" class="mono" style="display:none;white-space:pre-wrap;max-height:340px;overflow:auto"></pre></div><div id="grantscard" class="card"><b>Grants: <span id="glabel"></span> <span class="hint" id="gtoolsstate"></span></b>
 <p><label><input type="checkbox" id="g_tools"> allow tools in this share</label> &nbsp;
@@ -1996,7 +2142,7 @@ document.getElementById("g_save").addEventListener("click",function(){if(!curGra
   allow_memory:document.getElementById("g_memory").checked,allow_history:document.getElementById("g_history").checked,tools:tools})
  .then(function(d){if(!d)return;document.getElementById("g_status").textContent="saved";
   document.getElementById("grantscard").style.display="none";curGrants=null;load()})});
-var curMem=null;
+var curMem=null;var memD={};
 function loadMem(s){curMem=s;document.getElementById("memcard").style.display="block";
  document.getElementById("mlabel").textContent=s.label;
  document.getElementById("mpane").style.display="none";
@@ -2008,10 +2154,10 @@ function loadMem(s){curMem=s;document.getElementById("memcard").style.display="b
    h+='<p><button data-n="'+esc(f.name)+'" data-act="read">Read</button> <button data-n="'+esc(f.name)+'" data-act="merge">Merge back</button> <span class="mono">'+esc(f.name)+'</span> <span class="hint">'+f.size+' bytes, '+ago(f.mtime)+'</span></p>'}
   box.innerHTML=h;var bs=box.querySelectorAll("button");for(var j=0;j<bs.length;j++){bs[j].addEventListener("click",function(){
    var n=this.getAttribute("data-n"),a=this.getAttribute("data-act");
-   if(a==="read"){post("/api/share-memories",{action:"read",id:curMem.id,name:n}).then(function(r){if(!r)return;
+   if(a==="read"){post("/api/share-memories",{action:"read",id:curMem.id,name:n}).then(function(r){if(!r)return;memD[n]=r.digest;
      var p=document.getElementById("mpane");p.textContent=r.content;p.style.display="block";})}
    else{if(!confirm("Copy this file INTO your own memory? It will be marked as learned during a share - and the clone keeps its own copy."))return;
-    post("/api/share-memories",{action:"merge",id:curMem.id,name:n}).then(function(r){if(r){alert("Merged as "+r.merged_as);loadMem(curMem)}})}})}})}function load(){fetch("/api/shares",{credentials:"same-origin"}).then(function(r){return r.json().catch(function(){return []})}).then(function(r){
+    post("/api/share-memories",{action:"merge",id:curMem.id,name:n,digest:(memD[n]||"")}).then(function(r){if(r){alert("Merged as "+r.merged_as);loadMem(curMem)}})}})}})}function load(){fetch("/api/shares",{credentials:"same-origin"}).then(function(r){return r.json().catch(function(){return []})}).then(function(r){
  rows.innerHTML="";for(var k=0;k<(r||[]).length;k++){(function(s){var tr=document.createElement("tr");
  tr.innerHTML="<td>"+esc(s.label)+"</td><td>"+esc(s.owner)+"</td><td class='mono'>"+location.origin+"/share/"+s.id+"</td><td>"+
  (s.alive?(s.enabled?"open":"disabled"):"closed")+"</td><td>"+esc(grantSummary(s))+"</td><td>"+fmt(s.expires_at)+"</td><td></td>";
@@ -2796,24 +2942,45 @@ def vault_use(username, name, use_fn):
         raise RuntimeError("refused: use_fn result contained the vault secret (leak-guard)")
     return result
 
-def _nc_host_allowed(host, username=None):
+def _nc_vet_dial_ip(host, username=None):
+    """V04 (v-report): resolve ONCE and return the vetted dial IP for this
+    host, or None to refuse (fail closed). The old _nc_host_allowed answered
+    True and threw the answers away; urllib then resolved AGAIN when the
+    credentialed connection was made - a TTL-0 DNS actor could flip the
+    answer between check and dial. The connector now dials THIS ip (custom
+    pinned connection in _nc_opener); SNI, Host and certificate checks stay
+    on the hostname. V-report's preferred shape is honored too: the optional
+    per-user "nc_ip_pin" setting skips DNS entirely (trusted origin/IP
+    mapping - this is usually a stable home service).
+    Posture is UNCHANGED from 0.6u2: suffix-matched hosts may dial public or
+    private space; everything else is private/loopback-only, never link-local.
+    One deliberate tightening: link-local/multicast/reserved answers are now
+    refused on the suffix path too (0.6u2 only nailed them on the non-suffix
+    path; a suffix zone answering 169.254.x.x is a rebinding, not a cloud)."""
     h = (host or "").lower().rstrip(".")
     # 0.6n HARDENING (Mara 2026-09-24): an UNSET suffix must NOT wildcard -
     # "".endswith("") is True for every host, so 0.6j/0.6j1 community builds
     # allowed ANY https nc_url despite the error text claiming private-space.
     # Fixed forward: empty suffix now fails closed to RFC1918/loopback only.
-    # 0.6u2 NC-FIX (Mara 2026-09-25): the suffix is now the per-user setting
-    # "nc_allow_suffix" (the CAIRN_NC_ALLOW_SUFFIX env value is its default), the
-    # suffix match is dot-boundary exact (suffix example.com no longer matches
-    # evilexample.com), and hostnames that miss the suffix are DNS-resolved and
-    # accepted ONLY if every answer is private/loopback (resolve-then-check, the
-    # same pattern _f20_guard uses for the updater channel; DNS-rebinding TOCTOU
-    # is the documented residual there, identical posture here).
+    # 0.6u2 NC-FIX (Mara 2026-09-25): the suffix is the per-user setting
+    # "nc_allow_suffix" (the CAIRN_NC_ALLOW_SUFFIX env value is its default),
+    # the suffix match is dot-boundary exact (suffix example.com no longer
+    # matches evilexample.com).
     suf = (get_setting("nc_allow_suffix", NC_ALLOW_SUFFIX, username) or "").strip().lower()
-    if suf:
-        s = suf.lstrip(".")
-        if s and (h == s or h.endswith("." + s)):
-            return True
+    s = suf.lstrip(".")
+    matched = bool(s) and (h == s or h.endswith("." + s))
+    # nc_ip_pin (V04 "prefer explicit mapping" clause): garbage or door-
+    # adjacent pins refuse; a PUBLIC pin still requires the suffix posture.
+    pin = (get_setting("nc_ip_pin", "", username) or "").strip()
+    if pin:
+        try:
+            pip = _nc_ip.ip_address(pin)
+        except ValueError:
+            return None
+        if (pip.is_link_local or pip.is_multicast or pip.is_unspecified
+                or pip.is_reserved or (pip.is_global and not matched)):
+            return None
+        return str(pip)
     try:
         ip = _nc_ip.ip_address(h)
     except ValueError:
@@ -2822,21 +2989,31 @@ def _nc_host_allowed(host, username=None):
         # link-local IS is_private in Python's ipaddress module - nail the
         # metadata door shut explicitly, same stance as _f20_guard (0.6u2).
         if ip.is_link_local:
-            return False
-        return bool(ip.is_private or ip.is_loopback)
-    # hostname, not an IP literal, suffix missed: resolve-then-check, fail closed.
+            return None
+        return str(ip) if (ip.is_private or ip.is_loopback) else None
+    if not h:
+        return None
+    # hostname, not an IP literal: resolve ONCE here, vet every answer, and
+    # hand the caller the single dial IP - the socket never re-resolves.
     try:
         infos = _nc_sock.getaddrinfo(h, None)
     except Exception:
-        return False
+        return None
     answers = []
     for ai in infos:
         try:
-            answers.append(_nc_ip.ip_address(ai[4][0]))
+            a = _nc_ip.ip_address(ai[4][0])
         except ValueError:
-            return False
-    return bool(answers) and all((a.is_private or a.is_loopback) and not a.is_link_local
-                                 for a in answers)
+            return None
+        if (a.is_link_local or a.is_multicast or a.is_unspecified
+                or a.is_reserved):
+            return None
+        answers.append(a)
+    if not answers:
+        return None
+    if not matched and not all(a.is_private or a.is_loopback for a in answers):
+        return None
+    return str(sorted(answers, key=str)[0])
 
 def _nc_cfg(username):
     url = (get_setting("nc_url", "", username) or "").rstrip("/")
@@ -2847,11 +3024,13 @@ def _nc_cfg(username):
     if not url.startswith("https://"):
         return None, "Error: nc_url must start with https:// - plain http would carry the app password in the clear"
     host = _nc_up.urlsplit(url).hostname or ""
-    if not _nc_host_allowed(host, username):
+    dial_ip = _nc_vet_dial_ip(host, username)   # V04: ONE vetted resolution
+    if dial_ip is None:
         return None, ("Error: nc_url host %r is outside the allowed private space "
-                      "(needs nc_allow_suffix match, a private IP literal, or a "
-                      "hostname that resolves to private/loopback addresses only)" % host)
-    return (url, user), None
+                      "(needs nc_allow_suffix match, a private IP literal, a "
+                      "hostname that resolves to private/loopback addresses only, "
+                      "or a vetted nc_ip_pin mapping)" % host)
+    return (url, user, dial_ip), None
 
 def _nc_clean_path(p):
     """Normalize a user-supplied relative path. Reject traversal, absolute
@@ -2903,7 +3082,7 @@ def _p1h_pub_slug(slug):
     return ""
 # P1-H helpers END
 def _nc_dav_request(cfg, secret, method, rel, body=None, headers=None):
-    url, ncuser = cfg
+    url, ncuser, dial_ip = cfg   # V04: dial_ip is the vetted single resolution
     full = "%s/remote.php/dav/files/%s/%s" % (url, _nc_up.quote(ncuser), _nc_up.quote(rel, safe="/"))
     auth = "Basic " + base64.b64encode((ncuser + ":" + secret).encode("utf-8")).decode("ascii")
     req = _nc_ur.Request(full, data=body, method=method)
@@ -2912,7 +3091,7 @@ def _nc_dav_request(cfg, secret, method, rel, body=None, headers=None):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with _nc_opener().open(req, timeout=NC_TIMEOUT) as r:   # P1-G/S
+        with _nc_opener(dial_ip).open(req, timeout=NC_TIMEOUT) as r:   # P1-G/S + V04
             return r.status, _p1h_read(r, _P1H_CONNECTOR_BODY_CAP, "Nextcloud DAV")  # P1-H/W
     except _nc_uerr.HTTPError as e:
         # PROPFIND answers with 207 Multi-Status - success, not an error.
@@ -4352,6 +4531,68 @@ def _run_with_secret(username, args):
     except RuntimeError as e:
         return "Error: %s" % e
 
+CRED_ARGS_ALLOWED = {
+    "ssh_run": frozenset(("host", "user", "port", "key_name", "command", "timeout")),
+    "run_with_secret": frozenset(("command", "secrets", "secret_name", "env_var", "timeout")),
+}
+CRED_PREVIEW_MAX = 2600   # T-A2 (0.6w): the owner must see EVERY byte they approve
+def _p1i_cred_canon(name, clean):
+    """T-A2 (0.6w, R9 A2 / V-report V02): freeze ONE canonical argument
+    object BEFORE the record exists. Rejects keys no executor reads, mirrors
+    _run_with_secret's legacy secret_name/env_var branch into secrets[], and
+    pre-validates shapes the executor validates - so the frozen JSON the
+    owner reads IS the argument set that runs. Returns error text or None.
+    Mirrors verified line-by-line against _run_with_secret / _ssh_run."""
+    allowed = CRED_ARGS_ALLOWED.get(name)
+    if allowed is None:
+        return "Error: no argument canon for tool %r" % name
+    unknown = sorted(k for k in clean if k not in allowed)
+    if unknown:
+        return ("Error: unknown argument key(s) " + ", ".join(repr(str(k))[:40] for k in unknown)
+                + " for " + name + " (allowed: " + ", ".join(sorted(allowed)) + ")")
+    if name == "run_with_secret":
+        if clean.get("secrets") is None and clean.get("secret_name"):
+            _ev = clean.get("env_var") or "SECRET"
+            if not re.fullmatch(_CS_ENV_RE, str(_ev)):
+                return "Error: env_var name must be [A-Z][A-Z0-9_] - got %r" % (str(_ev)[:40],)
+            clean["secrets"] = [{"vault": clean.get("secret_name"), "env": _ev}]
+        for k in ("secret_name", "env_var"):
+            clean.pop(k, None)
+        if not str(clean.get("command") or "").strip():
+            return "Error: run_with_secret needs a command (it runs with the same privileges as shell)"
+        wants = clean.get("secrets")
+        if wants is None:
+            wants = []
+        if not isinstance(wants, list) or len(wants) > CS_SECRET_MAX:
+            return "Error: run_with_secret takes at most %d secrets" % CS_SECRET_MAX
+        for w in wants:
+            if not isinstance(w, dict):
+                return "Error: each secrets entry must be {vault, env}"
+            if not str(w.get("vault") or "").strip():
+                return "Error: each secrets entry needs a vault entry name"
+            _we = str(w.get("env") or "SECRET")
+            if not re.fullmatch(_CS_ENV_RE, _we):
+                return "Error: env var name must be [A-Z][A-Z0-9_] - got %r" % (_we[:40],)
+    else:  # ssh_run
+        if not str(clean.get("host") or "").strip():
+            return "Error: ssh_run needs a plain host"
+        if not str(clean.get("command") or "").strip():
+            return "Error: ssh_run needs a command to run on the host"
+        if not str(clean.get("key_name") or "").strip():
+            return "Error: ssh_run needs key_name - the vault entry holding the private key"
+        try:
+            int(clean.get("port") or 22)
+        except (TypeError, ValueError):
+            return "Error: ssh_run port must be 1-65535"
+    tv = clean.get("timeout")
+    if tv is not None:
+        try:
+            n = int(str(tv).strip())
+        except (TypeError, ValueError):
+            return "Error: timeout must be an integer number of seconds"
+        if not (5 <= n <= CS_TIMEOUT_MAX):
+            return "Error: timeout must be 5-%d seconds" % CS_TIMEOUT_MAX
+    return None
 def execute_cred_tool(name, args, username):
     if username is None:
         return "Error: no user context for credential call"
@@ -4524,6 +4765,116 @@ def _p1i_claim_conv(cid_in, uname, guest_id=None, enforce_guest=False):
                 return ("ok", cid_in)
         except sqlite3.Error:
             return ("bad", "")
+# ─── V15 (0.6w): upload quota ledger + boot hygiene ─────────────────────────
+# Reservations are accounted in user_quota: one row per principal plus the
+# _QUOTA_GLOBAL sentinel. Reserve happens INSIDE a BEGIN IMMEDIATE txn so
+# the check and the increment are one write decision - two parallel uploads
+# at the exact cap cannot both pass (SQLite serializes writers). Deletes
+# release; a boot reconcile recomputes everything from the attachment rows
+# that survived, so quota follows disk truth across crashes, not drift.
+class QuotaExceeded(Exception):
+    pass
+def _quota_reserve(db, actor, nbytes):
+    """Reserve nbytes for actor. Caller MUST hold an open BEGIN IMMEDIATE
+    txn and roll back when this raises."""
+    for who, cap in ((actor, USER_UPLOAD_QUOTA), (_QUOTA_GLOBAL, GLOBAL_UPLOAD_QUOTA)):
+        if cap <= 0:
+            continue
+        row = db.execute("SELECT used_bytes FROM user_quota WHERE username=?",
+                         (who,)).fetchone()
+        used = row[0] if row else 0
+        if used + nbytes > cap:
+            raise QuotaExceeded(
+                "upload quota exceeded for this account"
+                if who != _QUOTA_GLOBAL else "instance-wide upload quota exceeded")
+        db.execute(
+            "INSERT INTO user_quota(username, used_bytes) VALUES(?, MAX(0,?)) "
+            "ON CONFLICT(username) DO UPDATE SET used_bytes=MAX(0, used_bytes+?)",
+            (who, nbytes, nbytes))
+def _quota_release(db, actor, nbytes):
+    """Give bytes back (delete, or a rolled-back upload). Clamped at zero;
+    a missing row is created at zero, never an error."""
+    if nbytes <= 0:
+        return
+    for who in (actor, _QUOTA_GLOBAL):
+        if not who:
+            continue
+        db.execute(
+            "INSERT INTO user_quota(username, used_bytes) VALUES(?, 0) "
+            "ON CONFLICT(username) DO UPDATE SET used_bytes=MAX(0, used_bytes-?)",
+            (who, nbytes))
+def _v15_upload_hygiene(db):
+    """Boot pass (init_db): expire pending reservations whose write never
+    finalized, then recompute user_quota from surviving attachment rows."""
+    try:
+        stale = db.execute(
+            "SELECT id, conv_id, stored_name FROM attachments"
+            " WHERE pending_until IS NOT NULL AND pending_until < ?",
+            (time.time(),)).fetchall()
+        for r in stale:
+            try:
+                p = (UPLOADS_DIR / r[1] / r[2]).resolve()
+                if UPLOADS_DIR.resolve() in p.parents:
+                    p.unlink(missing_ok=True)
+            except (OSError, TypeError, ValueError):
+                pass
+            db.execute("DELETE FROM attachments WHERE id=?", (r[0],))
+        if stale:
+            log.info("V15: expired %d unfinished upload reservation(s)", len(stale))
+        db.execute("DELETE FROM user_quota")
+        db.execute(
+            "INSERT INTO user_quota(username, used_bytes)"
+            " SELECT COALESCE(a.user_id, c.user_id), SUM(a.size)"
+            " FROM attachments a LEFT JOIN conversations c ON c.id = a.conv_id"
+            " WHERE COALESCE(a.user_id, c.user_id) IS NOT NULL"
+            " GROUP BY COALESCE(a.user_id, c.user_id)")
+        db.execute(
+            "INSERT OR REPLACE INTO user_quota(username, used_bytes) VALUES(?,?)",
+            (_QUOTA_GLOBAL,
+             db.execute("SELECT COALESCE(SUM(size),0) FROM attachments").fetchone()[0]))
+        _v15_orphan_upload_dirs(db)   # A5/M29 fold: reaper
+    except sqlite3.Error as e:
+        log.error("V15 upload hygiene failed (quota recomputed next boot): %s", e)
+
+def _v15_orphan_upload_dirs(db):
+    """A5/M29 (round-9): uploads/<cid>/ dirs whose conversation row does not
+    exist (crash, aborted import, deleted-then-recreated races) had no reaper
+    - imports made them easy to mint. A dir is pruned only when NO attachment
+    row references the cid (live or pending) and its mtime is older than the
+    pending window, so a claim-in-flight dir is never touched. Best-effort
+    per entry; never fails the boot pass."""
+    try:
+        known = set()
+        for col in ("id",):
+            for r in db.execute("SELECT id FROM conversations"):
+                known.add(str(r[0]))
+        refd = set()
+        for r in db.execute("SELECT DISTINCT conv_id FROM attachments"):
+            if r[0]:
+                refd.add(str(r[0]))
+        grace = time.time() - max(UPLOAD_PENDING_SECS, 60)
+        pruned = 0
+        try:
+            entries = sorted(UPLOADS_DIR.iterdir())
+        except OSError:
+            return
+        for p in entries:
+            try:
+                if not p.is_dir() or not p.is_relative_to(UPLOADS_DIR):
+                    continue
+                cid = p.name
+                if cid in known or cid in refd:
+                    continue
+                if p.stat().st_mtime > grace:
+                    continue
+                shutil.rmtree(p)
+                pruned += 1
+            except OSError:
+                continue
+        if pruned:
+            log.info("A5/M29: pruned %d orphan uploads/ dir(s)", pruned)
+    except sqlite3.Error as e:
+        log.warning("A5 orphan-dir scan skipped: %s", e)
 
 def _f21_conv_override(conv_id):
     """F21: read-time validation of the stored per-chat override. Corrupt,
@@ -4697,16 +5048,22 @@ def execute_cred_tool_gated(name, args, username):
             # H05: canonical freeze BEFORE the record exists. Over-large or
             # non-canonical payloads never become an approval at all.
             clean = {k: v for k, v in args.items() if k != "confirm"}
+            # T-A2 (0.6w): canonicalize first - legacy secret shapes folded
+            # into secrets[], keys no executor reads refused at request time.
+            _cerr = _p1i_cred_canon(name, clean)
+            if _cerr:
+                return _cerr
             try:
                 _raw = json.dumps({"tool": name, "args": clean}, sort_keys=True,
                                   separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             except (TypeError, ValueError):
                 return ("Error: approval request arguments are not JSON-canonical "
                         "(refused; do not retry with the same payload)")
-            if len(_raw) > 8192:
-                return ("Error: approval payload too large (" + str(len(_raw)) +
-                        " > 8192 canonical bytes). Shrink the command; the freeze "
-                        "cap exists so the owner can review EVERY byte, not a prefix.")
+            if len(_raw) > CRED_PREVIEW_MAX:
+                return ("Error: approval request too large to review completely ("
+                        + str(len(_raw)) + " > " + str(CRED_PREVIEW_MAX)
+                        + " canonical bytes). Shrink the command: the owner must "
+                        "see EVERY byte they approve - no preview, no approval.")
             _pend = 0
             for _v in _APPROVALS.values():
                 if _v.get("user") == username and not _v.get("approved"):
@@ -4720,16 +5077,11 @@ def execute_cred_tool_gated(name, args, username):
                 "tool": name, "user": username, "ts": now, "approved": False,
                 "args": clean,
                 "digest": hashlib.sha256(_raw).hexdigest(),
-                "preview": json.dumps({
-                    "host": _p1i_preview(clean.get("host")),
-                    "user": _p1i_preview(clean.get("user")),
-                    "port": clean.get("port"),
-                    "key_name": _p1i_preview(clean.get("key_name")),
-                    "command": _p1i_preview(clean.get("command")),
-                    "secrets": [{"vault": _p1i_preview((w or {}).get("vault") if isinstance(w, dict) else w),
-                                 "env": _p1i_preview((w or {}).get("env") if isinstance(w, dict) else "")}
-                                for w in (clean.get("secrets") or [])][:4],
-                })[:2600]}
+                # T-A2 (0.6w): preview == the FULL frozen canonical JSON.
+                # The old field-list preview truncated commands, dropped
+                # timeout, and ignored the legacy secret shape entirely.
+                "preview": _raw.decode("utf-8")
+                }
             log_event(username, "credshell.approval.requested",
                       tool=name, approval=aid, digest=_APPROVALS[aid]["digest"][:16])
             return ("Error: PENDING OWNER APPROVAL. " + name +
@@ -5930,6 +6282,13 @@ F22_PART_AAD_USER = "cairn-backup" # CV1 AAD namespace: backup parts can never
                                    # be mistaken for vault rows or vice versa
 F22_FILE_CAP = 32 * 1024 * 1024    # per-file cap inside identity/uploads walks
 F22_IMPORT_MAX_BYTES = 64 * 1024 * 1024  # decoded container size ceiling
+F22_MAINT_MAX_BYTES = 1024 * 1024 * 1024  # A4 (round-9): CLI maintenance
+                                   # ceiling ONLY - no HTTP path ever sees it.
+                                   # Deliberately finite, not literal infinite:
+                                   # export/verify hold parts in RAM. The API
+                                   # export refuses at F22_IMPORT_MAX_BYTES,
+                                   # symmetric with every restore path that
+                                   # would accept an API-sized container.
 
 def _f22_vkey(s):
     # '0.5u' -> (0, 5, 'u') for downgrade comparison; junk -> (0,0,'') (oldest).
@@ -6069,9 +6428,14 @@ def _f22_mac_key(password, salt_bytes):
 def _f22_canon(obj):
     return json.dumps(obj, sort_keys=True, ensure_ascii=True,
                       separators=(",", ":")).encode("utf-8")
-def f22_export(password, include_uploads=True):
+def f22_export(password, include_uploads=True, max_total=F22_IMPORT_MAX_BYTES):
     """Build the whole-box encrypted container. Returns (text, stats dict).
-    Raises ValueError on precondition failure (never a partial file)."""
+    Raises ValueError on precondition failure (never a partial file).
+    A4 (round-9): max_total is the DECODED ceiling this container must fit
+    under to be restorable - by default the very ceiling every restore path
+    enforces in f22_verify (symmetric, so export can NEVER again print
+    success over a box nothing can restore). CLI maintenance passes
+    F22_MAINT_MAX_BYTES."""
     import json as _f22_json
     if not VAULT_CRYPTO_OK:
         raise ValueError("cryptography package missing - refusing to fake an encrypted backup")
@@ -6092,6 +6456,22 @@ def f22_export(password, include_uploads=True):
         _w, _sk = _f22_walk_dir(UPLOADS_DIR, "uploads"); plain.update(_w); _walk_skipped += _sk
     reseal_bytes, n_sealed, n_skipped = _f22_vault_reseal()
     plain["part/vault-resealed.json"] = reseal_bytes
+    # A4 (round-9): refuse HERE, before sealing, what verify would refuse
+    # later. The old asymmetry - export uncapped, verify capped at 64 MiB -
+    # let a >64 MiB box export "successfully" into a container that EVERY
+    # restore path (HTTP + CLI) rejects. A backup you cannot restore is
+    # worse than no backup.
+    _a4_total = 0
+    for _a4_pid in plain:
+        _a4_total += len(plain[_a4_pid])
+        if _a4_total > max_total:
+            plain.clear()
+            raise ValueError(
+                "backup would expand past the %d MiB restore ceiling - trim "
+                "uploads, export without uploads, or run the CLI "
+                "--export-backup (maintenance ceiling %d MiB). A backup you "
+                "can never restore is worse than no backup."
+                % (max_total // 1048576, F22_MAINT_MAX_BYTES // 1048576))
     parts_meta = []
     enc_parts = {}
     for pid in sorted(plain.keys()):
@@ -6130,11 +6510,13 @@ def f22_export(password, include_uploads=True):
              "uploads": bool(include_uploads)}
     return text, stats
 
-def f22_verify(text, password):
+def f22_verify(text, password, max_bytes=F22_IMPORT_MAX_BYTES):
     """Parse + decrypt + hash-verify an entire container. Returns a dict of
-    plaintext parts + manifest, or raises ValueError. Touches nothing."""
+    plaintext parts + manifest, or raises ValueError. Touches nothing.
+    A4: max_bytes mirrors f22_export max_total - HTTP restore paths keep
+    the 64 MiB default; CLI maintenance calls pass F22_MAINT_MAX_BYTES."""
     import json as _f22_json
-    if len(text) > F22_IMPORT_MAX_BYTES * 2:  # b64 slack
+    if len(text) > max_bytes * 2:  # b64 slack
         raise ValueError("container too large")
     try:
         obj = _f22_json.loads(text)
@@ -6216,8 +6598,9 @@ def f22_verify(text, password):
             raise ValueError("part %r decoded to %d bytes, manifest declared %d"
                              % (pid, len(data), p["bytes"]))
         _total += len(data)
-        if _total > F22_IMPORT_MAX_BYTES:
-            raise ValueError("container expands past the import ceiling")
+        if _total > max_bytes:
+            raise ValueError("container expands past the import ceiling "
+                             "(%d MiB)" % (max_bytes // 1048576))
         plain[pid] = data
     return {"manifest": man, "parts": plain,
             "manifest_authenticated": authenticated,
@@ -6225,26 +6608,52 @@ def f22_verify(text, password):
 
 def _f22_write_db_verified(data_bytes, dest_path):
     # integrity_check BEFORE swapping the live file (verify-before-apply).
-    tmp = _f22_tf.NamedTemporaryFile(prefix="f22restore_", delete=False)
+    # B17: the temp lives BESIDE the destination, 0600, O_EXCL|O_NOFOLLOW -
+    # never a plaintext DB copy in the system temp dir. os.replace lands it
+    # atomically; the .f22tmp unlink in finally is a no-op on success. (If a
+    # crashed run left a stale .f22tmp, O_EXCL refuses - rm it by hand.)
+    tmp = str(dest_path) + ".f22tmp"
+    fd = _f22_os.open(tmp, _f22_os.O_WRONLY | _f22_os.O_CREAT | _f22_os.O_EXCL
+                      | _f22_os.O_NOFOLLOW, 0o600)
     try:
-        tmp.write(data_bytes)
-        tmp.close()
-        with _f22_sql.connect(tmp.name) as chk:
+        with _f22_os.fdopen(fd, "wb") as f:
+            f.write(data_bytes)
+            f.flush()
+            _f22_os.fsync(f.fileno())
+        with _f22_sql.connect(tmp) as chk:
             row = chk.execute("PRAGMA integrity_check").fetchone()
         if not row or row[0] != "ok":
             raise ValueError("restored db %s failed integrity_check" % dest_path)
-        _f22_shutil.copy2(tmp.name, str(dest_path) + ".f22new")
-        _f22_os.replace(str(dest_path) + ".f22new", str(dest_path))
+        _f22_os.replace(tmp, str(dest_path))
+        _f22_fsync_dir(_f22_os.path.dirname(str(dest_path)))
     finally:
         try:
-            _f22_os.unlink(tmp.name)
+            _f22_os.unlink(tmp)
         except OSError:
             pass
 
+def _f22_fsync_dir(p):
+    # B17: best-effort durability for the tree swaps (same shape as the
+    # updater's _f20_fsync_dir, kept local - F22 must not lean on it).
+    try:
+        fd = _f22_os.open(str(p), _f22_os.O_RDONLY | _f22_os.O_DIRECTORY)
+        try:
+            _f22_os.fsync(fd)
+        finally:
+            _f22_os.close(fd)
+    except OSError:
+        pass
+
+
 def f22_apply(verified, keep_snapshot=True, allow_legacy=False):
-    """REPLACE-mode restore (never a silent merge; snapshot first). Live-box
-    safe-ish: DBs are whole-file replaced between requests, identity/uploads
-    trees swapped dir-by-dir. Returns summary dict.
+    """REPLACE-mode restore (never a silent merge; snapshot first). B17
+    (round-9): parts are staged into a fresh 0700 tree (dir_fd +
+    O_NOFOLLOW|O_EXCL, 0600 per part) and whole trees are swapped by RENAME -
+    no per-file overlay, nothing stale survives, and a symlink planted
+    anywhere in the old tree is parked aside, never followed (H34). CLI-only,
+    daemon STOPPED (maintenance window): a mid-swap failure keeps the
+    snapshot and any already-renamed-aside tree for recovery. DB temps are
+    0600 in the target dir, never the system temp dir. Returns summary dict.
     H11: an UNAUTHENTICATED v1 manifest is refused unless the operator opts
     in explicitly (CLI --allow-legacy-v1); the required-part inventory is
     re-checked here so apply never leans on its caller having been careful."""
@@ -6260,35 +6669,102 @@ def f22_apply(verified, keep_snapshot=True, allow_legacy=False):
             raise ValueError("required part missing at apply time: " + _req)
     stamp = _f22_dt.now(_f22_tz.utc).strftime("%Y%m%dT%H%M%SZ")
     snap_dir = STATE / ("pre-import-%s" % stamp)
-    if keep_snapshot:
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            _f22_shutil.copy2(DB_PATH, snap_dir / "conversations.db")
-        except OSError:
-            pass
-        try:
-            _f22_shutil.copy2(REGISTRY_PATH, snap_dir / "users.db")
-        except OSError:
-            pass
-    _f22_write_db_verified(parts["part/state.db"], DB_PATH)
-    _f22_write_db_verified(parts["part/registry.db"], REGISTRY_PATH)
-    # identity + secrets trees: move aside (into snapshot), write new
-    for prefix, dest in (("identity", IDENTITY), ("secrets", SECRETS)):
-        olds = snap_dir / (prefix + ".old") if keep_snapshot else None
-        if olds is not None and dest.exists():
-            _f22_shutil.copytree(str(dest), str(olds), dirs_exist_ok=True)
+    is_v2 = not verified.get("legacy_unauthenticated")
+    # B17 (round-9): every tree-part path is validated ONCE, up front, before
+    # any live state is touched. A part id is a NAME inside one of the three
+    # trees - relative, no "."/".." components, no NUL, never a path out.
+    tree_parts = {"identity": [], "secrets": [], "uploads": []}
     for pid, data in parts.items():
         if pid.startswith("identity/") or pid.startswith("secrets/") or pid.startswith("uploads/"):
-            rel = pid.split("/", 1)[1]
-            base = IDENTITY if pid.startswith("identity/") else (SECRETS if pid.startswith("secrets/") else UPLOADS_DIR)
-            fp = _f22_os.path.join(str(base), rel)
-            # containment: never escape the base dir (defense in depth)
-            if _f22_os.path.commonpath([_f22_os.path.realpath(base),
-                                        _f22_os.path.realpath(_f22_os.path.dirname(fp))]) != _f22_os.path.realpath(base):
+            prefix, rel = pid.split("/", 1)
+            comps = rel.split("/")
+            if (not rel or rel.startswith("/") or "\x00" in rel
+                    or any(c in ("", ".", "..") for c in comps)):
+                raise ValueError("backup part path rejected (escape/symlink shape): " + pid)
+            tree_parts[prefix].append((rel, data))
+    # A v2 export walks identity+secrets COMPLETELY, so those trees are
+    # replaced wholesale - REPLACE is finally TRUE and no stale file (another
+    # principal's memory, an old tier file) survives. Uploads are replaced
+    # only when the backup declares them. Legacy v1 containers only replace
+    # trees they actually carry parts for (their inventory promises nothing).
+    uploads_declared = bool(man.get("uploads")) or bool(tree_parts["uploads"])
+    replace_trees = []
+    for prefix in ("identity", "secrets", "uploads"):
+        if prefix == "uploads":
+            if not uploads_declared:
                 continue
-            _f22_os.makedirs(_f22_os.path.dirname(fp), exist_ok=True)
-            with open(fp, "wb") as f:
-                f.write(data)
+        elif not (is_v2 or tree_parts[prefix]):
+            continue
+        replace_trees.append(prefix)
+    stage_root = BASE / ("restore-stage-%s" % stamp)
+    # 1) STAGE everything into a fresh 0700 tree: dir_fd + O_NOFOLLOW|O_EXCL,
+    #    0600 per part. Nothing live is touched until staging fully succeeds,
+    #    and a staged tree cannot contain a symlink BY CONSTRUCTION - the
+    #    final-component symlink write (H34) dies structurally.
+    if _f22_os.path.lexists(str(stage_root)):
+        _f22_shutil.rmtree(str(stage_root), ignore_errors=True)
+    stage_root.mkdir(parents=True, mode=0o700)
+    _f22_os.chmod(str(stage_root), 0o700)
+    try:
+        for prefix in replace_trees:
+            sdir = stage_root / prefix
+            sdir.mkdir(mode=0o700)
+            _f22_os.chmod(str(sdir), 0o700)
+            for rel, data in tree_parts[prefix]:
+                comps = rel.split("/")
+                fdir = sdir.joinpath(*comps[:-1])
+                _f22_os.makedirs(str(fdir), exist_ok=True)
+                _f22_os.chmod(str(fdir), 0o700)
+                dfd = _f22_os.open(str(fdir), _f22_os.O_RDONLY | _f22_os.O_DIRECTORY | _f22_os.O_NOFOLLOW)
+                try:
+                    fd = _f22_os.open(comps[-1], _f22_os.O_WRONLY | _f22_os.O_CREAT
+                                      | _f22_os.O_EXCL | _f22_os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                    try:
+                        _f22_os.write(fd, data)
+                        _f22_os.fsync(fd)
+                    finally:
+                        _f22_os.close(fd)
+                finally:
+                    _f22_os.close(dfd)
+        # 2) SNAPSHOT the DBs: copies land 0600 under STATE - never in the
+        #    system temp dir, never world-readable.
+        if keep_snapshot:
+            snap_dir.mkdir(parents=True, mode=0o700)
+            _f22_os.chmod(str(snap_dir), 0o700)
+            for pth, sname in ((DB_PATH, "conversations.db"), (REGISTRY_PATH, "users.db")):
+                try:
+                    _f22_shutil.copy2(str(pth), snap_dir / sname)
+                    _f22_os.chmod(str(snap_dir / sname), 0o600)
+                except OSError:
+                    pass
+        aside_root = snap_dir if keep_snapshot else (stage_root.parent / ("restore-old-%s" % stamp))
+        if not keep_snapshot:
+            aside_root.mkdir(parents=True, mode=0o700)
+        # 3) SWAP: DBs whole-file replace (integrity-checked temps), then
+        #    whole-tree RENAMES. rename() moves a directory entry WITHOUT
+        #    traversing it, so a symlink planted anywhere in the old tree is
+        #    parked aside - never followed, never written through.
+        _f22_write_db_verified(parts["part/state.db"], DB_PATH)
+        _f22_write_db_verified(parts["part/registry.db"], REGISTRY_PATH)
+        for prefix, dest in (("identity", IDENTITY), ("secrets", SECRETS), ("uploads", UPLOADS_DIR)):
+            if prefix not in replace_trees:
+                continue
+            if _f22_os.path.lexists(str(dest)):
+                _f22_os.rename(str(dest), str(aside_root / (prefix + ".old")))
+            _f22_os.rename(str(stage_root / prefix), str(dest))
+        _f22_fsync_dir(str(BASE))
+        _f22_fsync_dir(str(STATE))
+        if keep_snapshot:
+            _f22_fsync_dir(str(snap_dir))
+        else:
+            _f22_shutil.rmtree(str(aside_root), ignore_errors=True)
+        _f22_shutil.rmtree(str(stage_root), ignore_errors=True)
+    except BaseException:
+        # Staging leftovers never survive a failed apply. The snapshot (and
+        # any already-renamed-aside tree) DOES - it is the recovery path.
+        # Raised loud; the CLI prints it; a human decides what next.
+        _f22_shutil.rmtree(str(stage_root), ignore_errors=True)
+        raise
     # vault re-seal under THIS box's master key (same-box: already inside
     # state.db as CV1 blobs and left untouched; new-box: this rebuilds them)
     resealed = 0
@@ -6349,11 +6825,23 @@ def f22_apply(verified, keep_snapshot=True, allow_legacy=False):
         n_users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     with _f22_sql.connect(str(DB_PATH)) as db:
         n_conv = db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    # B17: pre-import snapshots are pruned to the newest 3 - every apply
+    # used to leave a full DB set behind forever (unbounded disk leak).
+    _pruned = 0
+    try:
+        _snaps = sorted(p for p in STATE.glob("pre-import-*") if p.is_dir())
+        for _p in _snaps[:-3]:
+            _f22_shutil.rmtree(str(_p), ignore_errors=True)
+            _pruned += 1
+    except OSError:
+        pass
     log_event(DAEMON_OWNER, "backup.import", snapshot=str(snap_dir) if keep_snapshot else "",
-              users=n_users, conversations=n_conv, vault_resealed=resealed)
+              users=n_users, conversations=n_conv, vault_resealed=resealed,
+              replaced=",".join(replace_trees), pruned=_pruned)
     return {"snapshot": str(snap_dir) if keep_snapshot else "",
             "users": n_users, "conversations": n_conv,
             "vault_resealed": resealed, "vault_reseal_failed": re_seal_failed,
+            "replaced": ",".join(replace_trees),
             "from_version": man.get("src_version"), "created": man.get("created")}
 
 # --- F22 wiring: owner-only HTTP API + CLI parity (both call the SAME core) -
@@ -6504,7 +6992,8 @@ def _f22_cli_main(argv):
                 print("--export-backup needs a destination file path", file=sys.stderr)
                 return 2
             pw = _ask("backup password: ")
-            text, st = f22_export(pw, "--no-uploads" not in argv)
+            text, st = f22_export(pw, "--no-uploads" not in argv,
+                              max_total=F22_MAINT_MAX_BYTES)  # A4
             with open(dest, "wb") as f:
                 f.write(text.encode("utf-8"))
             log_event(DAEMON_OWNER, "backup.export", bytes=st["bytes"],
@@ -6528,7 +7017,7 @@ def _f22_cli_main(argv):
                 return 2
             pw = _ask("backup password: ")
             with open(src, "r", encoding="utf-8") as f:
-                v = f22_verify(f.read(), pw)
+                v = f22_verify(f.read(), pw, max_bytes=F22_MAINT_MAX_BYTES)  # A4 (round-9)
             s = _f22_summary(v["manifest"])
             print("manifest " + ("AUTHENTICATED (v2 MAC verified)" if v.get("manifest_authenticated")
                                  else "UNAUTHENTICATED (legacy v1: structure enforced, provenance NOT; "
@@ -6546,7 +7035,7 @@ def _f22_cli_main(argv):
                 return 2
             pw = _ask("backup password: ")
             with open(src, "r", encoding="utf-8") as f:
-                v = f22_verify(f.read(), pw)
+                v = f22_verify(f.read(), pw, max_bytes=F22_MAINT_MAX_BYTES)  # A4 (round-9)
             s = _f22_summary(v["manifest"])
             print("container OK: created " + str(s["created"]) + " from v" +
                   str(s["src_version"]) + ", " + str(len(s["parts"])) + " parts")
@@ -6570,7 +7059,7 @@ def _f22_cli_main(argv):
                 print("error: " + str(side), file=sys.stderr)
                 return 2
             pw = _ask("backup password: ")
-            v = f22_verify(text, pw)
+            v = f22_verify(text, pw, max_bytes=F22_MAINT_MAX_BYTES)  # A4 (round-9)
             s = _f22_summary(v["manifest"])
             print("staged container OK: created " + str(s["created"]) +
                   " from v" + str(s["src_version"]) + ", " +
@@ -7183,7 +7672,7 @@ def _help_route(h):
             # SCAR (F12.2) still governs the gated half: deep routes send an
             # absolute /login; relative "login" resolves wrong at /help/logs.
             h.send_response(302)
-            h.send_header("Location", "/login")
+            h.send_header("Location", h._ui_base + "login")
             h.end_headers()
             return
         h._html(200, _help_page("logs", "Instance Logs", _help_body_logs(u["username"]), u))
@@ -8005,19 +8494,39 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
         if cid in conv_ids:
             msgs_by_conv.setdefault(cid, []).append(m)
     now = time.time()
-    for cid, conv in conv_ids.items():
-        clist = sorted(msgs_by_conv.get(cid, []), key=lambda m: m.get("timestamp") or 0)
-        new_cid = str(uuid.uuid4())
-        title = str(conv.get("title") or "Imported conversation")[:200]
-        first_ts = min([(m.get("timestamp") or now * 1000) / 1000.0 for m in clist], default=now)
-        last_ts = max([(m.get("timestamp") or now * 1000) / 1000.0 for m in clist], default=now)
-        with sqlite3.connect(DB_PATH) as db:
-            db.execute("INSERT INTO conversations (id, title, created_at, updated_at, user_id) VALUES (?,?,?,?,?)",
-                       (new_cid, title, first_ts, last_ts, username))
+    # A5/V10 (round-9 audit): a tiny archive used to multiply on disk -
+    # every message reference to the SAME zip entry re-read it and wrote
+    # another file (output = refs x entry size, unbounded by the archive).
+    # Now: read each distinct entry AT MOST once (handler caps bound the
+    # distinct declared total to <=400 MB), write ONE file per conversation
+    # per entry (the uploads/<cid> layout contract), reserve the quota for
+    # the planned output BEFORE any write, and commit the whole archive in
+    # ONE transaction so a mid-import failure leaves NOTHING behind.
+    _entry_bytes = {}
+    _written = []
+    _db = sqlite3.connect(DB_PATH)
+    try:
+        # A5/V10: ONE transaction for the whole archive - begin once here,
+        # commit once after the loop; any failure rolls back every row and
+        # unlinks every staged file (no partial imports).
+        _db.execute("BEGIN IMMEDIATE")
+        for cid, conv in conv_ids.items():
+            clist = sorted(msgs_by_conv.get(cid, []), key=lambda m: m.get("timestamp") or 0)
+            new_cid = str(uuid.uuid4())
+            title = str(conv.get("title") or "Imported conversation")[:200]
+            first_ts = min([(m.get("timestamp") or now * 1000) / 1000.0 for m in clist], default=now)
+            last_ts = max([(m.get("timestamp") or now * 1000) / 1000.0 for m in clist], default=now)
+            # A5 plan phase: resolve + read (deduped) + size every attachment
+            # BEFORE the first INSERT, so the quota charge covers the real
+            # output of this conversation and the write phase cannot fail on
+            # an unreadable member after rows exist.
+            cdir = UPLOADS_DIR / new_cid
+            mplans = []
+            _conv_total = 0
+            _conv_files = {}
             for m in clist:
                 role = "user" if m.get("participant") == "USER" else "assistant"
                 content = m.get("text") or ""
-                att_list = []
                 items = []
                 am = m.get("attachmentMeta")
                 if am:
@@ -8026,6 +8535,7 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
                     except Exception:
                         items = []
                 img_queue = [e for e in (m.get("images") or []) if e in names]
+                _mitems = []
                 for it in items:
                     if not isinstance(it, dict):
                         continue
@@ -8034,24 +8544,43 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
                         entry = img_queue.pop(0)
                     if not entry or entry not in names:
                         continue
-                    data = zf.read(entry)
+                    if entry not in _entry_bytes:
+                        _entry_bytes[entry] = zf.read(entry)
+                    data = _entry_bytes[entry]
                     name = _safe_upload_name(str(it.get("file_name") or "file"))  # P1-E/J: was dir-strip-only; CR/LF/quote reached the header sink
-                    stored = uuid.uuid4().hex[:8] + "_" + name
-                    cdir = UPLOADS_DIR / new_cid
-                    cdir.mkdir(parents=True, exist_ok=True)
-                    fp = cdir / stored
-                    fp.write_bytes(data)
-                    _p1i_owner_only_file(fp)   # P1-I/S09
+                    # A5: the quota budget accrues PER REFERENCE (the report's
+                    # cumulative decoded-output budget) - boot hygiene recomputes
+                    # user_quota as SUM(a.size) over rows, so the charge must
+                    # match the row ledger, not the on-disk dedupe.
+                    _conv_total += len(data)
+                    if entry not in _conv_files:
+                        _conv_files[entry] = (entry, uuid.uuid4().hex[:8] + "_" + name, name)
+                    _ent, stored, name = _conv_files[entry]
                     kind = it.get("type") or "file"
                     if kind not in ("image", "video", "file", "pdf"):
                         kind = "file"
+                    _mitems.append((_ent, stored, name, it.get("mime_type"), len(data), kind))
+                mplans.append((role, content, m, _mitems))
+            _quota_reserve(_db, username, _conv_total)   # rides the single archive txn
+            _db.execute("INSERT INTO conversations (id, title, created_at, updated_at, user_id) VALUES (?,?,?,?,?)",
+                        (new_cid, title, first_ts, last_ts, username))
+            for (role, content, m, _mitems) in mplans:
+                att_list = []
+                for (_ent, stored, name, mime, size, kind) in _mitems:
+                    if stored not in [a["stored_name"] for a in att_list]:
+                        if not cdir.exists():
+                            cdir.mkdir(parents=True, exist_ok=True)
+                        fp = cdir / stored
+                        fp.write_bytes(_entry_bytes[_ent])
+                        _written.append(fp)
+                        _p1i_owner_only_file(fp)   # P1-I/S09
                     att_id = str(uuid.uuid4())
-                    db.execute("INSERT INTO attachments (id, conv_id, name, stored_name, mime, size, source, kind, ts) VALUES (?,?,?,?,?,?,?,?,?)",
-                               (att_id, new_cid, name, stored, it.get("mime_type"), len(data), "file", kind, now))
+                    _db.execute("INSERT INTO attachments (id, conv_id, name, stored_name, mime, size, source, kind, ts, user_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                               (att_id, new_cid, name, stored, mime, size, "file", kind, now, username))
                     att_list.append({"id": att_id, "name": name, "stored_name": stored,
-                                     "mime": it.get("mime_type"), "size": len(data), "kind": kind})
+                                     "mime": mime, "size": size, "kind": kind})
                     stats["attachments"] += 1
-                db.execute("INSERT INTO messages (id, conv_id, role, content, tool_calls, ts, attachments, reasoning, stopped) VALUES (?,?,?,?,?,?,?,?,?)",
+                _db.execute("INSERT INTO messages (id, conv_id, role, content, tool_calls, ts, attachments, reasoning, stopped) VALUES (?,?,?,?,?,?,?,?,?)",
                            (str(uuid.uuid4()), new_cid, role,
                             content if content else "(attachment)",
                             m.get("toolCallJson"),
@@ -8062,10 +8591,24 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
                 stats["messages"] += 1
             for k2 in comp_list:
                 if str(k2.get("conv_id") or "") == cid:
-                    db.execute("INSERT INTO compactions (id, conv_id, summary, msg_count, ts) VALUES (?,?,?,?,?)",
+                    _db.execute("INSERT INTO compactions (id, conv_id, summary, msg_count, ts) VALUES (?,?,?,?,?)",
                                (str(uuid.uuid4()), new_cid, str(k2.get("summary") or ""),
                                 int(k2.get("msg_count") or 0), float(k2.get("ts") or now)))
-        stats["conversations"] += 1
+            stats["conversations"] += 1
+        _db.commit()   # A5/V10: ONE publish - all conversations or none
+    except BaseException:
+        try:
+            _db.rollback()
+        except sqlite3.Error:
+            pass
+        for _fp in _written:
+            try:
+                _fp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    finally:
+        _db.close()
     restored = False
     _changed_keys = []
     _identity_written = False
@@ -9253,8 +9796,16 @@ def _p1j_conn_class(base_cls, policy):
     class _P1JPinned(base_cls):
         def connect(self):
             if getattr(self, "_tunnel_host", None):
-                base_cls.connect(self)  # proxied tunnel (none configured); defer
-                return
+                # V05 (v-report): a tunnel means the PROXY picks the ultimate
+                # destination and _p1j_vet never sees that choice. The old
+                # branch deferred to base-class connect under a "none
+                # configured" assumption - the moment the environment hands
+                # us a proxy, that assumption IS the bypass. Refuse instead:
+                # these doors are direct-only. If a proxy is ever genuinely
+                # needed, implement a vetted-proxy handler that checks the
+                # ultimate destination and blocks private/link-local (the
+                # V05 alternative) - do NOT re-open this branch.
+                raise urllib.error.URLError("proxy tunnel disallowed by IP policy")
             port = self.port if self.port is not None else (443 if is_https else 80)
             ip = _p1j_vet(self.host, port, policy)
             sock = _p1j_sock.create_connection((ip, port), self.timeout,
@@ -9286,12 +9837,53 @@ def _p1j_build_opener(redirect_guard, policy):
     # {scheme}_open wins - a bare build_opener would keep the default
     # unpinned handlers ahead of ours).
     op = urllib.request.OpenerDirector()
-    for _h in (urllib.request.ProxyHandler(), urllib.request.UnknownHandler(),
+    # V05: EMPTY proxy map. An env-honoring ProxyHandler hands the dial to
+    # the proxy, which then re-resolves the destination on ITS terms -
+    # outside every policy above. Direct-only, same posture the NC door
+    # took in V04 (CPython never even registers an empty ProxyHandler, so
+    # nothing in the chain consults the environment).
+    for _h in (urllib.request.ProxyHandler({}), urllib.request.UnknownHandler(),
                redirect_guard, _P1J_HTTPHandler(policy), _P1J_HTTPSHandler(policy),
                urllib.request.HTTPDefaultErrorHandler(),
                urllib.request.HTTPErrorProcessor()):
         op.add_handler(_h)
     return op
+# V04 (v-report 2026-09-25): the Nextcloud door dials the vetted IP chosen
+# once by _nc_vet_dial_ip - same discipline as _P1JPinned above (SNI, Host
+# and certificate verification STAY on the original hostname). Unlike the
+# P1-J pair this carries an already-vetted ip instead of re-resolving per
+# policy: the NC posture is per-user (nc_allow_suffix / nc_ip_pin), decided
+# at cfg time. A tunnel would hand the target back to a proxy's resolver
+# (V05 posture), so it is refused outright rather than deferred.
+def _nc_pinned_conn_class(base_cls, dial_ip):
+    is_https = issubclass(base_cls, _p1j_hc.HTTPSConnection)
+    class _NCPinned(base_cls):
+        def connect(self):
+            if getattr(self, "_tunnel_host", None):
+                raise urllib.error.URLError("proxy tunnel disallowed by NC dial policy")
+            port = self.port if self.port is not None else (443 if is_https else 80)
+            sock = _p1j_sock.create_connection((dial_ip, port), self.timeout,
+                                               self.source_address)
+            if is_https:
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            else:
+                self.sock = sock
+    return _NCPinned
+class _NC_HTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, dial_ip):
+        self._nc_dial_ip = dial_ip
+        urllib.request.HTTPHandler.__init__(self)
+    def http_open(self, req):
+        return self.do_open(_nc_pinned_conn_class(_p1j_hc.HTTPConnection,
+                                                  self._nc_dial_ip), req)
+class _NC_HTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, dial_ip):
+        self._nc_dial_ip = dial_ip
+        urllib.request.HTTPSHandler.__init__(self)
+    def https_open(self, req):
+        return self.do_open(_nc_pinned_conn_class(_p1j_hc.HTTPSConnection,
+                                                  self._nc_dial_ip),
+                            req, context=self._context)
 def _custom_base_blocked(base):
     """P1-A (K80 ruling 2026-09-22): a NON-owner custom model endpoint may
     only live on the public internet. This is the structural kill-shot for
@@ -9422,15 +10014,24 @@ def _provider_urlopen(cfg, req, timeout=300):
 # the validators defined far below in their connector blocks - both resolve
 # at CALL time, so file order does not matter (module fully loaded before
 # serve_forever). Do not "fix" the ordering.
-_P1G_CONNECTOR_OPENER = None
-def _nc_opener():
+def _nc_opener(dial_ip):
     """The connector door (Nextcloud DAV). Per-hop host fence + credential
-    strip on any origin change (both inherited from _P1cRedirectGuard)."""
-    global _P1G_CONNECTOR_OPENER
-    if _P1G_CONNECTOR_OPENER is None:
-        _P1G_CONNECTOR_OPENER = urllib.request.build_opener(
-            _P1cRedirectGuard(same_origin=True))  # P1-H/V
-    return _P1G_CONNECTOR_OPENER
+    strip on any origin change (both inherited from _P1cRedirectGuard).
+    V04 (v-report): was a build_opener() singleton whose DEFAULT handlers
+    re-resolved the hostname at connect - the credentialed dial could land
+    somewhere the config-time check never vetted (DNS TOCTOU). Now built
+    per-request around the ONE vetted dial IP: the pinned handlers dial that
+    ip while SNI/Host/cert keep the hostname; the same-origin redirect fence
+    is unchanged (every hop re-dials the vetted ip). Direct-only like
+    _p1j_build_opener: an env proxy would re-resolve the target (V05
+    posture), so this door carries no proxy support at all."""
+    op = urllib.request.OpenerDirector()
+    for _h in (urllib.request.ProxyHandler({}), urllib.request.UnknownHandler(),
+               _P1cRedirectGuard(same_origin=True), _NC_HTTPHandler(dial_ip),
+               _NC_HTTPSHandler(dial_ip), urllib.request.HTTPDefaultErrorHandler(),
+               urllib.request.HTTPErrorProcessor()):
+        op.add_handler(_h)
+    return op
 _P1G_CST_OPENER = None
 def _cst_opener():
     """Shared guarded door for OAuth + static-token connectors.
@@ -9484,7 +10085,7 @@ _CAIRN_SAFE_SETTINGS = frozenset({
 # a deliberate act in Settings, never a side effect of an import.
 # (search_custom is Mara's addition to the auditor's list: its {{api_key}}
 # template ships search keys to whatever URL the setting names. nc_url stays:
-# _nc_host_allowed pins it to the allowed private space - destination checks
+# _nc_vet_dial_ip pins it to the allowed private space - destination checks
 # like that are the pattern for any future re-add.)
 
 # F6: a password attempt against a MISSING username must burn the same
@@ -10670,6 +11271,18 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
             for idx, tc in sorted(tool_calls_acc.items()):
                 if cancel is not None and cancel.is_set():
                     send_event("stopped", {})
+                    return "".join(full_content), "".join(reasoning_acc), tool_log
+                # B19/H07: revocation is enforced LIVE at every side-effecting
+                # dispatch - the turn-start set above is only a snapshot. A
+                # break, role change, share disable, presence timeout or
+                # grant removal landing mid-turn stops the turn HERE, before
+                # the tool runs. _b19_still_allowed fails closed.
+                if username and not _b19_still_allowed(username, tc["name"]):
+                    log_event(username, "tool.call.denied", tool=tc["name"],
+                              iteration=iteration, reason="revoked-mid-turn")
+                    first_token["done"] = True
+                    hb.join(timeout=0)
+                    send_event("error", {"message": "Access revoked mid-turn - this tool call was refused and the turn was ended."})
                     return "".join(full_content), "".join(reasoning_acc), tool_log
                 # P3.3 S3p-v2: dispatch guard - the tier filter is enforced here,
                 # not just in the offered payload (defense in depth).
@@ -12382,7 +12995,9 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
       items.forEach(function(it){
         var box = document.createElement("div"); box.className = "card";
         var head = document.createElement("div");
-        head.textContent = it.tool + "  ·  " + it.user + "  ·  " + it.age + "s ago  ·  " + it.id;
+        head.textContent = it.tool + "  ·  " + it.user + "  ·  " + it.age + "s ago  ·  " + it.id
+          + "  ·  full action: " + String((it.preview || "").length) + " bytes"
+          + "  ·  sha256 " + String(it.digest || "").slice(0, 16);
         box.appendChild(head);
         var pre = document.createElement("pre");
         pre.style.whiteSpace = "pre-wrap"; pre.style.wordBreak = "break-all";
@@ -13463,7 +14078,7 @@ async function loadTier0(scope) {
       (window._t0Scope === 'personal' && !window._t0Personal && window._t0GlobalText) ? '' : 'none';
     document.getElementById('t0ScopeHint').textContent = (window._t0Scope === 'personal')
       ? 'Your personal Tier 0. It binds ONLY your sessions and replaces the instance constitution for you - other principals never see it, and it is never shown to other users. Prose here is behavioral, not structural: what the agent MAY do is enforced by code. Keep it lore-free - it still rides to every provider you configure.'
-      : 'The instance constitution: prepended by the daemon to EVERY prompt, for EVERY principal except you (write your Personal tab if you want your own floor), before any other layer - no prompt layer can exclude it. Only you can edit it; it is never shown to other users (they can be told it exists, not read it). Prose here is behavioral, not structural: what the agent MAY do is enforced by code. Keep it lore-free - it is projected to every provider on the list.';
+      : 'The instance constitution: prepended by the daemon to EVERY prompt, for EVERY principal except you (write your Personal tab if you want your own floor), before any other layer - no prompt layer can exclude it. Only you can edit it, but it is NOT private from the instance: it rides verbatim inside the prompt of every other principal, and they can get their agent to recite it. Keep secrets out. Prose here is behavioral, not structural: what the agent MAY do is enforced by code. Keep it lore-free - it is projected to every provider on the list.';
     updT0Count();
   } catch (e) {}
 }
@@ -13855,24 +14470,40 @@ self.addEventListener('fetch', (e) => {
 # reverse-proxy guidance in /help/tls still applies (limits there help too).
 import threading as _h16_th
 MAX_WORKERS = max(4, int(os.environ.get("MARA_MAX_WORKERS", "64") or 64))
+_TLS_HANDSHAKE_TIMEOUT = 15.0  # T-A3: bound on one server-side TLS handshake
+
 class _BoundedHTTPServer(ThreadingHTTPServer):
     daemon_threads = True  # the historical main() posture now lives with the class
+    _tls_ctx = None  # T-A3: set by _tls_wire; None => plaintext server
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._worker_sem = _h16_th.BoundedSemaphore(MAX_WORKERS)
     def process_request(self, request, client_address):
         if not self._worker_sem.acquire(blocking=False):
-            try:
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
-                                b"Connection: close\r\nContent-Length: 0\r\n\r\n")
-            except OSError:
-                pass
+            # T-A3: on a TLS server the peer is still waiting for a ServerHello;
+            # raw HTTP bytes would be garbage, so the honest 503 is plaintext-only.
+            if self._tls_ctx is None:
+                try:
+                    request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                    b"Connection: close\r\nContent-Length: 0\r\n\r\n")
+                except OSError:
+                    pass
             self.shutdown_request(request)
             return
         _h16_th.Thread(target=self._worker, args=(request, client_address),
                        daemon=True).start()
     def _worker(self, request, client_address):
         try:
+            if self._tls_ctx is not None:
+                # T-A3: the TLS handshake happens HERE - per accepted
+                # connection, inside a bounded worker - never inside accept().
+                # The listener stays a plain socket, so an idle or stalled TCP
+                # connection can burn at most ONE worker slot (H16 semaphore)
+                # and only until the handshake timeout below fires.
+                request = self._tls_ctx.wrap_socket(
+                    request, server_side=True, do_handshake_on_connect=False)
+                request.settimeout(_TLS_HANDSHAKE_TIMEOUT)
+                request.do_handshake()
             self.finish_request(request, client_address)
         except Exception:
             self.handle_error(request, client_address)
@@ -13880,6 +14511,7 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
             self.shutdown_request(request)
             self._worker_sem.release()
 class MaraHandler(BaseHTTPRequestHandler):
+    _ui_base = "/"  # T-A6: per-request UI base; _clean_route() owns it
     timeout = 300  # P1-B/H16: per-connection socket guard. 300s sits exactly
                    # at the worst legitimate single socket wait (the 300s
                    # provider read; SSE heartbeats every 20s), so nothing real
@@ -13916,7 +14548,45 @@ class MaraHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    _ui_base_ok = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+    def _clean_route(self):
+        """T-A6 (R9 A6): THE prefix choke point. Accepted prefixes: the
+        instance's own slug (/etc/mara/instance.conf, local truth) or the
+        authenticated session's OWN registry slug. Never a header, never a
+        guess - foreign/unknown prefixes stay unstripped and 404 on the
+        router on purpose (negative control). No-prefix routes exactly as
+        before, so direct access and prefix-stripping proxies keep working.
+        The <base> value follows local truth only: matched prefix, else the
+        session's own slug, else the instance slug, else "/" - every one of
+        those is guaranteed servable (own/instance prefixes strip; anything
+        also routes unprefixed)."""
+        raw = _p1i_clean_path(self.path)
+        inst = _instance_principal()
+        u = self._auth_user()
+        own = str(u["slug"] or "") if u else ""
+        if own and not self._ui_base_ok.fullmatch(own):
+            own = ""  # malformed legacy row can never reach the base tag
+        strip = ""
+        if inst and (raw == "/" + inst or raw.startswith("/" + inst + "/")):
+            strip = inst
+        elif own and (raw == "/" + own or raw.startswith("/" + own + "/")):
+            strip = own
+        _b = strip or own or inst
+        self._ui_base = "/" + _b + "/" if _b else "/"
+        return raw[len(strip) + 1:] if strip else raw
     def _html(self, code, content):
+        # T-A6: ONE choke point for base injection. Templates keep the
+        # historical absolute tokens; they become THIS request's base here.
+        # With base "/" every replace below is byte-inert (b always ends in
+        # "/"), so unprefixed deployments serve exactly yesterday's bytes.
+        b = self._ui_base
+        content = (content
+                   .replace('<base href="/mara/">', '<base href="' + b + '">')
+                   .replace('href="/update/', 'href="' + b + 'update/')
+                   .replace('"/update/console"', '"' + b + 'update/console"')
+                   .replace("'/update/console'", "'" + b + "update/console'")
+                   .replace("'/update/welcome'", "'" + b + "update/welcome'")
+                   .replace('href="/help', 'href="' + b + 'help'))
         body = content.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -13967,7 +14637,7 @@ class MaraHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self._door_bounce():
             return
-        path = _p1i_clean_path(self.path)
+        path = self._clean_route()
         # S06 (0.6q): share pages. /shares = management (any signed-in
         # principal; the API scopes rows), /share/<id> = the guest door.
         if path == "/shares":
@@ -13990,7 +14660,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     self._html(200, h_page)
             else:
                 if self._auth_user():
-                    self.send_response(302); self.send_header("Location", "/"); self.end_headers()
+                    self.send_response(302); self.send_header("Location", self._ui_base); self.end_headers()
                 else:
                     self._redirect_login()
             return
@@ -14001,7 +14671,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 # first-boot wizard is the front door until the owner exists.
                 if _f19_empty_registry():
                     self.send_response(302)
-                    self.send_header("Location", "/setup")
+                    self.send_header("Location", self._ui_base + "setup")
                     self.end_headers()
                     return
                 self._redirect_login()
@@ -14026,7 +14696,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             _door = _p1h_pub_slug(u["slug"]) if u else ""  # P1-H/N1
             if _door:
                 self.send_response(302)
-                self.send_header("Location", "/" + _door + "/")
+                self.send_header("Location", self._ui_base)  # T-A6: own door IS the base
                 self.end_headers()
                 return
             self._html(200, web_ui_auth("login"))
@@ -14041,7 +14711,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             u = self._auth_user()
             if not u or u["status"] != "active":
                 self.send_response(302)
-                self.send_header("Location", "/login")
+                self.send_header("Location", self._ui_base + "login")
                 self.end_headers()
                 return
             url, oerr = google_connect_url(u["username"])
@@ -14058,7 +14728,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             u = self._auth_user()
             if not u or u["status"] != "active":
                 self.send_response(302)
-                self.send_header("Location", "/login")
+                self.send_header("Location", self._ui_base + "login")
                 self.end_headers()
                 return
             params = dict(_nc_up.parse_qsl(_nc_up.urlsplit(self.path).query))
@@ -14390,13 +15060,13 @@ class MaraHandler(BaseHTTPRequestHandler):
                 _t1 = _t1.replace("Your name is your agent_name.", "Your name is " + _an + ".")
             self._json(200, {"agent_name": _an, "tiers": [
                 {"key": "tier0", "title": "Tier 0 - instance constitution",
-                 "blurb": "The deepest layer: rules that apply to every reply on this instance, for every resident. Only you can ever read it here - admins may know it exists, never what it says. Leave it empty unless you have rules that must never bend.",
+                 "blurb": "The deepest layer: rules that apply to every reply on this instance, for every resident. Read before writing: this text is projected VERBATIM into every other principal's system prompt, and anyone who can chat here can ask the agent to recite it. The editor is owner-only; the text is not. Treat it as visible to the whole instance and keep secrets out of it. Leave it empty unless you have rules that must never bend.",
                  "default": _t0, "cap": 65536},
                 {"key": "tier1", "title": "Tier 1 - who your agent is",
                  "blurb": "The persona your agent grows from. Its name is already filled in below - edit only if you want a different character. The owner's persona is shared with admins who serve this instance; make yours personal later from your own copy if you want.",
                  "default": _t1, "cap": 65536},
                 {"key": "tier2", "title": "Tier 2 - working directions (just for you)",
-                 "blurb": "Standing directions for your agent: voice, focus, habits. This shapes how it works - it can never grant or remove tools. It is yours alone; other residents never see it.",
+                 "blurb": "Standing directions for your agent: voice, focus, habits. This shapes how it works - it can never grant or remove tools. Yours alone, with one exception: when you create a share, a copy of these directions rides inside the share agent, so guests there may get it to recite them. Keep secrets out.",
                  "default": (get_setting("custom_instructions", "", u["username"]) or ""), "cap": 32768},
                 {"key": "tier3", "title": "Tier 3 - memory",
                  "blurb": "Nothing to write today. Memories accumulate automatically from your conversations and belong to you alone; manage them anytime in Settings.",
@@ -14471,7 +15141,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 "effective_est_tokens": _est_prompt_tokens(u["username"]),
                 "context_budget": ctx_budget(u["username"]),
                 "pristine": {"exists": (_pf is not None and _pf.exists()), "chars": pristine_chars},
-                "history": _sp_history_list(),
+                "history": _sp_history_list(_sp_hist_bucket(_scope, _scope_user)),  # T-A1: own bucket only
                 "scope": _scope, "scope_user": _scope_user,
                 "tier0": {"exists": TIER0_PATH.exists(),
                           "chars": (len(TIER0_PATH.read_text()) if TIER0_PATH.exists() else 0)},
@@ -14546,7 +15216,9 @@ class MaraHandler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "not found"})
         elif path == "/manifest.webmanifest":
-            self._raw(200, MANIFEST_WEB, "application/manifest+json")
+            # T-A6: PWA identity is per-base - an installed /alice/ clone must
+            # not collide with the same box's /bob/ one.
+            self._raw(200, MANIFEST_WEB.replace("/mara/", self._ui_base), "application/manifest+json")
         elif path == "/sw.js":
             self._raw(200, SERVICE_WORKER, "application/javascript")
         elif path == "/api/export/all":
@@ -14644,7 +15316,7 @@ class MaraHandler(BaseHTTPRequestHandler):
         # reachable by everyone: that is the landing page. /mara/ is a room;
         # the landing is the login page (K80).
         door = self.headers.get("X-Mara-Slug")
-        p = _p1i_clean_path(self.path)
+        p = self._clean_route()  # T-A6: exclusions must see the STRIPPED path
         if p in ("/login", "/signup", "/api/login", "/api/signup", "/api/logout"):
             return False
         # P1-I/S21: whose instance is this? LOCAL truth (/etc/mara/instance.conf),
@@ -14844,8 +15516,7 @@ class MaraHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self._door_bounce():
             return
-
-        path = _p1i_clean_path(self.path)
+        path = self._clean_route()
         # P1-B (audit): same-origin belt for POST. SameSite=Lax already hides
         # cookies from cross-site POSTs; this is the second latch. A client
         # that SENDS Origin must match our Host; CLI/apps that omit Origin
@@ -15399,9 +16070,20 @@ class MaraHandler(BaseHTTPRequestHandler):
                 return
             log_event(u["username"], "auth.login.success")
             tok = session_create(u["username"], u["slug"], u["id"])
+            # T-A6 (R9 A6): the old JS navigated to "/" + slug + "/" blind -
+            # community installs (no instance.conf) 404'd there because the
+            # daemon served no prefixes at all. "redirect" is now a target we
+            # GUARANTEE to serve: the matched request prefix, else the new
+            # session's own slug (rule: own-slug prefix always strips for
+            # that session), else "/" - all local truth, never a header.
+            _red = self._ui_base
+            if _red == "/":
+                _ownr = str(u["slug"] or "")
+                if self._ui_base_ok.fullmatch(_ownr):
+                    _red = "/" + _ownr + "/"
             self._json(200, {"ok": True, "username": u["username"], "role": u["role"],
                              "slug": _p1h_pub_slug(u["slug"]),  # P1-H/N1
-                             "agent_name": u["agent_name"]},
+                             "agent_name": u["agent_name"], "redirect": _red},
                        cookie=_session_cookie(tok, self._cookie_secure()))
         elif path == "/api/signup":
             # P1-B: signup spam is how pending queues die. 6 burst, 2/min.
@@ -15608,34 +16290,65 @@ class MaraHandler(BaseHTTPRequestHandler):
                 # marahome@<slug> and smoke-tests it. One slug, everything.
                 # Owner is never UI-assigned (user|admin whitelist stays).
                 slug = target["slug"] or ""
-                if slug:
-                    # P1-F/N1 (round-5): re-validate slug at the sudo boundary.
-                    # Signup enforces this shape, but the F22 restore path can
-                    # replace the registry wholesale, and an argv starting with
-                    # '-' is an option to the provision script.
-                    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,30}", slug):
-                        log.error("approval: %s has a malformed slug - refusing to invoke provision", target["username"])
-                        self._json(409, {"error": "slug in registry has invalid shape; account left pending"})
-                        return
-                    try:
-                        rc = subprocess.run(["sudo", "/etc/mara/mara-provision.py", slug, role], capture_output=True, text=True, timeout=300)
-                    except subprocess.TimeoutExpired:
-                        log.error("approval: provision timed out for %s (%s)", target["username"], slug)
-                        self._json(504, {"error": "provisioning timed out; account left pending, retry from the queue"})
-                        return
-                    if rc.returncode != 0:
-                        # P1-F/N1: the response used to be ok:true no matter what.
-                        # Activation is the provision script's job - if it failed,
-                        # the row is still pending and the owner deserves to know.
-                        tail = (rc.stderr or rc.stdout or "").strip()[-300:]
-                        log.error("approval: provision FAILED rc=%s for %s as %s by %s: %s",
-                                  rc.returncode, target["username"], role, u["username"], tail)
-                        self._json(502, {"error": "provisioning failed (rc=%s); account left pending" % rc.returncode,
-                                         "detail": tail})
-                        return
-                    log.info("approval: %s approved as %s by %s; provision rc=0", target["username"], role, u["username"])
-                else:
-                    log.warning("approval: %s has no slug - no agent provisioned", target["username"])
+                # P1-F/N1 (round-5): re-validate slug shape. Signup enforces
+                # this, but the F22 restore path can replace the registry
+                # wholesale, and an argv starting with '-' is an option to the
+                # provision script. T-A7: this fence now guards EVERY activation
+                # path - a malformed slug never gets activated either.
+                if slug and not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,30}", slug):
+                    log.error("approval: %s has a malformed slug - refusing to provision or activate", target["username"])
+                    self._json(409, {"error": "slug in registry has invalid shape; account left pending"})
+                    return
+                # T-A7 (R9 A7, K80 ruling): a community install has no host
+                # provision script and no other activation path existed - the
+                # old code 502'd (sudo present) or 500'd (sudo absent) and the
+                # row stayed pending forever. Community residents ARE registry
+                # accounts in this one daemon: activate in-daemon, one registry
+                # transaction. Managed hosts keep the script; sudo path below
+                # is untouched for them.
+                if not os.path.isfile("/etc/mara/mara-provision.py"):
+                    registry_set_status(uid, "active", role)
+                    log.info("approval: %s approved IN-DAEMON as %s by %s (no host provision script)",
+                             target["username"], role, u["username"])
+                    self._json(200, {"ok": True, "username": target["username"], "role": role,
+                                     "slug": _p1h_pub_slug(target["slug"]),  # P1-H/N1
+                                     "activated": "in-daemon"})
+                    return
+                if not slug:
+                    # B01 (folded into T-A7): this branch used to answer
+                    # ok:true while the row stayed PENDING - nothing could
+                    # have happened, because the provision script takes the
+                    # slug as argv. Managed host: honest refusal, stay pending.
+                    log.error("approval: %s has no slug - cannot run host provision script; left pending",
+                              target["username"])
+                    self._json(409, {"error": "registry row has no slug - host provisioning cannot run; account left pending"})
+                    return
+                try:
+                    rc = subprocess.run(["sudo", "/etc/mara/mara-provision.py", slug, role], capture_output=True, text=True, timeout=300)
+                except subprocess.TimeoutExpired:
+                    log.error("approval: provision timed out for %s (%s)", target["username"], slug)
+                    self._json(504, {"error": "provisioning timed out; account left pending, retry from the queue"})
+                    return
+                except FileNotFoundError:
+                    # T-A7: sudo itself missing used to escape this handler as
+                    # a raw 500. Script is PRESENT but unexecutable - managed
+                    # posture: honest 502, row stays pending, never a silent
+                    # in-daemon fallback on a managed host.
+                    log.error("approval: sudo missing - provision script cannot run for %s (%s)",
+                              target["username"], slug)
+                    self._json(502, {"error": "provisioning cannot run (sudo not found); account left pending"})
+                    return
+                if rc.returncode != 0:
+                    # P1-F/N1: the response used to be ok:true no matter what.
+                    # Activation is the provision script's job - if it failed,
+                    # the row is still pending and the owner deserves to know.
+                    tail = (rc.stderr or rc.stdout or "").strip()[-300:]
+                    log.error("approval: provision FAILED rc=%s for %s as %s by %s: %s",
+                              rc.returncode, target["username"], role, u["username"], tail)
+                    self._json(502, {"error": "provisioning failed (rc=%s); account left pending" % rc.returncode,
+                                     "detail": tail})
+                    return
+                log.info("approval: %s approved as %s by %s; provision rc=0", target["username"], role, u["username"])
                 self._json(200, {"ok": True, "username": target["username"], "role": role, "slug": _p1h_pub_slug(target["slug"])})  # P1-H/N1
             elif decision == "reject":
                 registry_set_status(uid, "rejected")
@@ -15841,7 +16554,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 except Exception:
                     self._json(500, {"error": "save failed (see daemon log)"})
                     return
-                self._json(200, {"ok": True, "chars": len(text), "scope": _scope, "scope_user": _scope_user, "history": _sp_history_list()})
+                self._json(200, {"ok": True, "chars": len(text), "scope": _scope, "scope_user": _scope_user, "history": _sp_history_list(_sp_hist_bucket(_scope, _scope_user))})
             elif action == "reset":
                 version = body.get("version") or "pristine"
                 text = None
@@ -15850,9 +16563,10 @@ class MaraHandler(BaseHTTPRequestHandler):
                     if _rp is not None and _rp.exists():
                         text = _rp.read_text()
                 else:
-                    for h in _sp_history_list():
+                    _hb = _sp_hist_bucket(_scope, _scope_user)  # T-A1: reset can only pull the caller's OWN bucket
+                    for h in _sp_history_list(_hb):
                         if version == h["sha"] or version == h["sha8"] or h["sha"].startswith(version):
-                            text = (SP_HISTORY_DIR / ("%s-%s-%s.md" % (h["ts"], h["sha8"], h["note"]))).read_text()
+                            text = (_hb / ("%s-%s-%s.md" % (h["ts"], h["sha8"], h["note"]))).read_text()
                             break
                 if text is None:
                     self._json(404, {"error": "version not found: " + str(version)[:32]})
@@ -15865,7 +16579,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 except Exception:
                     self._json(500, {"error": "reset failed (see daemon log)"})
                     return
-                self._json(200, {"ok": True, "chars": len(text), "restored": version, "scope": _scope, "scope_user": _scope_user, "history": _sp_history_list()})
+                self._json(200, {"ok": True, "chars": len(text), "restored": version, "scope": _scope, "scope_user": _scope_user, "history": _sp_history_list(_sp_hist_bucket(_scope, _scope_user))})
             else:
                 self._json(400, {"error": "action must be save or reset"})
         elif path.startswith("/api/users/") and path.endswith("/break"):
@@ -15945,6 +16659,10 @@ class MaraHandler(BaseHTTPRequestHandler):
                 if shx["enabled"]:
                     share_set_enabled(shx, False)
                     n += 1
+            # B19/H07: the break also kills the target's OWN in-flight
+            # runs. sessions_delete_all fences new requests; a turn already
+            # in flight only stops via its cancel event.
+            principals.append(target["username"])
             cancelled = _cancel_runs_for(principals)
             log_event(u["username"], "user.break", target=target["username"],
                       shares_disabled=n, cancelled=cancelled)
@@ -16017,11 +16735,17 @@ class MaraHandler(BaseHTTPRequestHandler):
             # change (K80 13:19).
             sessions_delete_all(target["username"])
             rotate_user_id(target["username"])
+            # B19/H07: a role change kills the target's in-flight runs too
+            # (sessions are already wiped; the running turn needs the event).
+            cancelled = _cancel_runs_for([target["username"]])
+            log_event(u["username"], "user.role", target=target["username"],
+                      role=new_role, cancelled=cancelled)
             log.info("role change: %s %s -> %s by %s (ALL sessions invalidated)",
                      target["username"], old_role, new_role, u["username"])
             self._json(200, {"ok": True, "username": target["username"],
                              "role": new_role, "previous_role": old_role,
-                             "sessions_invalidated": True})
+                             "sessions_invalidated": True,
+                             "cancelled_runs": cancelled})
         elif path == "/v1/chat/completions":
             self._handle_openai_compat()
         else:
@@ -16064,7 +16788,15 @@ class MaraHandler(BaseHTTPRequestHandler):
                 return
             n = db.execute(
                 "SELECT COUNT(*) FROM messages WHERE conv_id=?", (cid,)).fetchone()[0]
+            # V15: refund the quota this conversation was holding, attributed
+            # per uploader row (legacy rows fall back to the conversation's
+            # owner via the claim; global sentinel always moves).
+            _rel = db.execute(
+                "SELECT user_id, COALESCE(SUM(size),0) FROM attachments"
+                " WHERE conv_id=? GROUP BY user_id", (cid,)).fetchall()
             db.execute("DELETE FROM attachments WHERE conv_id=?", (cid,))
+            for _up, _sz in _rel:
+                _quota_release(db, _up, _sz)
             db.execute("DELETE FROM compactions WHERE conv_id=?", (cid,))
             db.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
             db.execute("DELETE FROM conversations WHERE id=?", (cid,))
@@ -16494,13 +17226,12 @@ class MaraHandler(BaseHTTPRequestHandler):
         if not _valid_conv_id(conv_id):
             self._json(400, {"error": "invalid conversation_id"})
             return
-        # P3.3 S2: an existing conversation must be owned; upload-before-first-chat
-        # is allowed (client UUIDs are random; the conv row is born at first chat).
-        with sqlite3.connect(DB_PATH) as db:
-            up_row = db.execute("SELECT user_id FROM conversations WHERE id=?", (conv_id,)).fetchone()
-        if up_row is not None and up_row[0] != u["username"]:
-            self._json(404, {"error": "not found"})
-            return
+        # P3.3 S2 + V03 (0.6w): ownership AND guest gating now live in the
+        # claim below. Upload used to read user_id alone, which let one share
+        # guest plant an upload inside another guest's conversation while the
+        # share's history box was off (the read/stream/chat paths all checked
+        # the guest stamp; this path did not).
+        uname = u["username"]
         name = _safe_upload_name(body.get("name", ""))
         # P1-C/F4 (round-2 audit): the client-declared type is a rumor. SVG
         # is a script carrier and html/xhtml can be snorted; none of them get
@@ -16530,24 +17261,110 @@ class MaraHandler(BaseHTTPRequestHandler):
             # chmod is gone entirely - uploads never needed world-readable.
             self._json(400, {"error": "invalid conversation_id"})
             return
-        cdir.mkdir(parents=True, exist_ok=True)
-        stored_name = uuid.uuid4().hex[:8] + "_" + name
-        fpath = cdir / stored_name
-        fpath.write_bytes(raw)
-        _p1i_owner_only_file(fpath)   # P1-I/S09
+        # V03 (0.6w): claim the target BEFORE any file write, through the
+        # same claim-or-mint choke point chat uses (P1-I/S03). Foreign-owner
+        # and cross-guest (history box off) land here and die exactly like
+        # they already died in chat/read/stream. Mirrors the chat handler's
+        # C03 posture: stamp every share thread with its visit, enforce the
+        # stamp only while the history box is off.
+        _g03 = None
+        _g03_enf = False
+        if _is_share_principal(uname):
+            _g03 = self._sess_guest_id()
+            _g03_enf = not _share_history_allowed(uname)
+        verdict, _claimed = _p1i_claim_conv(conv_id, uname, guest_id=_g03,
+                                            enforce_guest=_g03_enf)
+        if verdict == "mint":
+            # "new"/empty sentinels own nothing; an upload needs a real id.
+            # Chat may mint a thread in peace - an upload minting the shared
+            # "new" conversation was just a collision waiting to happen.
+            self._json(400, {"error": "invalid conversation_id"})
+            return
+        if verdict == "bad":
+            self._json(400, {"error": "invalid conversation_id"})
+            return
+        if verdict == "denied":
+            # P3.3 S2 posture kept: foreign conversations are invisible.
+            self._json(404, {"error": "not found"})
+            return
         kind = _classify_attachment(name, mime)
         att_id = str(uuid.uuid4())
+        stored_name = uuid.uuid4().hex[:8] + "_" + name
+        _now = time.time()
+        # V15: quota reservation + pending attachment row are ONE txn, and
+        # it commits BEFORE any bytes touch disk. An attacker can no longer
+        # drop the file first and leave accounting (or the orphan reaper) to
+        # sort it out afterwards. If accounting fails, nothing exists.
         try:
             with sqlite3.connect(DB_PATH) as db:
+                db.execute("BEGIN IMMEDIATE")
+                _quota_reserve(db, uname, len(raw))
                 db.execute(
-                    "INSERT INTO attachments (id, conv_id, name, stored_name, mime, size, source, kind, ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO attachments (id, conv_id, name, stored_name,"
+                    " mime, size, source, kind, ts, user_id, guest_id,"
+                    " pending_until) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (att_id, conv_id, name, stored_name, mime, len(raw),
                      body.get("source") if body.get("source") in ("file", "camera") else "file",
-                     kind, time.time()))
+                     kind, _now, uname, _g03, _now + UPLOAD_PENDING_SECS))
                 db.commit()
-        except Exception:
-            fpath.unlink(missing_ok=True)
-            log.exception("Upload DB insert failed for conv %s", conv_id)
+        except QuotaExceeded as e:
+            self._json(507, {"error": str(e)})
+            return
+        except sqlite3.Error:
+            log.exception("Upload reservation failed for conv %s", conv_id)
+            self._json(500, {"error": "could not record upload"})
+            return
+        def _v03_undo():
+            # A reserved row whose bytes never landed is a quota leak and a
+            # zombie attachment. Undo both, but only while the row is still
+            # pending - if finalize already won the race, the row is real.
+            try:
+                with sqlite3.connect(DB_PATH) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    cur = db.execute(
+                        "DELETE FROM attachments WHERE id=? AND pending_until IS NOT NULL",
+                        (att_id,))
+                    if cur.rowcount:
+                        _quota_release(db, uname, len(raw))
+                    db.commit()
+            except sqlite3.Error:
+                log.exception("V03 undo failed for attachment %s", att_id)
+        try:
+            # V15: the staging file is mode 0600 from creation (no plaintext
+            # window), then renamed into place atomically. The P1-I/S09 stamp
+            # stays as belt-and-braces for the umask.
+            cdir.mkdir(parents=True, exist_ok=True)
+            fpath = cdir / stored_name
+            tmp = cdir / ("." + stored_name + ".part")
+            try:
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(raw)
+                os.replace(str(tmp), str(fpath))
+            except OSError:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            _p1i_owner_only_file(fpath)
+        except OSError:
+            _v03_undo()
+            log.exception("Upload staging write failed for conv %s", conv_id)
+            self._json(500, {"error": "could not store upload"})
+            return
+        try:
+            with sqlite3.connect(DB_PATH) as db:
+                db.execute("UPDATE attachments SET pending_until=NULL WHERE id=?",
+                           (att_id,))
+                db.commit()
+        except sqlite3.Error:
+            try:
+                fpath.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _v03_undo()
+            log.exception("Upload finalize failed for conv %s", conv_id)
             self._json(500, {"error": "could not record upload"})
             return
         log.info("Upload: conv=%s name=%s size=%d kind=%s", conv_id, name, len(raw), kind)
@@ -16839,6 +17656,11 @@ class MaraHandler(BaseHTTPRequestHandler):
             if fmt == "cairn":
                 try:
                     stats, restored = _import_cairn_archive(zf, u["username"], restore, restore_identity)
+                except QuotaExceeded as qe:
+                    # A5/V10 (round-9): import output now rides the V15 quota
+                    # ledger; a refusal is the same 507 the upload path gives.
+                    self._json(507, {"error": str(qe)})
+                    return
                 except ValueError as ve:
                     # P1-F/P: a parsed-but-malformed archive (duplicate top-level
                     # keys, unreadable members) is a client error, not a 500.
@@ -17100,6 +17922,7 @@ _F20_BACKUPS = BASE / "backups"
 _F20_PINFILE = STATE / "update-pin.json"
 _F20_STATEFILE = STATE / "update-state.json"
 _F20_PENDING = STATE / "update-pending.json"
+_F20_JOURNAL = STATE / "update-journal.json"  # B14 (0.6w): in-flight swap journal, reconciled on boot
 _F20_UA = "CAIRN-Updater/1"
 _F20_VER_RE = _f20_re.compile(r"\d{1,4}(?:\.\d{1,4}){1,3}[A-Za-z0-9._-]{0,16}\Z")
 _F20_SHA_RE = _f20_re.compile(r"[0-9a-f]{64}\Z")
@@ -17137,6 +17960,20 @@ def _f20_jwrite(path, obj):
         f.write(_f20_json.dumps(obj, ensure_ascii=True))
     _f20_os.chmod(tmp, 0o600)
     _f20_os.replace(tmp, str(path))
+
+
+def _f20_fsync_dir(p):
+    """B14 (round-9): fsync the DIRECTORY after os.replace so the rename
+    itself is durable, not just the file's bytes. Best-effort: a filesystem
+    that refuses a directory fsync must not fail an install."""
+    try:
+        fd = _f20_os.open(str(_f20_os.path.dirname(str(p)) or "."), _f20_os.O_RDONLY)
+        try:
+            _f20_os.fsync(fd)
+        finally:
+            _f20_os.close(fd)
+    except Exception:
+        pass
 
 
 def _f20_state():
@@ -17467,12 +18304,23 @@ def _f20_stage(force=False):
 def _f20_snapshot(stamp):
     """Pre-update backup: code + sqlite backup-API DB snapshots + settings
     dump + SHA manifest. Databases are never auto-RESTORED from this - it is
-    the human's safety net, and silent DB restore eats post-update chats."""
+    the human's safety net, and silent DB restore eats post-update chats.
+    B14 (round-9): a failed DB snapshot is now an ABORT, not a warning -
+    _f20_prepare refuses to swap without a complete pre-update backup.
+    V08 (round-8/9): secret settings are REDACTED from the settings.json
+    dump (canonical EXPORT_SECRET classification; keys kept, values
+    replaced; ROLLBACK.txt documents key recovery).
+    Returns (dir, err)."""
     d = _F20_BACKUPS / ("pre-update-" + stamp)
     d.mkdir(parents=True, exist_ok=True)
     _f20_os.chmod(str(_F20_BACKUPS), 0o700)
     _f20_os.chmod(str(d), 0o700)
-    _f20_shutil.copy2(_F20_SRC, str(d / "marahome.py"))
+    _errs = []
+    try:
+        _f20_shutil.copy2(_F20_SRC, str(d / "marahome.py"))
+        _f20_os.chmod(str(d / "marahome.py"), 0o600)
+    except Exception as e:
+        return d, "code copy failed (" + type(e).__name__ + ") - pre-update backup incomplete"
     for nm, p in (("conversations.db", DB_PATH), ("users.db", REGISTRY_PATH)):
         try:
             s = _f20_sqlite3.connect(str(p))
@@ -17482,12 +18330,33 @@ def _f20_snapshot(stamp):
             t.close(); s.close()
             _f20_os.chmod(str(d / nm), 0o600)
         except Exception as e:
-            _f20_clog("snapshot warning: " + nm + " not captured (" + type(e).__name__ + ")")
+            _errs.append(nm + " (" + type(e).__name__ + ")")
+            _f20_clog("snapshot FAILURE: " + nm + " (" + type(e).__name__ + ")")
+    if _errs:
+        return d, "DB snapshot failed: " + ", ".join(_errs)
     try:
         s = _f20_sqlite3.connect(str(DB_PATH))
         rows = s.execute("SELECT username, key, value FROM settings").fetchall()
         s.close()
-        _f20_jwrite(d / "settings.json", [[r[0], r[1], r[2]] for r in rows])
+        # V08 (round-8/9): this dump shipped secret settings PLAINTEXT at rest.
+        # Redact with the canonical export-secret classification (the same
+        # EXPORT_SECRET_PREFIXES/EXPORT_SECRET_NAMES the .cairn export/import
+        # path uses - no parallel list). Keys stay visible so the human can
+        # see what to re-enter; the DB copies in this snapshot still hold the
+        # live rows (safety net, never auto-restored). Residual: live settings
+        # rows remain plaintext until the vault migration (documented).
+        _redacted = []
+        _rows2 = []
+        for _u, _k, _v in rows:
+            if str(_k).startswith(EXPORT_SECRET_PREFIXES) or str(_k) in EXPORT_SECRET_NAMES:
+                _rows2.append([_u, _k, "[REDACTED - secret setting; re-enter via Settings after rollback]"])
+                _redacted.append(str(_k))
+            else:
+                _rows2.append([_u, _k, _v])
+        if _redacted:
+            _f20_clog("settings.json: redacted " + str(len(_redacted)) + " secret value(s) ("
+                      + ", ".join(sorted(set(_redacted))) + ")")
+        _f20_jwrite(d / "settings.json", _rows2)
     except Exception:
         pass
     lines = []
@@ -17498,7 +18367,15 @@ def _f20_snapshot(stamp):
     (d / "ROLLBACK.txt").write_text(
         "Manual rollback (code only - databases were not touched by the swap):\n"
         "  cp '" + str(d / "marahome.py") + "' '" + _F20_SRC + "' && "
-        "chown mara:mara '" + _F20_SRC + "' && systemctl restart marahome\n",
+        "chown mara:mara '" + _F20_SRC + "' && systemctl restart marahome\n"
+        "\n"
+        "V08 (round-8/9): secret settings are REDACTED from settings.json in this\n"
+        "snapshot (keys kept, values replaced). Key recovery: the DB copies beside\n"
+        "settings.json still hold the live rows (safety net, never auto-restored) -\n"
+        "e.g.  sqlite3 conversations.db 'SELECT * FROM settings'  - or re-enter via\n"
+        "Settings. Vault-sealed secrets are unaffected (encrypted under\n"
+        "VAULT_KEY_PATH). Residual: live settings rows remain plaintext in the DB\n"
+        "until the vault migration lands.\n",
         encoding="utf-8")
     # 0.6t AA (audit round 7): snapshots carried full code + DB copies forever.
     # Keep the 5 most recent pre-update-* dirs; older ones are pruned. Other
@@ -17514,7 +18391,7 @@ def _f20_snapshot(stamp):
                 _f20_clog("AA prune warning: " + _old.name + " (" + type(e).__name__ + ")")
     except Exception as e:
         _f20_clog("AA prune warning: sweep failed (" + type(e).__name__ + ")")
-    return d
+    return d, None
 
 
 def _f20_smoke(staged_file):
@@ -17608,7 +18485,14 @@ def _f20_prepare(man, summ, force=False):
             return "staged file churned since download - refusing to swap", None
     stamp = _f20_dt.now().strftime("%Y%m%dT%H%M%SZ")
     _f20_clog("snapshot: capturing pre-update backup")
-    snap = _f20_snapshot(stamp)
+    snap, snap_err = _f20_snapshot(stamp)
+    if snap_err:
+        # B14 (round-9): an incomplete pre-update backup is an ABORT now,
+        # not a warning - swapping without it leaves an advanced floor and
+        # nothing to roll back to.
+        _f20_clog("snapshot FAILED: " + snap_err + " - refusing to swap")
+        log_event(_f20_owner_name(), "update.failed", stage="snapshot", version=summ["version"], err=snap_err[:120])
+        return "pre-update snapshot failed - refusing to swap: " + snap_err, None
     _f20_clog("snapshot: " + str(snap))
     _f20_clog("smoke: gold-boot of staged build on scratch env")
     sf = _F20_STAGING / ("f_" + _f20_hashlib.sha256(man["files"][0]["path"].encode()).hexdigest()[:12])
@@ -17618,21 +18502,50 @@ def _f20_prepare(man, summ, force=False):
         log_event(_f20_owner_name(), "update.failed", stage="smoke", version=summ["version"], err=err[:120])
         return "smoke test failed - live files untouched: " + err, None
     _f20_clog("smoke: pass")
-    _f20_jwrite(_F20_PENDING, {"from": VERSION, "to": summ["version"], "stamp": stamp,
-                               "notes": str(man.get("notes", ""))[:8000], "welcomed": False,
+    # B14 (round-9): the swap is atomic and the anti-rollback state advances
+    # only AFTER it lands. Order: journal -> fsynced temp in the target dir
+    # -> os.replace -> dir fsync -> state -> pending -> journal cleared. A
+    # crash anywhere in there is reconciled on boot against the live SHA.
+    with open(_F20_SRC, "rb") as fh:
+        old_sha = _f20_hashlib.sha256(fh.read()).hexdigest()
+    new_sha = man["files"][0]["sha256"]
+    _f20_jwrite(_F20_JOURNAL, {"stamp": stamp, "from": VERSION, "to": summ["version"],
+                               "old_sha": old_sha, "new_sha": new_sha,
+                               "floor": summ["floor"], "nonce": int(summ["nonce"]),
                                "backup": str(snap)})
+    tmp_src = str(_F20_SRC) + ".f20new"
+    try:
+        with open(tmp_src, "wb") as fo:
+            fo.write(sf.read_bytes())
+            fo.flush()
+            _f20_os.fsync(fo.fileno())
+        _f20_os.chmod(tmp_src, 0o644)
+        _f20_os.replace(tmp_src, _F20_SRC)
+        _f20_fsync_dir(_F20_SRC)
+    except Exception as e:
+        for _p in (tmp_src, str(_F20_JOURNAL)):
+            try:
+                _f20_os.unlink(_p)
+            except Exception:
+                pass
+        _f20_clog("swap FAILED: " + type(e).__name__ + " - live file untouched")
+        log_event(_f20_owner_name(), "update.failed", stage="swap", version=summ["version"], err=type(e).__name__)
+        return "code swap failed - live files untouched: " + type(e).__name__, None
     st = _f20_state()
     vk_new, vk_old = _f20_vkey(summ["floor"]), _f20_vkey(st.get("floor", "0"))
     st["floor"] = summ["floor"] if vk_new >= vk_old else st.get("floor", "0")
     st["nonce"] = max(int(st.get("nonce", 0)), int(summ["nonce"]))
     st["last_install"] = {"from": VERSION, "to": summ["version"], "stamp": stamp,
-                          "build_sha_expected": None}
+                          "build_sha_expected": new_sha}
     _f20_jwrite(_F20_STATEFILE, st)
-    with open(_F20_SRC, "rb") as fh:
-        old_sha = _f20_hashlib.sha256(fh.read()).hexdigest()
-    _f20_shutil.copyfile(str(sf), _F20_SRC)
-    _f20_os.chmod(_F20_SRC, 0o644)
-    _f20_clog("swap: code replaced (was sha " + old_sha[:12] + ")")
+    _f20_jwrite(_F20_PENDING, {"from": VERSION, "to": summ["version"], "stamp": stamp,
+                               "notes": str(man.get("notes", ""))[:8000], "welcomed": False,
+                               "backup": str(snap)})
+    try:
+        _f20_os.unlink(str(_F20_JOURNAL))
+    except Exception:
+        pass
+    _f20_clog("swap: code replaced atomically (was sha " + old_sha[:12] + ")")
     _f20_clog("rollback (manual, code only): cp " + str(snap / "marahome.py") + " " + _F20_SRC)
     log_event(_f20_owner_name(), "update.installed", **{"from": VERSION, "to": summ["version"],
               "stamp": stamp, "old_sha": old_sha[:12], "force": str(bool(force))})
@@ -17843,7 +18756,7 @@ def _f20_welcome_gate(h):
     if not u or u["role"] != "owner" or u["status"] != "active":
         return False
     h.send_response(302)
-    h.send_header("Location", "/update/welcome")
+    h.send_header("Location", h._ui_base + "update/welcome")
     h.end_headers()
     return True
 
@@ -17954,6 +18867,53 @@ def _f20_init():
             pass
 
 
+def _f20_boot_reconcile():
+    """B14 (round-9): finish or discard an interrupted update, decided ONLY
+    by evidence. The journal is written BEFORE the code swap and cleared
+    AFTER the state advance, so on boot exactly two states are possible:
+      - live file matches journal.new_sha -> the swap landed but the state
+        advance was interrupted: complete it (floor/nonce/pending), then
+        clear the journal.
+      - live file does not match -> the swap never landed: the anti-rollback
+        state was never advanced (it is written after the swap now), so the
+        journal is discarded loudly and nothing is faked.
+    An unreadable journal is left untouched for a human - never guessed."""
+    if not _f20_os.path.exists(str(_F20_JOURNAL)):
+        return
+    j = _f20_jread(_F20_JOURNAL, None)
+    if not isinstance(j, dict) or not j.get("new_sha"):
+        _f20_clog("boot reconcile: unreadable update journal - leaving it for a human")
+        return
+    try:
+        with open(_F20_SRC, "rb") as fh:
+            live = _f20_hashlib.sha256(fh.read()).hexdigest()
+    except Exception as e:
+        _f20_clog("boot reconcile: cannot hash live code (" + type(e).__name__ + ") - journal kept")
+        return
+    if j.get("new_sha") == live:
+        st = _f20_state()
+        vk_new, vk_old = _f20_vkey(str(j.get("floor", "0"))), _f20_vkey(st.get("floor", "0"))
+        st["floor"] = j.get("floor") if (vk_new is not None and vk_old is not None and vk_new >= vk_old) else st.get("floor", "0")
+        st["nonce"] = max(int(st.get("nonce", 0)), int(j.get("nonce", 0)))
+        st["last_install"] = {"from": str(j.get("from", VERSION)), "to": str(j.get("to", "?")),
+                              "stamp": str(j.get("stamp", "?")), "build_sha_expected": live}
+        _f20_jwrite(_F20_STATEFILE, st)
+        _f20_jwrite(_F20_PENDING, {"from": str(j.get("from", "?")), "to": str(j.get("to", "?")),
+                                   "stamp": str(j.get("stamp", "?")), "notes": "",
+                                   "welcomed": False, "backup": str(j.get("backup", ""))})
+        try:
+            _f20_os.unlink(str(_F20_JOURNAL))
+        except Exception:
+            pass
+        _f20_clog("boot reconcile: swap landed but state advance was interrupted - floor/nonce completed now")
+        log_event(_f20_owner_name(), "update.reconciled", stage="completed", stamp=str(j.get("stamp", "?")))
+    else:
+        try:
+            _f20_os.unlink(str(_F20_JOURNAL))
+        except Exception:
+            pass
+        _f20_clog("boot reconcile: interrupted install DISCARDED - live code does not match the journal; anti-rollback state never advanced (backup: " + str(j.get("backup", "?")) + ")")
+        log_event(_f20_owner_name(), "update.reconciled", stage="discarded", stamp=str(j.get("stamp", "?")))
 def _f20_boot_note():
     pend = _f20_jread(_F20_PENDING)
     if isinstance(pend, dict):
@@ -17973,8 +18933,10 @@ LOG_CATALOG["update.failed"] = ("basic", "warn", "Update install aborted at a ga
 LOG_CATALOG["share.killswitch"] = ("basic", "warn", "Staff kill switch disabled ALL shares of a user (guests kicked, in-flight runs cancelled)", "target, disabled, cancelled")
 LOG_CATALOG["user.break"] = ("basic", "warn", "Staff broke an account: suspended status, all sessions killed, all shares disabled", "target, shares_disabled, cancelled")
 LOG_CATALOG["user.unsuspend"] = ("basic", "warn", "Owner restored a suspended account", "target")
+LOG_CATALOG["user.role"] = ("basic", "warn", "Owner changed a user's role (all sessions invalidated, in-flight runs cancelled)", "target, role, cancelled")
 LOG_CATALOG["update.rotated"] = ("basic", "warn", "Update verification key rotated via old-key-signed manifest", "nonce, manifest_nonce")
 LOG_CATALOG["update.booted"] = ("basic", "info", "First boot after an update swap (release notes pending)", "from, to, stamp")
+LOG_CATALOG["update.reconciled"] = ("basic", "warn", "Boot reconcile of an interrupted update journal (completed or discarded)", "stage, stamp")
 LOG_CATALOG["update.config"] = ("basic", "info", "Updater settings changed by owner", "fields")
 LOG_CATALOG["update.rejected"] = ("basic", "warn", "Update route refused a request", "reason")
 LOG_CATALOG["tier0.save"] = ("basic", "info", "Tier-0 constitution saved (text never logged)", "chars")
@@ -18307,8 +19269,9 @@ def _host_is_loopback(h):
     except ValueError:
         return False
 def _tls_wire(server):
-    """H08: TLS wiring with fail-closed semantics. Returns True when the
-    listener is wrapped. Raises RuntimeError BEFORE the socket serves when a
+    """H08: TLS wiring with fail-closed semantics. Returns True when TLS will be
+    served (T-A3: per-connection wrap - the listener itself stays plain and
+    _tls_ctx is set on the server for _BoundedHTTPServer._worker to use). Raises RuntimeError BEFORE the socket serves when a
     TLS mode cannot deliver TLS on a non-loopback bind - the address that was
     HTTPS yesterday must never be HTTP today."""
     global TLS_SERVED, _TLS_RUNTIME, _TLS_SERVED_CERT
@@ -18318,7 +19281,11 @@ def _tls_wire(server):
         return False
     if _cert:
         try:
-            server.socket = _tls_ctx_from(_cert, _key).wrap_socket(server.socket, server_side=True)
+            # T-A3: do NOT wrap the listener. load_cert_chain still runs here,
+            # so a bad pair raises at boot and fail-closed is unchanged; each
+            # accepted connection is wrapped per-worker instead, which is what
+            # keeps one idle TCP conn from freezing the whole accept loop.
+            server._tls_ctx = _tls_ctx_from(_cert, _key)
             TLS_SERVED = True
             _TLS_SERVED_CERT = _cert
             log.info("TLS: mode=%s serving HTTPS on %s:%d (cert %s)", _TLS_RUNTIME, HOST, PORT, _cert)
@@ -18356,10 +19323,12 @@ def main():
         sys.exit(_f20_cli_install(force=("--force" in sys.argv[1:])))
     _p1i_file_mode_sweep()   # P1-I/S09/S20: state 0700, DBs 0600, uploads 0600
     _f26_seed_tier_files()   # F26: seed lore-free Tier-1 base where absent (no-op on CAIRN)
+    _sp_history_migrate()    # T-A1 (0.6w): archive pre-buckets flat history entries (once)
     reload_identity()
     _p1c_install_dispatch_safety()  # P1-C/F9: no handler bug may leave a client dangling
     _f18_start()  # F18 scheduler (daemon thread, never kills boot)
     _f20_init()     # F20 updater dirs (0700)
+    _f20_boot_reconcile()  # B14 (0.6w): finish/discard an interrupted swap BEFORE any welcome stamp
     _f20_boot_note()  # F20: stamp post-update boot; welcome gate reads the marker
 
     def _sighup(_s, _f):
