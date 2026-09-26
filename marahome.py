@@ -1023,7 +1023,7 @@ form.addEventListener("submit", async (e) => {
 </script>
 <div id="f25w" style="display:none;background:#3a1d24;border:1px solid #ff3b5c;color:#ffd9e0;
 padding:10px 14px;border-radius:8px;margin:0 0 16px;font-size:13px;text-align:left">
-You are reaching CAIRN over plain HTTP from a non-localhost address. Session cookies are Secure by design, so a browser will not keep a login session on this transport. Open http://localhost:8470 (default port) on the machine itself, or put CAIRN behind TLS you control (Cloudflare Tunnel, or Caddy with tls internal). This page keeps working over HTTP on purpose: first setup should never require trusting a stranger's certificate.
+You are reaching CAIRN over plain HTTP from a non-localhost address. Session cookies cannot be marked Secure over plain HTTP, so your login WILL stick here and your session token travels in the clear - readable by anyone on the network path. Open http://localhost:8470 (default port) on the machine itself, or put CAIRN behind TLS you control (Cloudflare Tunnel, or Caddy with tls internal). This page keeps working over HTTP on purpose: first setup should never require trusting a stranger's certificate.
 </div>
 <script>
 /* F25: insecure-transport disclosure. Browsers treat localhost as a secure context,
@@ -1075,13 +1075,132 @@ def _owns_share_principal(username, principal):
 def _share_alive(sh):
     if sh is None or not int(sh["enabled"] or 0):
         return False
+    # V19: lifecycle state. 'creating' (ceremony in flight) and
+    # 'deleting' (tombstone, cleanup retriable) are NOT alive. Join rows
+    # that do not carry the column (approval-decide shape) fall through -
+    # both non-active states also set enabled=0, so the gate above already
+    # catches them there.
+    if "state" in sh.keys() and str(sh["state"] or "active") != "active":
+        return False
     _exp = sh["expires_at"]
-    return not (_exp and _exp < time.time())
+    if _exp and _exp < time.time():
+        return False
+    # T-B20 (R9 B20): a share is alive only while its SHARER is an active
+    # account. /break suspends AND disables shares, but every other road to
+    # status='suspended' used to leave guests chatting on the owner's
+    # provider keys. Owner row missing or non-active -> dead (fail closed:
+    # never bill a maybe-suspended purse; if the registry itself cannot be
+    # read, nothing else works either). Shape note: the V11 approval-decide
+    # JOIN row carries the owner column as "owner_", plain shares rows as
+    # "owner"; a row carrying neither cannot be verified and dies closed.
+    try:
+        _keys = sh.keys()
+        _own = sh["owner"] if "owner" in _keys else (
+            sh["owner_"] if "owner_" in _keys else None)
+        if _own is None:
+            return False
+        _ow = registry_get_user(_own)
+    except Exception:
+        return False
+    return bool(_ow) and (_ow["status"] or "") == "active"
 def _share_public_row(sh):
     return {"id": sh["id"], "label": sh["label"], "owner": sh["owner"],
             "enabled": bool(int(sh["enabled"] or 0)), "created_at": sh["created_at"],
             "expires_at": sh["expires_at"], "alive": _share_alive(sh),
+            "state": (str(sh["state"] or "active") if "state" in sh.keys() else "active"),
             "url": "/share/" + sh["id"]}
+def _v19_rmtree_checked(path):
+    """V19: rmtree that REPORTS instead of swallowing. ignore_errors=True let
+    the old delete eat filesystem failures while the API claimed the share was
+    gone. Returns a list of failures; an already-vanished path is success; a
+    tree still present after the pass is reported, and the next pass picks up
+    where this one stopped."""
+    errs = []
+    def _onerr(_fn, p, _exc):
+        try:
+            if not os.path.exists(p):
+                return
+        except OSError:
+            pass
+        errs.append(str(p))
+    try:
+        shutil.rmtree(path, onerror=_onerr)
+    except OSError as _e:
+        errs.append(str(path) + ": " + str(_e))
+    try:
+        if path.exists() and str(path) not in errs:
+            errs.append(str(path) + ": still present after cleanup pass")
+    except OSError:
+        pass
+    return errs
+def _v19_cleanup_namespace(principal):
+    """One IDEMPOTENT cleanup pass over the share's content footprint:
+    conversation/message/compaction/attachment rows + quota release, uploads
+    dirs, settings rows, memory dir (containment-guarded), tier1 snapshot +
+    pristine. Missing files/rows are successes, not errors - safe to re-run
+    until it returns []."""
+    errs = []
+    cids = []
+    try:
+        with sqlite3.connect(DB_PATH) as db:
+            cids = [r[0] for r in db.execute("SELECT id FROM conversations WHERE user_id=?", (principal,)).fetchall()]
+            for cid in cids:
+                db.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
+                db.execute("DELETE FROM compactions WHERE conv_id=?", (cid,))
+                try:
+                    # V15: count the bytes, delete the rows, hand the quota
+                    # back - in that order, per conversation.
+                    _w_sz = db.execute(
+                        "SELECT COALESCE(SUM(size),0) FROM attachments WHERE conv_id=?",
+                        (cid,)).fetchone()[0]
+                    db.execute("DELETE FROM attachments WHERE conv_id=?", (cid,))
+                    _quota_release(db, principal, _w_sz)
+                except Exception as _e:
+                    errs.append("attachments/quota for " + str(cid) + ": " + str(_e))
+                db.execute("DELETE FROM conversations WHERE id=?", (cid,))
+            db.execute("DELETE FROM settings WHERE username=?", (principal,))
+            db.commit()
+    except Exception as _e:
+        errs.append("content database: " + str(_e))
+    for cid in cids:
+        if _valid_conv_id(cid):  # belt: never rmtree a traversal
+            try:
+                errs.extend(_v19_rmtree_checked(UPLOADS_DIR / cid))
+            except Exception as _e:
+                errs.append("uploads dir " + str(cid) + ": " + str(_e))
+    try:
+        md = _user_memory_dir(principal)
+        # B5: containment via resolve() - the dir must be a DIRECT real child
+        # of MEMORY_DIR. A symlinked namespace resolves away and is never
+        # removed. Covers seed + room/ + visits/ in one rmtree.
+        if md is not None and md.resolve().parent == MEMORY_DIR.resolve() and md.exists():
+            errs.extend(_v19_rmtree_checked(md))
+    except Exception as _e:
+        errs.append("memory dir: " + str(_e))
+    try:
+        tp = _tier1_target(principal)
+        if tp is not None:
+            for p in (tp, tp.with_name(tp.name + ".pristine")):
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as _e:
+                    errs.append(str(p) + ": " + str(_e))
+    except Exception as _e:
+        errs.append("tier1 files: " + str(_e))
+    return errs
+def _v19_scratch_namespace(principal):
+    """Failed-create rollback: best-effort removal of whatever the ceremony
+    already wrote into the share namespace. Residue is LOUD (a rollback that
+    silently leaves files is the orphan farm we are trying to end)."""
+    try:
+        _left = _v19_cleanup_namespace(principal)
+        if _left:
+            log.warning("V19: create rollback left residue for %s: %s",
+                        principal, "; ".join(_left[:5]))
+    except Exception:
+        pass
 def share_create(owner_username, label, expires_days, include_mem=False):
     """Creation ceremony (canon): random principal + random password shown
     ONCE. Persona copied into the share's OWN settings row; the sharer's
@@ -1095,10 +1214,6 @@ def share_create(owner_username, label, expires_days, include_mem=False):
     except Exception:
         days = 0
     days = max(0, min(days, 3650))
-    with _reg_db() as db:
-        n = db.execute("SELECT COUNT(*) FROM shares WHERE owner=?", (owner_username,)).fetchone()[0]
-    if n >= SHARE_MAX_PER_OWNER:
-        return None, "share limit reached (" + str(SHARE_MAX_PER_OWNER) + " per principal)", None
     pw = os.urandom(12).hex()
     salt = os.urandom(16).hex()
     sid = ""
@@ -1111,9 +1226,47 @@ def share_create(owner_username, label, expires_days, include_mem=False):
     if not sid:
         return None, "could not mint a share id - try again", None
     principal = "share-" + sid
-    registry_create_user(principal, pw, display_name=label, agent_name=label,
-                         slug=principal, role="guest", status="active",
-                         approved_at=time.time())
+    # V19: QUOTA CHECK AND ROW INSERT ARE ONE BEGIN IMMEDIATE TRANSACTION
+    # (the old flow counted on one connection and inserted on another -
+    # parallel creates all saw room). The row is RESERVED as 'creating'
+    # with enabled=0: quota is held atomically from this instant, and no
+    # gate, login door, or alive check rides the share until activation.
+    # Tombstones ('deleting') are deliberately NOT counted: a share whose
+    # guests are locked out does not hold the owner's slot hostage while
+    # host-side cleanup is retried (logged nuance on the LEDGER row).
+    expires_at = (time.time() + days * 86400.0) if days else None
+    try:
+        with _reg_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            n = db.execute("SELECT COUNT(*) FROM shares WHERE owner=?"
+                           " AND state IN ('active','creating')",
+                           (owner_username,)).fetchone()[0]
+            if n >= SHARE_MAX_PER_OWNER:
+                db.rollback()
+                return None, "share limit reached (" + str(SHARE_MAX_PER_OWNER) + " per principal)", None
+            db.execute(
+                "INSERT INTO shares (id, principal, owner, label, salt, pw_hash, enabled, expires_at, created_at, has_tier1, state)"
+                " VALUES (?,?,?,?,?,?,0,?,?,0,'creating')",
+                (sid, principal, owner_username, label, salt, _hash_pw(pw, salt),
+                 expires_at, time.time()))
+            db.commit()
+    except Exception:
+        log.exception("S06: share reserve failed for %s", owner_username)
+        return None, "share creation failed - nothing was kept", None
+    try:
+        registry_create_user(principal, pw, display_name=label, agent_name=label,
+                             slug=principal, role="guest", status="active",
+                             approved_at=time.time())
+    except Exception:
+        log.exception("S06: share principal create failed for %s", sid)
+        # V19: the reserved row is the only footprint so far.
+        try:
+            with _reg_db() as db:
+                db.execute("DELETE FROM shares WHERE id=? AND state='creating'", (sid,))
+                db.commit()
+        except Exception:
+            pass
+        return None, "share creation failed - nothing was kept", None
     has_t1 = 0
     try:
         _cp = _tier1_file(owner_username)  # personal copy? snapshot it.
@@ -1121,19 +1274,20 @@ def share_create(owner_username, label, expires_days, include_mem=False):
             _tp = _tier1_target(principal)
             if _tp is not None:
                 _tp.parent.mkdir(parents=True, exist_ok=True)
-                _tp.write_text(_cp.read_text())
+                # V19: the snapshot carries the owner's personal Tier 1
+                # into the share namespace - created 0600, never at umask
+                # defaults.
+                _v19_data = _cp.read_bytes()
+                _v19_fd = os.open(str(_tp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(_v19_fd, _v19_data)
+                finally:
+                    os.close(_v19_fd)
                 has_t1 = 1
     except Exception:
         log.warning("S06: tier1 snapshot failed for share by %s - this share projects the global base", owner_username)
     _persona = (get_setting("custom_instructions", "", owner_username) or "")
-    expires_at = (time.time() + days * 86400.0) if days else None
     try:
-        with _reg_db() as db:
-            db.execute(
-                "INSERT INTO shares (id, principal, owner, label, salt, pw_hash, enabled, expires_at, created_at, has_tier1)"
-                " VALUES (?,?,?,?,?,?,1,?,?,?)",
-                (sid, principal, owner_username, label, salt, _hash_pw(pw, salt),
-                 expires_at, time.time(), has_t1))
         if _persona:
             set_setting("custom_instructions", _persona, principal)
         # S06 (0.6s): the include-memories box (canon ruling 5) - the ONE
@@ -1142,13 +1296,27 @@ def share_create(owner_username, label, expires_days, include_mem=False):
         _mem_n = 0
         if include_mem:
             _mem_n = _share_copy_memories_at_creation(share_get(sid), owner_username)
+        # V19 activation - the SECOND transaction. enabled + state flip
+        # together; the CAS on state='creating' means a delete that raced
+        # the ceremony can never be resurrected by a late activation.
+        with _reg_db() as db:
+            cur = db.execute("UPDATE shares SET enabled=1, state='active', has_tier1=?"
+                             " WHERE id=? AND state='creating'", (has_t1, sid))
+            db.commit()
+        if cur.rowcount != 1:
+            raise RuntimeError("share activation lost - row is no longer creating")
     except Exception:
         log.exception("S06: share create rollback for %s", owner_username)
+        # V19: "nothing was kept" now REALLY means nothing - user row,
+        # reserved share row, tier1 snapshot, copied memories, settings.
         try:
             with _reg_db() as db:
                 db.execute("DELETE FROM users WHERE username=?", (principal,))
+                db.execute("DELETE FROM shares WHERE id=?", (sid,))
+                db.commit()
         except Exception:
             pass
+        _v19_scratch_namespace(principal)
         return None, "share creation failed - nothing was kept", None
     _sp_clear_principal(principal)
     log_event(owner_username, "share.create", share_id=sid, memories_copied=_mem_n)
@@ -1188,61 +1356,43 @@ def share_set_expiry(sh, days):
     log_event(sh["owner"], "share.expiry", share_id=sh["id"], days=days)
     return None
 def share_delete(sh):
-    """Delete ceremony, order-fixed (canon): sessions -> conversations +
-    messages/compactions/attachments rows -> uploads dirs -> settings rows ->
-    memory dir (containment-guarded) -> tier1 copy + pristine -> share row ->
-    user row. No orphan escapes; nothing outside the share's namespace is
-    ever touched."""
+    """V19 delete ceremony (canon order, lifecycle state machine):
+    REVOKE FIRST - sessions die and in-flight guest turns get the cancel
+    event (B19 machinery). TOMBSTONE SECOND - state='deleting' + enabled=0
+    in one immediate transaction closes the gate and the login door
+    instantly, and the row survives as the retry anchor. CLEAN THIRD - one
+    idempotent pass over the content footprint that REPORTS instead of
+    swallowing (the old rmtree(ignore_errors=True) ate failures while the
+    API claimed the share was gone). Everything gone -> row + user row gone,
+    cleanup='complete'. Anything left -> the tombstone REMAINS (the owner
+    hits delete again to retry; guests stay locked out in the meantime) and
+    the result says cleanup='incomplete' with the failed paths, distinctly.
+    Nothing outside the share's namespace is ever touched."""
     principal = sh["principal"]
+    sid = sh["id"]
     sessions_delete_all(principal)
-    try:
-        with sqlite3.connect(DB_PATH) as db:
-            cids = [r[0] for r in db.execute("SELECT id FROM conversations WHERE user_id=?", (principal,)).fetchall()]
-            for cid in cids:
-                db.execute("DELETE FROM messages WHERE conv_id=?", (cid,))
-                db.execute("DELETE FROM compactions WHERE conv_id=?", (cid,))
-                try:
-                    # V15: count the bytes, delete the rows, hand the quota
-                    # back - in that order, per conversation.
-                    _w_sz = db.execute(
-                        "SELECT COALESCE(SUM(size),0) FROM attachments WHERE conv_id=?",
-                        (cid,)).fetchone()[0]
-                    db.execute("DELETE FROM attachments WHERE conv_id=?", (cid,))
-                    _quota_release(db, principal, _w_sz)
-                except Exception:
-                    pass
-                db.execute("DELETE FROM conversations WHERE id=?", (cid,))
-            db.execute("DELETE FROM settings WHERE username=?", (principal,))
-            db.commit()
-        for cid in cids:
-            if _valid_conv_id(cid):  # belt: never rmtree a traversal
-                shutil.rmtree(UPLOADS_DIR / cid, ignore_errors=True)
-    except Exception:
-        log.exception("S06: share content delete failed for %s", principal)
-    try:
-        md = _user_memory_dir(principal)
-        # B5: containment via resolve() - the dir must be a DIRECT real child
-        # of MEMORY_DIR. A symlinked namespace resolves away and is never
-        # removed. Covers seed + room/ + visits/ in one rmtree.
-        if md is not None and md.resolve().parent == MEMORY_DIR.resolve() and md.exists():
-            shutil.rmtree(md, ignore_errors=True)
-    except Exception:
-        pass
-    try:
-        tp = _tier1_target(principal)
-        if tp is not None:
-            for p in (tp, tp.with_name(tp.name + ".pristine")):
-                try:
-                    p.unlink()
-                except FileNotFoundError:
-                    pass
-    except Exception:
-        pass
+    cancelled = _cancel_runs_for([principal])
     with _reg_db() as db:
-        db.execute("DELETE FROM shares WHERE id=?", (sh["id"],))
-        db.execute("DELETE FROM users WHERE username=?", (principal,))
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("UPDATE shares SET state='deleting', enabled=0 WHERE id=?", (sid,))
+        db.commit()
+    errs = _v19_cleanup_namespace(principal)
     _sp_clear_principal(principal)
-    log_event(sh["owner"], "share.delete", share_id=sh["id"])
+    if not errs:
+        with _reg_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM shares WHERE id=?", (sid,))
+            db.execute("DELETE FROM users WHERE username=?", (principal,))
+            db.commit()
+        log_event(sh["owner"], "share.delete", share_id=sid, cleanup="complete")
+        return {"ok": True, "cleanup": "complete", "cleanup_errors": [],
+                "runs_cancelled": cancelled}
+    log.warning("V19: share %s tombstoned, cleanup incomplete: %s",
+                sid, "; ".join(errs[:5]))
+    log_event(sh["owner"], "share.delete", share_id=sid, cleanup="incomplete",
+              failures=len(errs))
+    return {"ok": True, "cleanup": "incomplete", "cleanup_errors": errs,
+            "runs_cancelled": cancelled}
 def _share_path_allowed(p):
     """S06 guest allowlist (deny by default - this IS the security model):
     what a role=guest session may touch. Everything else reads as anonymous:
@@ -1812,9 +1962,13 @@ def _share_ask_execute(username, args):
         return "the sharer cannot use that tool either - nothing to ask for"
     _share_approvals_expire()
     with _reg_db() as db:
+        # V19: pending-check + insert are ONE BEGIN IMMEDIATE transaction
+        # (same posture as the share quota and the V11 decide path).
+        db.execute("BEGIN IMMEDIATE")
         n = db.execute("SELECT COUNT(*) AS c FROM share_approvals"
                        " WHERE share_id=? AND status='pending'", (sh["id"],)).fetchone()["c"]
         if n >= SHARE_ASK_MAX_PENDING:
+            db.rollback()
             return "the inbox already has pending requests for this share - wait for a decision"
         db.execute("INSERT INTO share_approvals (share_id, tool_name, note, status,"
                    " requested_by, created_at) VALUES (?,?,?,?,?,?)",
@@ -2218,8 +2372,11 @@ def _shares_api_post(h):
         log_event(u["username"], "share.grants", share_id=sh["id"])
         h._json(200, {"ok": True, "share": _share_public_row(share_get(sh["id"]))})
     elif action == "delete":
-        share_delete(sh)
-        h._json(200, {"ok": True})
+        # V19: revoked + tombstoned IS success for the share; leftover
+        # files are reported distinctly (cleanup="incomplete" + the failed
+        # paths) and the tombstone stays put as the retry anchor.
+        res = share_delete(sh)
+        h._json(200, res)
     else:
         h._json(400, {"error": "unknown action"})
 # ─── S06 guest + management pages (0.6q) ────────────────────────────────────
@@ -2586,6 +2743,11 @@ def init_registry():
         # new shares keep byte-identical prompts until a sharer opts out.
         _add_col(db, "shares", "project_tier0", "INTEGER NOT NULL DEFAULT 1")
         _add_col(db, "shares", "project_tier2", "INTEGER NOT NULL DEFAULT 1")
+        # V19 (round-9): share lifecycle state. 'active' = normal;
+        # 'creating' = quota reserved, creation ceremony still running;
+        # 'deleting' = tombstone: revoked and closed, cleanup incomplete and
+        # retriable. The DEFAULT keeps every existing row byte-identical.
+        _add_col(db, "shares", "state", "TEXT NOT NULL DEFAULT 'active'")
         db.execute("CREATE TABLE IF NOT EXISTS share_presence ("
                    "owner TEXT PRIMARY KEY, seen_at REAL NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS share_approvals ("
@@ -6156,11 +6318,18 @@ try:
     from zoneinfo import ZoneInfo as _f18_zi  # noqa: E402  (F23: per-user time zones)
 except Exception:
     _f18_zi = None  # ancient stdlib / missing zoneinfo: everyone gets system-local
+from concurrent.futures import ThreadPoolExecutor as _f18_Pool  # noqa: E402  (V16)
 
 F18_TICK_SECONDS = 20
 F18_MAX_TASKS = 100
 F18_RESULT_CHARS = 400
 F18_CATCHUP_CAP = 120          # minutes; a VM suspend must not cause a firehose
+F18_MAX_PARALLEL = 4           # V16: bounded worker pool for model calls
+F18_LEASE_SECS = 900           # V16: fire lease; report sketched 600, agent loops with tool chains legitimately exceed 10 min — expiry is recoverable either way
+_f18_pool = None               # V16: ThreadPoolExecutor, created in _f18_start
+_f18_inflight = {}             # V16: task_id -> True while a worker owns it
+_f18_inflight_lock = _f18_threading.Lock()
+_f18_migrated = False          # V16: column migration once per process
 _f18_last_min = None           # minute latch, owned by the scheduler thread
 def _f18_zone(username):
     """F23: the user's IANA zone from settings ("" / bad name = system-
@@ -6190,6 +6359,73 @@ def _f18_local(dt_naive, username):
         return dt_naive
 
 
+def _f18_wall_to_epoch(stamp_str, username):
+    """V16 backfill: interpret legacy 'YYYY-MM-DDTHH:MM' (owner wall time)
+    as a UTC epoch. Best effort: owner zone first (fold=0), then system
+    local. None = unparseable (that task's latch simply starts fresh)."""
+    try:
+        w = _f18_dt.strptime(stamp_str, "%Y-%m-%dT%H:%M")
+    except Exception:
+        return None
+    z = _f18_zone(username)
+    try:
+        if z is not None:
+            return w.replace(tzinfo=z, fold=0).timestamp()
+        return w.astimezone().timestamp()
+    except Exception:
+        return None
+
+
+def _f18_wall_info(m_utc, username):
+    """V16: for a UTC-aware minute instant, return (owner-naive wall minute,
+    occurrence, gap). occurrence is 'second' when this wall minute already
+    happened one real hour ago (fall-back repeat), 'first' when it will
+    repeat in an hour, else 'normal'. gap=True when the owner's zone
+    SPRING-FORWARDED during the last real hour (the wall-minus-1h phantom
+    minute was skipped). Zone-free owners: normal, no gap."""
+    z = _f18_zone(username)
+    w_a = m_utc.astimezone(z) if z is not None else m_utc.astimezone()
+    w = w_a.replace(tzinfo=None)
+    if z is None:
+        return w, "normal", False
+    try:
+        prev = (m_utc - _f18_td(hours=1)).astimezone(z)
+        nxt = (m_utc + _f18_td(hours=1)).astimezone(z)
+    except Exception:
+        return w, "normal", False
+    occ = "normal"
+    if prev.replace(tzinfo=None) == w:
+        occ = "second"
+    elif nxt.replace(tzinfo=None) == w:
+        occ = "first"
+    gap = (w_a.utcoffset() - prev.utcoffset() == _f18_td(hours=1))
+    return w, occ, gap
+
+
+def _f18_eligible(t, m_utc):
+    """V16: the wall minute (naive dt) DUE for task t at UTC instant m_utc,
+    honoring the task's explicit DST policies; None = not due.
+    dst_missing 'skip' (default): nonexistent minutes never fire — exactly
+    the old implicit behavior. 'move': a minute skipped by spring-forward
+    fires at the first real minute after the gap.
+    dst_repeat 'first' (default): a fall-back-repeated minute fires on its
+    first occurrence only — the old latch ate the repeat. 'second': only
+    the repeat. 'both': both occurrences."""
+    w, occ, gap = _f18_wall_info(m_utc, t["owner"])
+    if _f18_cron_match(t["cron"], w):
+        rp = (t.get("dst_repeat") or "first")
+        if rp == "first" and occ == "second":
+            return None
+        if rp == "second" and occ == "first":
+            return None
+        return w
+    if gap and (t.get("dst_missing") or "skip") == "move":
+        ph = w - _f18_td(hours=1)
+        if _f18_cron_match(t["cron"], ph):
+            return ph
+    return None
+
+
 def _f18_ensure_tasks(db):
     db.execute("CREATE TABLE IF NOT EXISTS tasks ("
                "id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL,"
@@ -6197,6 +6433,37 @@ def _f18_ensure_tasks(db):
                "enabled INTEGER NOT NULL DEFAULT 1, conv_id TEXT,"
                "last_fire TEXT, last_result TEXT, last_ts REAL, created_at REAL)")
     db.execute("CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner)")
+    global _f18_migrated
+    if _f18_migrated:
+        return
+    # V16: UTC latch + fire lease + explicit DST policy. Once per process —
+    # _add_col ALTERs take the write lock, they must not ride every tick.
+    # Defaults byte-preserve the effective pre-V16 behavior (spring-forward
+    # skip; fall-back fires first occurrence only).
+    try:
+        _add_col(db, "tasks", "last_fire_utc", "REAL")
+        _add_col(db, "tasks", "lease_until", "REAL")
+        _add_col(db, "tasks", "lease_token", "TEXT")
+        _add_col(db, "tasks", "dst_missing", "TEXT NOT NULL DEFAULT 'skip'")
+        _add_col(db, "tasks", "dst_repeat", "TEXT NOT NULL DEFAULT 'first'")
+        db.commit()
+        _f18_migrated = True
+    except Exception:
+        db.rollback()
+        log.exception("F18: V16 column migration failed; scheduler cannot claim safely (tick errors are logged and retried)")
+        return
+    # one-time backfill: legacy wall-string latch -> UTC epoch, best effort.
+    try:
+        rows = db.execute("SELECT id, owner, last_fire FROM tasks "
+                          "WHERE last_fire_utc IS NULL AND last_fire IS NOT NULL").fetchall()
+        for _rid, _own, _lf in rows:
+            _ep = _f18_wall_to_epoch(_lf, _own)
+            if _ep is not None:
+                db.execute("UPDATE tasks SET last_fire_utc=? WHERE id=?", (_ep, _rid))
+        if rows:
+            db.commit()
+    except Exception:
+        db.rollback()
 
 
 def _f18_cron_field(spec, lo, hi):
@@ -6352,15 +6619,33 @@ def _f18_task_turn(t):
         return False, "crashed: " + type(e).__name__ + ": " + str(e)[:180], conv_id
 
 
-def _f18_run_task(t, stamp):
-    """Fire + record. The tick thread runs these inline, so fires are
-    serialized by construction — no lock, no provider pile-ups."""
+def _f18_run_task(t, stamp, m_epoch=None, lease_token=None):
+    """Fire + record (V16: runs in the worker pool, NOT in the tick
+    connection). The tick already latched + leased this fire (claim before
+    effect), so a crash after the model call cannot refire the same due
+    minute — the idempotency unit is (task_id, floored due UTC minute).
+    Recording is lease-token-guarded: a worker that outlived its lease
+    never clobbers a newer fire's state. m_epoch=None keeps the legacy
+    direct-call shape (no lease bookkeeping)."""
     t0 = time.time()
-    ok, result, conv_id = _f18_task_turn(t)
+    ok = False
+    conv_id = t.get("conv_id") or ""
+    # V16: re-check the account between claim and effect — an account
+    # paused in that window releases the fire without any model call.
+    _tou = registry_get_user(t["owner"])
+    if not _tou or _tou["status"] != "active":
+        result = "held: account not active"
+    else:
+        ok, result, conv_id = _f18_task_turn(t)
     try:
         with sqlite3.connect(DB_PATH) as db:
-            db.execute("UPDATE tasks SET conv_id=?, last_fire=?, last_result=?, last_ts=? WHERE id=?",
-                       (conv_id, stamp, result, time.time(), t["id"]))
+            if lease_token is None:
+                db.execute("UPDATE tasks SET conv_id=?, last_fire=?, last_result=?, last_ts=? WHERE id=?",
+                           (conv_id, stamp, result, time.time(), t["id"]))
+            else:
+                db.execute("UPDATE tasks SET conv_id=?, last_fire=?, last_result=?, last_ts=?,"
+                           " lease_until=NULL, lease_token=NULL WHERE id=? AND lease_token=?",
+                           (conv_id, stamp, result, time.time(), t["id"], lease_token))
             db.commit()
     except Exception:
         log.exception("F18 failed to record task outcome")
@@ -6372,11 +6657,30 @@ def _f18_run_task(t, stamp):
     return {"id": t["id"], "ok": ok, "result": result, "conv_id": conv_id, "stamp": stamp}
 
 
+def _f18_worker(t, stamp, m_epoch, lease_token):
+    """V16: pool entry point. Owns the in-flight slot for the whole run."""
+    try:
+        _f18_run_task(t, stamp, m_epoch, lease_token)
+    except Exception:
+        log.exception("F18 worker failed for task %r", t.get("id"))
+    finally:
+        with _f18_inflight_lock:
+            _f18_inflight.pop(t["id"], None)
+
+
 def _f18_tick(now=None):
-    """One scheduler pass. Fires each enabled task once per matching minute,
-    oldest minute first. Returns list of fire records (E2E visibility)."""
+    """One scheduler pass (V16). Due instants are UTC minutes; per-task wall
+    conversion + the task's explicit DST policy decide eligibility. Each due
+    fire is CLAIMED in one short BEGIN IMMEDIATE transaction (latch + lease
+    written BEFORE any model work), then handed to a bounded worker pool —
+    a slow model call never blocks the tick thread, another task, or a later
+    tick. Returns fire records ('pending' = handed to the pool; without a
+    pool — tests/boot-before-arm — fires run serially, still claim-latched)."""
     global _f18_last_min
-    now_dt = (now or _f18_dt.now()).replace(second=0, microsecond=0)
+    now_dt = now or _f18_dt.now(_f18_ti.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.astimezone()   # naive operator/test input = system local
+    now_dt = now_dt.astimezone(_f18_ti.utc).replace(second=0, microsecond=0)
     if _f18_last_min is None:
         _f18_last_min = now_dt - _f18_td(minutes=1)
     gap = int((now_dt - _f18_last_min).total_seconds() // 60)
@@ -6387,33 +6691,83 @@ def _f18_tick(now=None):
         _f18_last_min = now_dt - _f18_td(minutes=1)
         gap = 1
     fired = []
+    now_e = time.time()
+    _cols = ("id", "owner", "name", "cron", "prompt", "enabled", "conv_id",
+             "last_fire", "last_result", "last_ts", "created_at",
+             "last_fire_utc", "lease_until", "lease_token", "dst_missing", "dst_repeat")
+    with sqlite3.connect(DB_PATH) as db:
+        _f18_ensure_tasks(db)
+        # V16 fairness under the 8-per-minute claim cap: oldest latch first,
+        # never-fired (NULL) tops the queue (SQLite ASC puts NULL first) -
+        # without this an always-due 9th task would starve forever.
+        rows = [dict(zip(_cols, r)) for r in db.execute(
+            "SELECT id, owner, name, cron, prompt, enabled, conv_id,"
+            " last_fire, last_result, last_ts, created_at,"
+            " last_fire_utc, lease_until, lease_token, dst_missing, dst_repeat"
+            " FROM tasks WHERE enabled=1 ORDER BY last_fire_utc ASC").fetchall()]
     for back in range(gap - 1, -1, -1):
         m = now_dt - _f18_td(minutes=back)
-        stamp = m.strftime("%Y-%m-%dT%H:%M")
+        m_epoch = m.timestamp()
+        due = []
+        for t in rows:
+            with _f18_inflight_lock:
+                if t["id"] in _f18_inflight:
+                    continue   # a live run of THIS task suppresses refire (lease is the crash twin)
+            # P1-C/F7 (round-2 audit) kept: a task belongs to an ACCOUNT;
+            # when that account is not active its agent stops talking to
+            # model providers entirely.
+            _tou = registry_get_user(t["owner"])
+            if not _tou or _tou["status"] != "active":
+                if t["owner"] not in _f18_skip_logged:
+                    _f18_skip_logged.add(t["owner"])
+                    log.warning("F18: tasks held - %r is not an active account", t["owner"])
+                continue
+            if (t["last_fire_utc"] or 0) >= m_epoch:
+                continue       # UTC latch: this due minute is spent; a crash cannot refire it
+            if t["lease_until"] and t["lease_until"] > now_e:
+                continue       # a worker (or a recently-crashed one) still holds the lease
+            lm = _f18_eligible(t, m)
+            if lm is None:
+                continue       # cron silent, or the DST policy holds this instant
+            due.append((t, lm))
+        if not due:
+            continue
+        due = due[:8]          # one short claim txn stays short (report's limit=8)
+        token = str(uuid.uuid4())
+        claimed = []
         with sqlite3.connect(DB_PATH) as db:
-            db.row_factory = sqlite3.Row
-            _f18_ensure_tasks(db)
-            rows = db.execute("SELECT * FROM tasks WHERE enabled=1").fetchall()
-            for r in rows:
-                t = dict(r)
-                # P1-C/F7 (round-2 audit): a task belongs to an ACCOUNT; when
-                # that account is not active its agent stops talking to model
-                # providers entirely. The interactive path required status=
-                # active (_need_user); the scheduler not checking it was the
-                # last chat/scheduler asymmetry P1-A left behind.
-                _tou = registry_get_user(t["owner"])
-                if not _tou or _tou["status"] != "active":
-                    if t["owner"] not in _f18_skip_logged:
-                        _f18_skip_logged.add(t["owner"])
-                        log.warning("F18: tasks held - %r is not an active account", t["owner"])
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                for (t, lm) in due:
+                    cur = db.execute(
+                        "UPDATE tasks SET last_fire_utc=?, lease_until=?, lease_token=?"
+                        " WHERE id=? AND enabled=1"
+                        " AND (lease_until IS NULL OR lease_until<=?)"
+                        " AND (last_fire_utc IS NULL OR last_fire_utc<?)",
+                        (m_epoch, now_e + F18_LEASE_SECS, token, t["id"], now_e, m_epoch))
+                    if cur.rowcount == 1:
+                        claimed.append((t, lm))
+                db.commit()
+            except Exception:
+                db.rollback()
+                log.exception("F18 claim txn failed (minute skipped; future minutes retry)")
+                continue
+        for (t, lm) in claimed:
+            lstamp = lm.strftime("%Y-%m-%dT%H:%M")  # owner wall stamp — UI contract unchanged
+            if _f18_pool is None:
+                fired.append(_f18_run_task(t, lstamp, m_epoch, token))  # pool-less: serial, still claim-latched
+                continue
+            with _f18_inflight_lock:
+                if t["id"] in _f18_inflight:
                     continue
-                lm = _f18_local(m, t["owner"])  # F23: cron lives in the owner's zone
-                lstamp = lm.strftime("%Y-%m-%dT%H:%M")  # no zone = same string as before
-                if not _f18_cron_match(t["cron"], lm):
-                    continue
-                if (t["last_fire"] or "") >= lstamp:
-                    continue  # minute latch: crash between fire+record must not double-fire
-                fired.append(_f18_run_task(t, lstamp))
+                _f18_inflight[t["id"]] = True
+            try:
+                _f18_pool.submit(_f18_worker, dict(t), lstamp, m_epoch, token)
+            except Exception:
+                with _f18_inflight_lock:
+                    _f18_inflight.pop(t["id"], None)
+                log.exception("F18 submit failed; lease expires, minute stays spent (recoverable)")
+            fired.append({"id": t["id"], "stamp": lstamp, "pending": True})
     _f18_last_min = now_dt
     return fired
 
@@ -6433,7 +6787,10 @@ def _f18_loop():
 
 def _f18_start():
     """Armed from main(). A scheduler that cannot start must never kill boot."""
+    global _f18_pool
     try:
+        if _f18_pool is None:
+            _f18_pool = _f18_Pool(max_workers=F18_MAX_PARALLEL, thread_name_prefix="f18-task")
         _f18_threading.Thread(target=_f18_loop, daemon=True, name="f18-scheduler").start()
         log.info("F18 scheduler armed (tick %ss, host tz %s, per-user zones %s)",
                  F18_TICK_SECONDS, time.strftime("%Z") or "local",
@@ -6490,23 +6847,20 @@ def _f18_api_post(h):
     u = _f18_guard(h)
     if u is None:
         return
-    try:
-        body = h._read_body()
-        if body is None:
-            return
-        try:
-            body = json.loads(body)
-        except Exception:
-            h._json(400, {"error": "invalid JSON body"})
-            return
-    except Exception:
-        h._json(400, {"error": "invalid json"})
+    body = h._json_object_body()
+    if body is None:
         return
     name = str(body.get("name") or "").strip()[:60]
     cron = str(body.get("cron") or "").strip()
     prompt = str(body.get("prompt") or "").strip()
     tid = str(body.get("id") or "").strip()
     enabled = 1 if body.get("enabled", 1) in (1, True, "1", "on", "true") else 0
+    dm = str(body.get("dst_missing") or "").strip().lower() or None   # V16
+    dr = str(body.get("dst_repeat") or "").strip().lower() or None    # V16
+    if dm is not None and dm not in ("skip", "move"):
+        h._json(400, {"error": "dst_missing must be 'skip' or 'move'"}); return
+    if dr is not None and dr not in ("first", "second", "both"):
+        h._json(400, {"error": "dst_repeat must be 'first', 'second' or 'both'"}); return
     if not name:
         h._json(400, {"error": "name required (1-60 chars)"})
         return
@@ -6521,13 +6875,15 @@ def _f18_api_post(h):
     with sqlite3.connect(DB_PATH) as db:
         _f18_ensure_tasks(db)
         if tid:
-            row = db.execute("SELECT id FROM tasks WHERE id=? AND owner=?",
+            row = db.execute("SELECT id, dst_missing, dst_repeat FROM tasks WHERE id=? AND owner=?",
                              (tid, u["username"],)).fetchone()
             if row is None:
                 h._json(404, {"error": "task not found"})
                 return
-            db.execute("UPDATE tasks SET name=?, cron=?, prompt=?, enabled=? WHERE id=? AND owner=?",
-                       (name, cron, prompt, enabled, tid, u["username"]))  # P1-F/N2: match the delete path
+            dm = dm if dm is not None else (row[1] or "skip")     # V16: absent key = keep existing
+            dr = dr if dr is not None else (row[2] or "first")    # V16
+            db.execute("UPDATE tasks SET name=?, cron=?, prompt=?, enabled=?, dst_missing=?, dst_repeat=? WHERE id=? AND owner=?",
+                       (name, cron, prompt, enabled, dm, dr, tid, u["username"]))  # P1-F/N2: match the delete path
         else:
             n = db.execute("SELECT COUNT(*) FROM tasks WHERE owner=?",
                            (u["username"],)).fetchone()[0]
@@ -6535,8 +6891,9 @@ def _f18_api_post(h):
                 h._json(400, {"error": "task cap is %d" % F18_MAX_TASKS})
                 return
             tid = str(uuid.uuid4())
-            db.execute("INSERT INTO tasks (id, owner, name, cron, prompt, enabled, created_at) VALUES (?,?,?,?,?,?,?)",
-                       (tid, u["username"], name, cron, prompt, enabled, time.time()))
+            db.execute("INSERT INTO tasks (id, owner, name, cron, prompt, enabled, created_at, dst_missing, dst_repeat) VALUES (?,?,?,?,?,?,?,?,?)",
+                       (tid, u["username"], name, cron, prompt, enabled, time.time(),
+                        dm or "skip", dr or "first"))  # V16 defaults = old implicit behavior
         db.commit()
     log_event(u["username"], "task.save", task_id=tid, name=name, cron=cron)
     h._json(200, {"ok": True, "id": tid})
@@ -6546,17 +6903,8 @@ def _f18_api_delete(h):
     u = _f18_guard(h)
     if u is None:
         return
-    try:
-        body = h._read_body()
-        if body is None:
-            return
-        try:
-            body = json.loads(body)
-        except Exception:
-            h._json(400, {"error": "invalid JSON body"})
-            return
-    except Exception:
-        h._json(400, {"error": "invalid json"})
+    body = h._json_object_body()
+    if body is None:
         return
     tid = str(body.get("id") or "").strip()
     if not tid:
@@ -6569,6 +6917,8 @@ def _f18_api_delete(h):
         if cur.rowcount == 0:
             h._json(404, {"error": "task not found"})
             return
+    with _f18_inflight_lock:
+        _f18_inflight.pop(tid, None)   # V16: deleted task frees its slot (a live worker's record write becomes a harmless rowcount 0)
     h._json(200, {"ok": True})  # the task's conversation stays — history is sacred
 # F18-END
 # F22-BEGIN  (E2E extracts this block verbatim: shipped code, not a reimplementation)
@@ -7187,14 +7537,9 @@ def _f22_body_json(h, max_bytes):
     if not _rate_allow("backup|" + _client_ip(h), 12, 6):
         h._json(429, {"error": "too many backup requests - slow down"})
         return None
-    raw = h._read_body(max_bytes)
-    if raw is None:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception:
-        h._json(400, {"error": "invalid json"})
-        return None
+    # T-V23 (C9): dict-check included - a list/number body is a 400 now,
+    # not an AttributeError downstream. Error string kept byte-exact.
+    return h._json_object_body(max_bytes, "invalid json")
 def _f22_summary(man):
     return {"created": man.get("created"), "src_version": man.get("src_version"),
             "uploads": bool(man.get("uploads")),
@@ -7818,9 +8163,9 @@ HELP_BODIES = {
 <li>The value is encrypted <b>in-process, before persistence</b>. No endpoint in the daemon can return a decrypted value - there is no code path that does that. (The one exception by design: connectors decrypt <i>inside a function</i>, use the value against the external service, and never surface it back into chat - that is the <code>vault_use</code> pattern, and its results pass a leak guard.)</li>
 <li>Encryption is AES-256-GCM with <b>the ciphertext bound to its owner and entry name</b> (authenticated encryption). Copying a sealed blob to another account's row does not decrypt - it fails loudly.</li>
 <li>The master key lives on <b>a different machine</b> (the key server), served to the daemon over a tmpfs file at boot. It never touches any disk on the box that holds the ciphertext. Steal the database, the backups, the whole VM image - you get ciphertext with no key.</li>
-<li><b>Plaintext in flight is bound to a URL, not to the ciphertext.</b> AEAD binds the stored blob to its owner and name; when a connector decrypts and uses a value, the destination is whatever its configured URL says at that moment. Redirects are fenced and credentials are stripped on any origin change (P1-C/P1-G), but the endpoint behind a correctly-configured URL is the endpoint you trust - that trust is the connector's, not the vault's.</li>
+<li><b>Plaintext in flight is bound to a URL, not to the ciphertext.</b> AEAD binds the stored blob to its owner and name; when a connector decrypts and uses a value, the destination is whatever its configured URL says at that moment. Redirects are fenced and credentials are stripped on any origin change, but the endpoint behind a correctly-configured URL is the endpoint you trust - that trust is the connector's, not the vault's.</li>
 </ul>
-<h2>The house standard (six properties, K80 ruling 2026-09-22)</h2>
+<h2>The house standard (six properties)</h2>
 <p>Everything on this instance that counts as most-sensitive user data inherits this pattern:</p>
 <ol>
 <li>The value enters <b>once</b>, encrypted in-process before persistence; no endpoint ever returns it.</li>
@@ -7835,7 +8180,7 @@ HELP_BODIES = {
 <p><b>You are the trust anchor.</b> Someone with live root on the running box <i>during a key-staging window</i> plus the database holds both halves, and AES-256 is the only thing left. That someone is today the operator who already physically owns the hardware. Every encryption system on Earth bottoms out at its operator; the difference here is that the bottom is documented, not pretended away.</p>
 <p><b>Key loss is survivable but real.</b> Losing the master key AND its backup coverage simultaneously makes every vault unreadable - credentials get re-sealed from their sources. The key's backup story is deliberately the strongest one in the house.</p>
 </div>
-<p class="foot">Source: <code>cairn-creds-vault-datasheet-20260922.md</code> - this page is its translation, not a replacement.</p>
+<p class="foot">This page is the plain-words translation of the vault design datasheet; the datasheet stays the authority.</p>
 """,
 "connectors": """
 <p>Connectors let the assistant <b>ask external services things on your behalf</b>. Every connector on this instance is <b>read-only</b> in v1: they can fetch, list and report; none of them send mail, push code, flip firewalls or delete anything. Write scopes are a separate future decision, not an oversight.</p>
@@ -7858,7 +8203,7 @@ HELP_BODIES = {
 <p>Settings carries the connect flow for Google/Microsoft (connect button &rarr; provider sign-in page &rarr; this instance stores only sealed ciphertext). GitHub/HA/OPNsense/Nextcloud take a token in Settings which is sealed on arrival - the field is write-only, and an empty save clears the seal. Tokens are minted by you on each service; minimum-privilege (read-only) tokens are the house standard.</p>
 """,
 "data-home": """
-<p><b>Data Home</b> answers one question: <i>where does my data live, and who else can read it once it lives there?</i> The ruling (K80, 2026-09-22): you may opt to keep credentials and data with your own Nextcloud - with a disclaimer that tells the truth about what that means.</p>
+<p><b>Data Home</b> answers one question: <i>where does my data live, and who else can read it once it lives there?</i> The house rule: you may opt to keep credentials and data with your own Nextcloud - with a disclaimer that tells the truth about what that means.</p>
 <h2>The levels</h2>
 <dl>
 <dt>Level 1 - Local only <span class="tag">default, what runs today</span></dt>
@@ -7889,7 +8234,7 @@ HELP_BODIES = {
 <h2>3. Backups</h2>
 <p>Platform backups (hypervisor snapshots) capture the disk, which means conversations and ciphertext. They do not capture the master key (different machine). The honest framing: a backup tape is your data with the vault still locked, not with it empty.</p>
 <h2>4. Your own sessions</h2>
-<p>Anyone holding your logged-in device or your session cookie <i>is</i> you as far as this instance can tell. The session here is a one-year remember-me cookie (HttpOnly, Secure, SameSite=Lax) - by design it survives a server restart. Sessions die when <i>you</i> end them: logout ends this device, sign-out-everywhere ends all of them. There is no second factor wired in yet - treat that as a current limitation, not a secret. And root on the box can read the session table outright, which is why this page says the operator is the bottom of every trust story here.</p>
+<p>Anyone holding your logged-in device or your session cookie <i>is</i> you as far as this instance can tell. The session here is a one-year remember-me cookie (HttpOnly, Secure on TLS, SameSite=Lax) - by design it survives a server restart. Sessions die when <i>you</i> end them: logout ends this device, sign-out-everywhere ends all of them. There is no second factor wired in yet - treat that as a current limitation, not a secret. And root on the box can read the session table outright, which is why this page says the operator is the bottom of every trust story here.</p>
 <h2>5. The instance event log</h2>
 <p>Opt-in, metadata-only, self-only, off = purge. It records timing and outcomes, never words. The full contract, including what stays unconditional, is on the <a href="help/logs">Instance Logs</a> page.</p>
 <h2>6. <code>run_with_secret</code> and the leak guard</h2>
@@ -7907,7 +8252,7 @@ HELP_BODIES = {
 <dt>Vault</dt><dd>Sealed-encrypted credential storage. Write-only. See its own page.</dd>
 <dt>CV1</dt><dd>"Cairn Vault blob version 1" - the sealed-ciphertext format: AES-256-GCM, bound to owner and entry name.</dd>
 <dt>Master key</dt><dd>The key that unseals vaults. Lives on another machine (the key server), handed to the daemon over memory-only storage at boot. Never on the disk that holds the ciphertext.</dd>
-<dt>Key server</dt><dd>The backup/key machine. Holds the vault master key and nightly backups; reachable on LAN only, by design.</dd>
+<dt>Key server</dt><dd>The separate backup/key machine. Holds the vault master key and nightly backups; reachable on LAN only, by design.</dd>
 <dt>vault_use</dt><dd>The pattern where a connector decrypts a secret inside a function, uses it against the outside service, and never surfaces it into chat. The leak guard refuses results that contain the secret.</dd>
 <dt>Connector</dt><dd>A fixed, read-only integration (Nextcloud, Google, Microsoft, GitHub, Home Assistant, OPNsense). Read-only is v1 policy, not an accident.</dd>
 <dt>Credential shell</dt><dd>Owner/admin tools that spend vault entries (SSH keys, env secrets) without ever printing them.</dd>
@@ -8337,7 +8682,7 @@ a{color:var(--accent);text-decoration:none}
   <p style="margin-top:0"><b>Read this before you create anything.</b> This is not a terms-of-service formality; it is an operations briefing.</p>
 <div id="f25w" style="display:none;background:#3a1d24;border:1px solid #ff3b5c;color:#ffd9e0;
 padding:10px 14px;border-radius:8px;margin:0 0 16px;font-size:13px;text-align:left">
-You are reaching CAIRN over plain HTTP from a non-localhost address. Session cookies are Secure by design, so a browser will not keep a login session on this transport. Open http://localhost:8470 (default port) on the machine itself, or put CAIRN behind TLS you control (Cloudflare Tunnel, or Caddy with tls internal). This page keeps working over HTTP on purpose: first setup should never require trusting a stranger's certificate.
+You are reaching CAIRN over plain HTTP from a non-localhost address. Session cookies cannot be marked Secure over plain HTTP, so your login WILL stick here and your session token travels in the clear - readable by anyone on the network path. Open http://localhost:8470 (default port) on the machine itself, or put CAIRN behind TLS you control (Cloudflare Tunnel, or Caddy with tls internal). This page keeps working over HTTP on purpose: first setup should never require trusting a stranger's certificate.
 </div>
 <script>
 /* F25: insecure-transport disclosure. Browsers treat localhost as a secure context,
@@ -12586,7 +12931,7 @@ var host = (location.hostname || "").toLowerCase();
   if (document.getElementById("f25w")) return;
   var d = document.createElement("div"); d.id = "f25w";
   d.style.cssText = "background:#3a1d24;border:1px solid #ff3b5c;color:#ffd9e0;padding:10px 14px;border-radius:8px;margin:8px 12px;font-size:13px;text-align:left";
-  d.innerHTML = "You are reaching CAIRN over plain HTTP from a non-localhost address. Session cookies are Secure by design, so a browser will not keep a login session on this transport. Open http://localhost:8470 (default port) on the machine itself, or put CAIRN behind TLS you control (Cloudflare Tunnel, or Caddy with tls internal). This page keeps working over HTTP on purpose: first setup should never require trusting a stranger's certificate.";
+  d.innerHTML = "You are reaching CAIRN over plain HTTP from a non-localhost address. Session cookies cannot be marked Secure over plain HTTP, so your login WILL stick here and your session token travels in the clear - readable by anyone on the network path. Open http://localhost:8470 (default port) on the machine itself, or put CAIRN behind TLS you control (Cloudflare Tunnel, or Caddy with tls internal). This page keeps working over HTTP on purpose: first setup should never require trusting a stranger's certificate.";
   document.body.insertBefore(d, document.body.firstChild);
 } catch (e) {} }
 if (document.body) f25show(); else document.addEventListener("DOMContentLoaded", f25show); })();
@@ -15197,6 +15542,25 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._json(413, {"error": "body too large"})
             return None
         return self.rfile.read(length)
+    def _json_object_body(self, cap=None, err="invalid JSON body"):
+        # T-V23 (round-9 C9): the shared JSON-object body reader. Parse
+        # failure -> 400 err; valid JSON that is NOT an object -> 400
+        # "JSON body must be an object" (the login/cmd-approvals wording
+        # from P1-I/B11, reused so clients see ONE contract). Same
+        # convention as _read_body: returns the dict, or None AFTER the
+        # error was already sent - callers MUST early-return on None.
+        raw = self._read_body(cap)
+        if raw is None:
+            return None
+        try:
+            body = json.loads(raw)
+        except Exception:
+            self._json(400, {"error": err})
+            return None
+        if not isinstance(body, dict):
+            self._json(400, {"error": "JSON body must be an object"})
+            return None
+        return body
     def do_OPTIONS(self):
         # P1-B: wildcard CORS is dead. The UI is same-origin; /v1 phone apps
         # are server-side clients (no preflight). Old preflights now fail
@@ -15927,6 +16291,17 @@ class MaraHandler(BaseHTTPRequestHandler):
         p = self._clean_route()  # T-A6: exclusions must see the STRIPPED path
         if p in ("/login", "/signup", "/api/login", "/api/signup", "/api/logout"):
             return False
+        # B18 (audit 2026-09-25): public doors must survive instance.conf. The
+        # old five-route exempt set bounced share pages, the guest share login,
+        # public /help, /setup and /static to the owner's login - shares
+        # unusable on any multi-instance host. Each of these carries its own
+        # fence downstream (S06 share gate, owner-welded /setup, public-by-
+        # design help/static), so they stay reachable by everyone; everything
+        # else still bounces.
+        if (p == "/share" or p.startswith("/share/") or p == "/api/share/login"
+                or p == "/setup" or p == "/help" or p.startswith("/help/")
+                or p.startswith("/static/")):
+            return False
         # P1-I/S21: whose instance is this? LOCAL truth (/etc/mara/instance.conf),
         # never a request header.
         # H18 (audit 2026-09-24): the header-absence early return that used to
@@ -15940,7 +16315,13 @@ class MaraHandler(BaseHTTPRequestHandler):
         if _trusted:
             if door and door != _trusted:
                 self.send_response(302)
-                self.send_header("Location", "/" + door + "/login")
+                # B18: the header is attacker-controlled; "/" + raw was a
+                # protocol-relative open redirect (header "/host" ->
+                # "//host/login"). A value that is not a door slug empties;
+                # the empty form must NOT be re-prefixed ("/" + "" + "/login"
+                # == "//login" - itself protocol-relative) -> plain "/login".
+                _ds = _p1h_pub_slug(door)
+                self.send_header("Location", ("/" + _ds + "/login") if _ds else "/login")
                 self.end_headers()
                 return True
             u = self._auth_user()
@@ -15960,7 +16341,9 @@ class MaraHandler(BaseHTTPRequestHandler):
         u = self._auth_user()
         if not (u and u["slug"] == door):
             self.send_response(302)
-            self.send_header("Location", "/" + door + "/login")
+            # B18: same header-derived redirect, same guard.
+            _ds = _p1h_pub_slug(door)
+            self.send_header("Location", ("/" + _ds + "/login") if _ds else "/login")
             self.end_headers()
             return True
         return False
@@ -16014,6 +16397,10 @@ class MaraHandler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "invalid JSON body"})
             return
+        if not isinstance(body, dict):
+            # T-V23 (C9 family sweep): list/number bodies crashed here.
+            self._json(400, {"error": "JSON body must be an object"})
+            return
         name = str(body.get("name") or "").strip()
         if not VAULT_NAME_RE.match(name):
             self._json(400, {"error": "invalid vault entry name (lowercase letters/digits/-/_, must start with a letter or digit, max 64 chars)"})
@@ -16056,6 +16443,10 @@ class MaraHandler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "invalid JSON body"})
             return
+        if not isinstance(body, dict):
+            # T-V23 (C9 family sweep): list/number bodies crashed here.
+            self._json(400, {"error": "JSON body must be an object"})
+            return
         name = str(body.get("name") or "").strip()
         if not VAULT_NAME_RE.match(name):
             self._json(400, {"error": "invalid vault entry name"})
@@ -16084,6 +16475,10 @@ class MaraHandler(BaseHTTPRequestHandler):
                 return
         except Exception:
             self._json(400, {"error": "invalid JSON body"})
+            return
+        if not isinstance(body, dict):
+            # T-V23 (C9 family sweep): list/number bodies crashed here.
+            self._json(400, {"error": "JSON body must be an object"})
             return
         name = str(body.get("name") or "").strip()
         p = _memory_file_path(name, u["username"])
@@ -16132,12 +16527,31 @@ class MaraHandler(BaseHTTPRequestHandler):
         # bare IPv6-literal access is not a supported shape.
         _o = (self.headers.get("Origin") or "").strip()
         if _o:
+            # V18: canonical compare - scheme must be http(s), hostname AND
+            # effective port must match. The old latch compared hostnames
+            # only, so a page at http://127.0.0.1:1234 could POST to
+            # 127.0.0.1:8470. When Host carries no port, a default Origin
+            # port (80/443) is same-origin; a Host WITH a port must match
+            # exactly. Scheme is deliberately NOT compared to transport
+            # truth: TLS-terminating proxies forward plain HTTP with or
+            # without X-Forwarded-Proto, and scheme-vs-config belongs with
+            # the configured-public-origin work, not bolted on blind.
             try:
-                _oh = (urllib.parse.urlsplit(_o).hostname or "").lower()
+                _ou = urllib.parse.urlsplit(_o)
+                _oh = (_ou.hostname or "").lower()
+                _os = (_ou.scheme or "").lower()
+                _op = _ou.port or (443 if _os == "https" else 80)
             except Exception:
-                _oh = ""
-            _hh = (self.headers.get("Host") or "").rsplit(":", 1)[0].lower()
-            if _oh != _hh:
+                _oh = _os = ""
+                _op = -1
+            _host = self.headers.get("Host") or ""
+            _hh = _host.rsplit(":", 1)[0].lower()
+            try:
+                _ok_port = (_op == int(_host.rsplit(":", 1)[1]))
+            except Exception:
+                _ok_port = (_op in (80, 443))
+            if (not _oh or _os not in ("http", "https")
+                    or _oh != _hh or not _ok_port):
                 self._json(403, {"error": "cross-origin request refused"})
                 return
         if path == "/api/share/login":  # S06 guest door (rate-limited inside)
@@ -16238,18 +16652,32 @@ class MaraHandler(BaseHTTPRequestHandler):
             u = self._need_user()
             if not u:
                 return
-            try:
-                body = self._read_body()
-                if body is None:
-                    return
-                try:
-                    body = json.loads(body)
-                except Exception:
-                    self._json(400, {"error": "invalid JSON body"})
-                    return
-            except Exception:
-                self._json(400, {"error": "invalid JSON body"})
+            body = self._json_object_body()
+            if body is None:
                 return
+            # T-V23 (B06 fold-in, round-9): validate-ALL-fields-first. The
+            # old route committed each setting as it went, so a late 400
+            # (tools_disabled shape, a compaction range, an owner gate)
+            # left the earlier fields ALREADY WRITTEN. Now every field
+            # validates + normalizes into `muts` (key, value, owner) and
+            # `seals` (vault ops), and NOTHING reaches the store until the
+            # single apply block at the end: seals first (their shape error
+            # is still a plain 400 with the settings table untouched), then
+            # ONE transaction for every staged row. The str() coercion
+            # set_setting applied is preserved where the apply runs.
+            muts = []
+            seals = []
+            _tv23_purge = False
+            _tv23_gate = False
+            def _tv23_pend(_key, _def):
+                # Read a setting through the pending overlay: a value
+                # staged earlier in THIS request wins over the stored one
+                # (the old code wrote-then-read for the provider lookups
+                # below; this preserves that ordering exactly).
+                for _mk, _mv, _mu in reversed(muts):
+                    if _mk == _key and _mu == u["username"]:
+                        return _mv
+                return get_setting(_key, _def, u["username"])
             # B11: compaction gates run BEFORE any settings write so a
             # refusal can never leave a partial write behind. The checks
             # inside the compaction block below stay as defense in depth.
@@ -16262,12 +16690,12 @@ class MaraHandler(BaseHTTPRequestHandler):
                     return
             for k in ["model", "theme"]:
                 if k in body:
-                    set_setting(k, body[k], u["username"])
+                    muts.append((k, body[k], u["username"]))
             # F16: per-user auto-title toggle, normalized to on/off (only a
             # literal "off" means off - a garbage value cannot disable titles
             # by accident and cannot smuggle anything else into settings).
             if "title_gen" in body:
-                set_setting("title_gen", "off" if str(body["title_gen"]).lower() == "off" else "on", u["username"])
+                muts.append(("title_gen", "off" if str(body["title_gen"]).lower() == "off" else "on", u["username"]))
             # F17: media generation config (design: f17-media-gen-design). Closed
             # sets for modes/kinds; base URLs SSRF-gated HERE and again at call
             # time; media_key is write-only - only a non-empty POST overwrites it
@@ -16277,25 +16705,25 @@ class MaraHandler(BaseHTTPRequestHandler):
             for _f17k in ("imagegen_mode", "audiogen_mode"):
                 if _f17k in body:
                     _f17v = str(body[_f17k] or "").strip().lower()
-                    set_setting(_f17k, _f17v if _f17v in ("current", "custom") else "off", u["username"])
+                    muts.append((_f17k, _f17v if _f17v in ("current", "custom") else "off", u["username"]))
             if "imagegen_kind" in body:
-                set_setting("imagegen_kind", "cloudflare" if str(body["imagegen_kind"] or "").strip().lower() == "cloudflare" else "openai", u["username"])
+                muts.append(("imagegen_kind", "cloudflare" if str(body["imagegen_kind"] or "").strip().lower() == "cloudflare" else "openai", u["username"]))
             for _f17k in ("imagegen_model", "audiogen_model"):
                 if _f17k in body:
                     _f17v = str(body[_f17k] or "").strip()
                     if len(_f17v) > 200:
                         self._json(400, {"error": _f17k + " too long (200 char cap)"}); return
-                    set_setting(_f17k, _f17v, u["username"])
+                    muts.append((_f17k, _f17v, u["username"]))
             if "imagegen_size" in body:
                 _f17v = str(body["imagegen_size"] or "").strip()
                 if not re.fullmatch(r"\d{2,5}x\d{2,5}", _f17v):
                     _f17v = "1024x1024"
-                set_setting("imagegen_size", _f17v, u["username"])
+                muts.append(("imagegen_size", _f17v, u["username"]))
             if "audiogen_voice" in body:
                 _f17v = str(body["audiogen_voice"] or "").strip()
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", _f17v):
                     _f17v = "alloy"
-                set_setting("audiogen_voice", _f17v, u["username"])
+                muts.append(("audiogen_voice", _f17v, u["username"]))
             for _f17k in ("imagegen_base", "audiogen_base"):
                 if _f17k in body:
                     _f17v = str(body[_f17k] or "").strip().rstrip("/")
@@ -16303,14 +16731,14 @@ class MaraHandler(BaseHTTPRequestHandler):
                         _f17e = _f17_guard_base(_f17v)
                         if _f17e:
                             self._json(400, {"error": _f17k + " rejected: " + _f17e}); return
-                    set_setting(_f17k, _f17v, u["username"])
+                    muts.append((_f17k, _f17v, u["username"]))
             if "imagegen_cf_account" in body:
                 _f17v = str(body["imagegen_cf_account"] or "").strip().lower()
                 if _f17v and not re.fullmatch(r"[0-9a-f]{32}", _f17v):
                     self._json(400, {"error": "Cloudflare account id must be 32 hex chars"}); return
-                set_setting("imagegen_cf_account", _f17v, u["username"])
+                muts.append(("imagegen_cf_account", _f17v, u["username"]))
             if str(body.get("media_key") or ""):
-                set_setting("model_key_media", str(body["media_key"]), u["username"])
+                muts.append(("model_key_media", str(body["media_key"]), u["username"]))
             if "v1_token" in body:
                 # P1-A/H1: write-only token that locks the /v1 door. Owner
                 # only; "" clears it (endpoint falls back to session-only).
@@ -16323,7 +16751,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     # token is a liability, so refuse it at the door
                     self._json(400, {"error": "v1_token must be at least 32 printable "
                         "characters (ASCII, no spaces) - or send empty to clear it"}); return
-                set_setting("v1_token", _vt, u["username"])
+                muts.append(("v1_token", _vt, u["username"]))
             if "mediagen_max_mb" in body:
                 if u["username"] != DAEMON_OWNER:
                     self._json(403, {"error": "mediagen_max_mb is an owner setting - owner only"}); return
@@ -16333,7 +16761,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     self._json(400, {"error": "mediagen_max_mb must be whole MB (1-512)"}); return
                 if not 1 <= _f17v <= 512:
                     self._json(400, {"error": "mediagen_max_mb out of range (1-512 MB)"}); return
-                set_setting("mediagen_max_mb", _f17v, DAEMON_OWNER)
+                muts.append(("mediagen_max_mb", _f17v, DAEMON_OWNER))
             # F23: per-user timezone (IANA name, blank = system-local). Validated
             # against the system zone table; every user gets THEIR clock, no more,
             # no less. Cron matching and display both ride it.
@@ -16348,7 +16776,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     except Exception:
                         self._json(400, {"error": "unknown timezone - use an IANA name like America/Chicago (blank = system-local)"})
                         return
-                set_setting("timezone", v, u["username"])
+                muts.append(("timezone", v, u["username"]))
             # F12.2: connector config. google_client_id is a public OAuth
             # identifier (per-user); oauth_redirect_base is app-level (owner
             # only) and must be a bare https URL. Secrets never travel here.
@@ -16357,7 +16785,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 if v and (len(v) > 256 or not re.fullmatch(r"[A-Za-z0-9._@-]+", v)):
                     self._json(400, {"error": "google_client_id looks malformed (expected a Google OAuth client id)"})
                     return
-                set_setting("google_client_id", v, u["username"])
+                muts.append(("google_client_id", v, u["username"]))
             if "oauth_redirect_base" in body:
                 if u["username"] != DAEMON_OWNER:
                     self._json(403, {"error": "oauth_redirect_base is an app-level setting - owner only"})
@@ -16368,23 +16796,27 @@ class MaraHandler(BaseHTTPRequestHandler):
                     if _ru.scheme != "https" or not _ru.netloc or _ru.query or _ru.fragment:
                         self._json(400, {"error": "oauth_redirect_base must be an https:// URL without query/fragment (blank = CAIRN default)"})
                         return
-                set_setting("oauth_redirect_base", v.rstrip("/"), u["username"])
+                muts.append(("oauth_redirect_base", v.rstrip("/"), u["username"]))
             if "ms_client_id" in body:
                 v = str(body["ms_client_id"] or "").strip()
                 if v and not re.fullmatch(r"[0-9a-fA-F-]{8,64}", v):
                     self._json(400, {"error": "ms_client_id looks malformed (expected an Entra application/client id)"})
                     return
-                set_setting("ms_client_id", v, u["username"])
+                muts.append(("ms_client_id", v, u["username"]))
             # F12.4: static-token connectors. Secret keys seal STRAIGHT into
             # the vault (never stored as settings, never echoed); empty value
             # clears the vault entry. URL/key settings are not secrets.
             for _ckind, _ckey in (("github", "github_token"), ("ha", "ha_token"),
                                   ("opnsense", "opnsense_secret")):
                 if _ckey in body:
-                    _msg, _err = _cst_seal(u["username"], _ckind, str(body[_ckey] or ""))
-                    if _err:
-                        self._json(400, {"error": _err})
-                        return
+                    # T-V23: sealing is a WRITE - stage it. The apply block
+                    # runs seals BEFORE the settings transaction, so the
+                    # malformed-token 400 lands with zero settings rows
+                    # touched. (Two tokens in one request, the first good
+                    # and the second malformed, can still leave the first
+                    # sealed - strictly better than sealing mid-route while
+                    # later fields could 400 the request.)
+                    seals.append((_ckind, str(body[_ckey] or "")))
             if "ha_url" in body:
                 v = str(body["ha_url"] or "").strip()
                 if v:
@@ -16393,7 +16825,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                         self._json(400, {"error": _err})
                         return
                     v = _cv
-                set_setting("ha_url", v, u["username"])
+                muts.append(("ha_url", v, u["username"]))
             if "opnsense_url" in body:
                 v = str(body["opnsense_url"] or "").strip()
                 if v:
@@ -16402,13 +16834,13 @@ class MaraHandler(BaseHTTPRequestHandler):
                         self._json(400, {"error": _err})
                         return
                     v = _cv
-                set_setting("opnsense_url", v, u["username"])
+                muts.append(("opnsense_url", v, u["username"]))
             if "opnsense_key" in body:
                 v = str(body["opnsense_key"] or "").strip()
                 if v and not re.fullmatch(r"[A-Za-z0-9+/]{16,128}", v):
                     self._json(400, {"error": "opnsense_key looks malformed (expected the API key, no spaces)"})
                     return
-                set_setting("opnsense_key", v, u["username"])
+                muts.append(("opnsense_key", v, u["username"]))
             # F4: instance logs master switch + retention. Opt-in default off;
             # off = purge (data follows the choice, never outlives it - the UI
             # confirms with a "download first?" step before sending off).
@@ -16418,16 +16850,20 @@ class MaraHandler(BaseHTTPRequestHandler):
                     self._json(400, {"error": "logs_level must be off, basic, or verbose"})
                     return
                 _lv_prev = _logs_level(u["username"])
-                set_setting("logs_level", v, u["username"])
+                muts.append(("logs_level", v, u["username"]))
+                # T-V23: purge + gate are side effects of the WRITE; they
+                # ride the apply block, so a late 400 can never purge the
+                # logs of a request that never landed. _lv_prev is read
+                # now (nothing else in this request can move logs_level).
                 if v == "off" and _lv_prev != "off":
-                    _logs_purge(u["username"])
-                _logs_file_gate()
+                    _tv23_purge = True
+                _tv23_gate = True
             if "logs_retention" in body:
                 v = str(body["logs_retention"] or "").strip().lower()
                 if v and v not in LOG_RETENTION_S:
                     self._json(400, {"error": "logs_retention must be one of 1h, 6h, 12h, 24h, 48h"})
                     return
-                set_setting("logs_retention", v or "24h", u["username"])
+                muts.append(("logs_retention", v or "24h", u["username"]))
             # S4f2: model parameters. Blank = cleared = omitted from the
             # request = provider default. Values validated; bad input is a
             # 400 and nothing is written for that key.
@@ -16440,7 +16876,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     except (TypeError, ValueError):
                         self._json(400, {"error": "temperature must be a number between 0 and 2"})
                         return
-                set_setting("temperature", v, u["username"])
+                muts.append(("temperature", v, u["username"]))
             if "max_tokens" in body:
                 v = str(body["max_tokens"] or "").strip()
                 if v:
@@ -16450,7 +16886,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     except (TypeError, ValueError):
                         self._json(400, {"error": "max_tokens must be a positive integer (no ceiling - small local models included)"})
                         return
-                set_setting("max_tokens", v, u["username"])
+                muts.append(("max_tokens", v, u["username"]))
             if "top_p" in body:
                 v = str(body["top_p"] or "").strip()
                 if v:
@@ -16460,7 +16896,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     except (TypeError, ValueError):
                         self._json(400, {"error": "top_p must be a number between 0 and 1"})
                         return
-                set_setting("top_p", v, u["username"])
+                muts.append(("top_p", v, u["username"]))
             if "model_params" in body:
                 v = str(body["model_params"] or "").strip()
                 if v:
@@ -16479,37 +16915,42 @@ class MaraHandler(BaseHTTPRequestHandler):
                     if _bad:
                         self._json(400, {"error": "reserved keys (use their own fields): " + ", ".join(_bad)})
                         return
-                set_setting("model_params", v, u["username"])
+                muts.append(("model_params", v, u["username"]))
             # S4a: web search settings. Provider from the fixed list; n clamped
             # 1-20; the key is write-only ("" clears) and stored per provider;
             # the custom config is stored raw and validated at use time by the
             # webtools layer (its errors are the user-facing contract).
             if "search_provider" in body:
                 sp2 = str(body["search_provider"] or "").strip()
-                set_setting("search_provider", sp2 if sp2 in SEARCH_PROVIDER_IDS else "duckduckgo_lite", u["username"])
+                muts.append(("search_provider", sp2 if sp2 in SEARCH_PROVIDER_IDS else "duckduckgo_lite", u["username"]))
             if "search_n" in body:
                 try:
-                    set_setting("search_n", str(min(max(int(body["search_n"]), 1), SEARCH_N_MAX)), u["username"])
+                    muts.append(("search_n", str(min(max(int(body["search_n"]), 1), SEARCH_N_MAX)), u["username"]))
                 except (TypeError, ValueError):
                     pass
             if "search_key" in body:
-                kprov = get_setting("search_provider", "duckduckgo_lite", u["username"]) or "duckduckgo_lite"
+                # T-V23: overlay read - a search_provider STAGED earlier in
+                # THIS request lands in the same txn, so the key must follow
+                # the staged provider (old code read it post-write; same
+                # result, preserved exactly).
+                kprov = _tv23_pend("search_provider", "duckduckgo_lite") or "duckduckgo_lite"
                 if kprov in SEARCH_KEY_PROVIDERS:
-                    set_setting("search_key_" + kprov, str(body["search_key"] or ""), u["username"])
+                    muts.append(("search_key_" + kprov, str(body["search_key"] or ""), u["username"]))
             if "search_custom" in body:
-                set_setting("search_custom", str(body["search_custom"] or ""), u["username"])
+                muts.append(("search_custom", str(body["search_custom"] or ""), u["username"]))
             # S4e: model BYOK. Provider from the fixed list; the key is
             # write-only per provider ("" clears); model_custom = base URL
             # (plain URL or {"base_url": ...}); context_budget clamped.
             if "model_provider" in body:
                 mp2 = str(body["model_provider"] or "").strip()
-                set_setting("model_provider", mp2 if mp2 in MODEL_PROVIDER_IDS else "featherless", u["username"])
+                muts.append(("model_provider", mp2 if mp2 in MODEL_PROVIDER_IDS else "featherless", u["username"]))
             if "model_key" in body:
-                kprov = get_setting("model_provider", "featherless", u["username"]) or "featherless"
+                # T-V23: overlay read, same contract as search_key above.
+                kprov = _tv23_pend("model_provider", "featherless") or "featherless"
                 if kprov in MODEL_KEY_PROVIDERS:
-                    set_setting("model_key_" + kprov, str(body["model_key"] or ""), u["username"])
+                    muts.append(("model_key_" + kprov, str(body["model_key"] or ""), u["username"]))
             if "model_custom" in body:
-                set_setting("model_custom", str(body["model_custom"] or "").strip(), u["username"])
+                muts.append(("model_custom", str(body["model_custom"] or "").strip(), u["username"]))
             if "context_budget" in body:
                 try:
                     cb = int(body["context_budget"])
@@ -16519,20 +16960,20 @@ class MaraHandler(BaseHTTPRequestHandler):
                     # compaction math). Anything positive is honored.
                     if cb < 1:
                         raise ValueError
-                    set_setting("context_budget", str(cb), u["username"])
+                    muts.append(("context_budget", str(cb), u["username"]))
                 except (TypeError, ValueError):
                     pass
             # S4f1: per-user custom instructions (clamped to the persona budget)
             if "custom_instructions" in body:
-                set_setting("custom_instructions",
-                            str(body["custom_instructions"] or "")[:USER_PERSONA_CAP], u["username"])
+                muts.append(("custom_instructions",
+                             str(body["custom_instructions"] or "")[:USER_PERSONA_CAP], u["username"]))
             # S4f8: tool notes - standing guidance about the tools, rendered
             # in the prompt right after the auto tool list. Clamped like
             # custom_instructions; text in this field can never grant
             # capabilities (tool authority is daemon-enforced).
             if "tool_notes" in body:
-                set_setting("tool_notes",
-                            str(body["tool_notes"] or "")[:TOOL_NOTES_CAP], u["username"])
+                muts.append(("tool_notes",
+                             str(body["tool_notes"] or "")[:TOOL_NOTES_CAP], u["username"]))
             # S4f8: tool toggles - remove-only, never grants. The list is
             # re-intersected with the tier base before storing, so a
             # hand-crafted request can only disable, never enable.
@@ -16546,9 +16987,9 @@ class MaraHandler(BaseHTTPRequestHandler):
                 if not isinstance(_td, list):
                     self._json(400, {"error": "tools_disabled must be a JSON list of tool names"})
                     return
-                set_setting("tools_disabled",
-                            json.dumps(sorted(set(str(n) for n in _td if isinstance(n, str)) & set(_tool_base_set()))),
-                            u["username"])
+                muts.append(("tools_disabled",
+                             json.dumps(sorted(set(str(n) for n in _td if isinstance(n, str)) & set(_tool_base_set()))),
+                             u["username"]))
             # S4f9: compaction settings - a/o ONLY (K80 10:54: users do
             # not edit their own amnesia) AND instance-gated like the F3
             # prompt editor: the owner's instance is owner-only, an admin
@@ -16566,7 +17007,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     if len(cp.encode("utf-8")) > COMPACT_PROMPT_CAP:
                         self._json(400, {"error": "compaction_prompt exceeds 32KB"})
                         return
-                    set_setting("compaction_prompt", cp, u["username"])
+                    muts.append(("compaction_prompt", cp, u["username"]))
                 if "compaction_threshold" in body:
                     ct = str(body["compaction_threshold"] or "").strip()
                     if ct:
@@ -16576,7 +17017,33 @@ class MaraHandler(BaseHTTPRequestHandler):
                         except (TypeError, ValueError):
                             self._json(400, {"error": "compaction_threshold must be a number between 0.3 and 0.95 (blank = 0.8)"})
                             return
-                    set_setting("compaction_threshold", ct, u["username"])
+                    muts.append(("compaction_threshold", ct, u["username"]))
+            # T-V23/B06: the SINGLE commit point. Vault seals run first (a
+            # malformed seal 400s with zero settings rows touched), then
+            # every staged setting lands in ONE transaction - the str()
+            # coercion set_setting used is preserved on each row. A txn
+            # failure AFTER seals landed is a disk-level event; it is
+            # reported (500) and the settings table rolled back whole.
+            for _ckind, _cval in seals:
+                _msg, _err = _cst_seal(u["username"], _ckind, _cval)
+                if _err:
+                    self._json(400, {"error": _err})
+                    return
+            if muts:
+                try:
+                    with sqlite3.connect(DB_PATH) as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        for _k, _v, _un in muts:
+                            db.execute("INSERT OR REPLACE INTO settings (username, key, value) VALUES (?,?,?)",
+                                       (_un, _k, str(_v)))
+                        db.commit()
+                except Exception:
+                    self._json(500, {"error": "settings write failed"})
+                    return
+            if _tv23_purge:
+                _logs_purge(u["username"])
+            if _tv23_gate:
+                _logs_file_gate()
             log_event(u["username"], "settings.change",
                       keys=",".join(sorted(str(k) for k in body.keys()))[:180])
             self._json(200, {"ok": True, "tools_disabled": _tools_disabled_list(u["username"])})
@@ -16695,22 +17162,19 @@ class MaraHandler(BaseHTTPRequestHandler):
             if not _rate_allow("login|" + _client_ip(self), 20, 12):
                 self._json(429, {"error": "too many login attempts - slow down"})
                 return
-            try:
-                body = self._read_body()
-                if body is None:
-                    return
-                try:
-                    body = json.loads(body)
-                except Exception:
-                    self._json(400, {"error": "invalid JSON body"})
-                    return
-            except Exception:
-                self._json(400, {"error": "invalid JSON body"})
+            body = self._json_object_body()
+            if body is None:
                 return
-            # P1-I/B11: JSON that parses but ISN'T an object (list, number)
-            # used to raise AttributeError -> raw 500 on the auth door.
-            if not isinstance(body, dict):
-                self._json(400, {"error": "JSON body must be an object"})
+            # P1-I/B11 + T-V23: the helper keeps the auth door honest -
+            # parse failures and non-object bodies are 400, never a crash.
+            # T-V23 (C9 tail): credentials must be STRINGS before they
+            # reach PBKDF2/registry. A non-string against a REAL user used
+            # to crash _hash_pw (no response on the wire); against a
+            # phantom the dummy path swallowed it. This gate runs BEFORE
+            # any lookup, so it is not a username oracle.
+            if not isinstance(body.get("username", ""), str) or \
+                    not isinstance(body.get("password", ""), str):
+                self._json(400, {"error": "username and password must be strings"})
                 return
             u = registry_authenticate(body.get("username", ""), body.get("password", ""))
             if not u:
@@ -16781,6 +17245,13 @@ class MaraHandler(BaseHTTPRequestHandler):
                 # P1-I/B11 (same door class as login): 400, not 500.
                 self._json(400, {"error": "JSON body must be an object"})
                 return
+            # T-V23 (C9 tail): these four values all flow into regexes and
+            # crypto; a number used to raise AttributeError (crash, no
+            # answer) instead of 400 like every other shape violation.
+            for _sf in ("username", "password", "display_name", "agent_name"):
+                if _sf in body and not isinstance(body[_sf], str):
+                    self._json(400, {"error": _sf + " must be a string"})
+                    return
             username = (body.get("username") or "").strip()
             # P1-C/N2: display_name flows into the system-prompt persona and
             # used to accept anything up to the body cap. 64 clean characters.
@@ -16953,6 +17424,10 @@ class MaraHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._json(400, {"error": "invalid JSON body"})
                 return
+            if not isinstance(body, dict):
+                # T-V23 (C9 family sweep): list/number bodies crashed here.
+                self._json(400, {"error": "JSON body must be an object"})
+                return
             target = registry_get_by_id(uid)
             if not target or target["status"] != "pending":
                 self._json(404, {"error": "pending approval not found"})
@@ -17054,6 +17529,10 @@ class MaraHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._json(400, {"error": "invalid JSON body"})
                 return
+            if not isinstance(body, dict):
+                # T-V23 (C9 family sweep): list/number bodies crashed here.
+                self._json(400, {"error": "JSON body must be an object"})
+                return
             action = body.get("action")
             if action == "mode":
                 m = str(body.get("mode") or "").strip().lower()
@@ -17140,6 +17619,10 @@ class MaraHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._json(400, {"error": "invalid JSON body"})
                 return
+            if not isinstance(body, dict):
+                # T-V23 (C9 family sweep): list/number bodies crashed here.
+                self._json(400, {"error": "JSON body must be an object"})
+                return
             # F29/R2: scope resolution (Q3). Unknown scope = 400, never a silent global write.
             _scope = body.get("scope") or "global"
             if _scope not in ("global", "personal"):
@@ -17197,6 +17680,10 @@ class MaraHandler(BaseHTTPRequestHandler):
                     return
             except Exception:
                 self._json(400, {"error": "invalid JSON body"})
+                return
+            if not isinstance(body, dict):
+                # T-V23 (C9 family sweep): list/number bodies crashed here.
+                self._json(400, {"error": "JSON body must be an object"})
                 return
             # F26: same scope contract as GET; writes land on the copy that
             # the actor is allowed to own, never somewhere else.
@@ -17394,6 +17881,10 @@ class MaraHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._json(400, {"error": "invalid JSON body"})
                 return
+            if not isinstance(body, dict):
+                # T-V23 (C9 family sweep): list/number bodies crashed here.
+                self._json(400, {"error": "JSON body must be an object"})
+                return
             target = registry_get_by_id(m.group(1))
             if not target:
                 self._json(404, {"error": "user not found"})
@@ -17547,18 +18038,10 @@ class MaraHandler(BaseHTTPRequestHandler):
         # offered payload, the dispatch guard, and the prompt tool reference
         # all use it.
         eff_tools = effective_tool_names(uname)
-        try:
-            body = self._read_body()
-            if body is None:
-                return
-            try:
-                body = json.loads(body)
-            except Exception:
-                self._json(400, {"error": "invalid JSON body"})
-                return
-        except Exception:
-            self._json(400, {"error": "invalid JSON body"})
+        body = self._json_object_body()
+        if body is None:
             return
+        # T-V23 (C9): non-object bodies are answered 400 by the helper.
         # P1-I/S03 (round-8 #1): claim-or-mint is ONE atomic decision. A
         # non-string id used to raise inside fullmatch (500 on the wire); it
         # now coerces to "" so the server MINTS a fresh conversation. The
@@ -17924,6 +18407,11 @@ class MaraHandler(BaseHTTPRequestHandler):
                 return
         except Exception:
             body = {}
+        if not isinstance(body, dict):
+            # T-V23 (C9 family sweep): the {} fallback covers parse
+            # failures; a VALID JSON list still has no .get - answer 400.
+            self._json(400, {"error": "JSON body must be an object"})
+            return
         cid = body.get("conversation_id", "")
         if not _valid_conv_id(cid):
             # P1-C/N1: an empty cid used to skip the ownership check entirely
@@ -17967,18 +18455,12 @@ class MaraHandler(BaseHTTPRequestHandler):
         if length > UPLOAD_BODY_MAX:
             self._json(413, {"error": "file too large (15 MB cap)"})
             return
-        _raw = self._read_body(UPLOAD_BODY_MAX)
-        if _raw is None:
-            # P1-C/F1: _read_body already ANSWERED (400/413) and returned None.
-            # json.loads(None) used to raise, the except fired, and a SECOND
-            # full response hit the same keep-alive connection. Round-2 audit:
-            # 16 of 18 sites were guarded; these two had non-empty arguments
-            # so the P1-B mechanical rewrite regex missed them. That is on me.
-            return
-        try:
-            body = json.loads(_raw)
-        except Exception:
-            self._json(400, {"error": "invalid JSON body"})
+        body = self._json_object_body(UPLOAD_BODY_MAX)
+        if body is None:
+            # P1-C/F1: _read_body already ANSWERED (400/413) and returned
+            # None. json.loads(None) used to raise, the except fired, and a
+            # SECOND full response hit the same keep-alive connection. The
+            # helper keeps that guard: None always means "already answered".
             return
         conv_id = body.get("conversation_id", "")
         if not _valid_conv_id(conv_id):
@@ -17990,13 +18472,15 @@ class MaraHandler(BaseHTTPRequestHandler):
         # share's history box was off (the read/stream/chat paths all checked
         # the guest stamp; this path did not).
         uname = u["username"]
-        name = _safe_upload_name(body.get("name", ""))
+        # T-V23 (C9 tail): a numeric name used to crash .replace() inside
+        # _safe_upload_name. str() first; the sanitizer still has the last word.
+        name = _safe_upload_name(str(body.get("name") or ""))
         # P1-C/F4 (round-2 audit): the client-declared type is a rumor. SVG
         # is a script carrier and html/xhtml can be snorted; none of them get
         # to be stored as an inlineable image/* type. The serve path decides
         # inline-ness from magic bytes regardless - this just stops storing
         # a lie.
-        mime = (body.get("mime") or "application/octet-stream")[:128]
+        mime = str(body.get("mime") or "application/octet-stream")[:128]
         if mime == "image/svg+xml" or name.lower().endswith((".svg", ".xhtml", ".htm", ".html")):
             mime = "application/octet-stream"
         data = body.get("data")
@@ -18303,14 +18787,9 @@ class MaraHandler(BaseHTTPRequestHandler):
         if length > IMPORT_BODY_MAX:
             self._json(413, {"error": "archive too large (64 MB decoded cap)"})
             return
-        _raw = self._read_body(IMPORT_BODY_MAX)
-        if _raw is None:
-            # P1-C/F1: same double-response shape as _handle_upload - guard.
-            return
-        try:
-            body = json.loads(_raw)
-        except Exception:
-            self._json(400, {"error": "invalid JSON body"})
+        body = self._json_object_body(IMPORT_BODY_MAX)
+        if body is None:
+            # P1-C/F1: the helper already answered (400/413) - early return.
             return
         data = body.get("data")
         if not isinstance(data, str) or not data:
@@ -18554,13 +19033,8 @@ class MaraHandler(BaseHTTPRequestHandler):
                 "Settings > Model) or sign in.", "type": "authentication_error",
                 "code": "invalid_api_key"}})
             return
-        body = self._read_body()
+        body = self._json_object_body()
         if body is None:
-            return
-        try:
-            body = json.loads(body)
-        except Exception:
-            self._json(400, {"error": "invalid JSON body"})
             return
         messages = body.get("messages", [])
         # S4e: /v1 has no user context - resolve the daemon owner's config.
@@ -18686,7 +19160,8 @@ from datetime import datetime as _f20_dt
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey as _f20_VerifyKey
 
 # DEV-ERA TEST KEY - the ONLY line that changes at BETA (K80 offline master).
-_F20_PIN_B64 = "YhKNUUe5poamlv0DL7s33+pQVJfzKosG0KcRb/Ljdx8="  # CAIRN master key (ceremony 2026-09-24; FP a8d666d4...3497ca)
+_F20_PIN_B64 = "YhKNUUe5poamlv0DL7s33+pQVJfzKosG0KcRb/Ljdx8="  # CAIRN master key (ceremony 2026-09-24; FP a8d666d4...3497ca = sha256 hex of
+  # the raw 32-byte public key per _f20_fp_hex; full FP published in INSTALL.md)
 _F20_SCHEMA = 1
 _F20_MANIFEST_MAX = 262144          # 256 KB manifest cap (canon)
 _F20_TOTAL_MAX = 64 * 1024 * 1024   # 64 MB total payload cap (canon)
@@ -18909,6 +19384,13 @@ def _f20_pub():
         src = "rotated"
     raw = _f20_b64.b64decode(str(b64), validate=True)
     return _f20_VerifyKey.from_public_bytes(raw), src, raw
+def _f20_fp_hex(raw):
+    """T-V21 (round-10): the KEY FINGERPRINT is sha256 of the raw 32-byte
+    public key, lowercase hex. This one line is the canonical definition -
+    the ceremony and INSTALL.md must agree with THIS formula, not the other
+    way round. Published out-of-band so first install is not trust-on-first-
+    download from the same account that ships the code."""
+    return _f20_hashlib.sha256(raw).hexdigest()
 
 
 def _f20_validate(man, murl, force=False):
@@ -18995,6 +19477,18 @@ def _f20_validate(man, murl, force=False):
     if rot:
         if nonce <= int(st.get("nonce", 0)) or rn <= int(st.get("rot_nonce", 0)):
             return "refused: rotation nonce does not advance (replay?)", None
+    else:
+        # T-V21 (round-10): anti-rollback is nonce-first, version-second. EVERY
+        # non-rotation manifest must strictly advance the recorded nonce - the
+        # version floor alone cannot stop a replay of an old-but-above-floor
+        # build signed by the same key. Runs for --force reinstalls too: the
+        # documented recovery from a bad state file is offline (restore the
+        # snapshot + edit update-state.json), never a network-install hatch.
+        # A crash between swap and state advance is recovered by the boot
+        # journal (_f20_boot_reconcile), which never re-validates, so this
+        # gate cannot strand an interrupted install.
+        if nonce <= int(st.get("nonce", 0)):
+            return "refused: manifest nonce did not advance", None
     kind = "rotation" if rot else "code"
     return None, {"kind": kind, "version": ver, "floor": floor, "nonce": nonce,
                   "released_utc": str(man.get("released_utc", ""))[:40],
@@ -19366,8 +19860,10 @@ def _f20_route_status(h):
     err, pair = _f20_staged()
     staged = None if err else pair[1]
     pend = _f20_jread(_F20_PENDING)
+    kfp = ""
     try:
         _ks, ksrc, _kr = _f20_pub()
+        kfp = _f20_fp_hex(_kr)
     except Exception:
         ksrc = "CORRUPT-PINFILE"
     with _F20_CLOG_LOCK:
@@ -19375,7 +19871,7 @@ def _f20_route_status(h):
     h._json(200, {"enabled": _f20_enabled(), "url": _f20_manifest_url(),
                   "lan": _f20_lan_ok(), "xorigin": _f20_xorigin_ok(),
                   "current": VERSION, "build_sha": DAEMON_BUILD_SHA[:12],
-                  "key_source": ksrc,
+                  "key_source": ksrc, "key_fp": kfp,
                   "state": {"floor": st.get("floor", "0"), "nonce": int(st.get("nonce", 0)),
                             "rot_nonce": int(st.get("rot_nonce", 0))},
                   "staged": staged,
@@ -19908,7 +20404,7 @@ sudo update-ca-certificates</code></pre>
 <h2>Why there is no built-in ACME</h2>
 <p>Deliberate, not lazy. An ACME client means the daemon holds domain-validation credentials and automates trusting certificates over a protocol with real sharp edges (rate limits, account keys, challenge ports, renewal races). That machinery wants key custody and root-adjacent privileges that a chat daemon has no business holding. The split above keeps it simple: <i>something you chose</i> owns the certificates, the daemon consumes them, and the settings card refuses a broken pair before it can take a restart.</p>
 <h2>The cookie rule this interacts with</h2>
-<p>Session cookies are <b>Secure</b> whenever the request arrives over TLS - served directly or reported honestly by your proxy (<code>X-Forwarded-Proto: https</code>). On plain HTTP from a non-localhost address, browsers are not trusted with the session and login will not stick. That is a feature with a documentation page, not a bug - and it is why <a href="/help/remote">Remote access & Firewall</a> pushes you toward TLS even on a VPN.</p>
+<p>Session cookies carry <b>Secure</b> when the request arrives over TLS - served directly or reported honestly by your proxy (<code>X-Forwarded-Proto: https</code>). On plain HTTP from a non-localhost address the cookie cannot be Secure without breaking every plain-LAN setup this project deliberately supports - so login DOES stick there, and your token plus everything you type ride the wire in the clear. Treat plain HTTP as an onboarding door, not a steady state: <a href="/help/remote">Remote access & Firewall</a> and <a href="/help/tls">TLS</a> exist to get you onto real transport, even on a VPN.</p>
 """
 HELP_BODIES["remote"] = """<p>The honest starting point: this daemon listens on <b>127.0.0.1</b> only. That is the boot line's own words, not a config we forgot. Nobody on your LAN - let alone the internet - can reach it until <i>you</i> deliberately build a path. Every option below is you opening a door you chose, on purpose.</p>
 <h2>Option 1 (recommended): a VPN</h2>
@@ -19918,7 +20414,7 @@ HELP_BODIES["remote"] = """<p>The honest starting point: this daemon listens on 
 <li><b>WireGuard</b> - self-hosted, one UDP port forwarded, keys you generate. More setup, zero third party in the middle. Docs: wireguard.com.</li>
 </ul>
 <div class="card"><p style="margin:0"><b>Please read:</b> commands provided to assist; these tools are very safe, but this project does not control that repository - review before you run.</p></div>
-<p><b>The catch nobody mentions:</b> a VPN address is not localhost to your browser. Plain <code>http://10.x.x.x</code> over the tunnel still trips the Secure-cookie rule, and login will not stick. Over a VPN you still want TLS - Caddy <code>tls internal</code> bound to the tunnel address, or the daemon's own <a href="/help/tls">Local CA</a>, both covered on the TLS page.</p>
+<p><b>The catch nobody mentions:</b> a VPN address is not localhost to your browser. Plain <code>http://10.x.x.x</code> over the tunnel lets you log in and STAYS logged in - the Secure flag only exists where TLS exists - and that plain traffic, session token included, is readable to anything that controls a hop. A VPN is privacy, not transport security: run TLS over the tunnel too - Caddy <code>tls internal</code> bound to the tunnel address, or the daemon's own <a href="/help/tls">Local CA</a>, both covered on the TLS page.</p>
 <h2>Option 2: a reverse proxy on a gateway box</h2>
 <p>The standard home-server shape: Caddy (or nginx) with a real certificate on the machine that has the public name, daemon in <b>Proxy</b> mode on loopback, firewall exposing only 443. Walkthrough on the <a href="/help/tls">TLS & Certificates</a> page. The proxy must forward <code>X-Forwarded-Proto</code> honestly so the daemon knows its users really arrive over HTTPS.</p>
 <h2>Option 3 (last resort): router port forwarding</h2>
@@ -19926,7 +20422,7 @@ HELP_BODIES["remote"] = """<p>The honest starting point: this daemon listens on 
 <ul>
 <li>Your home IP becomes a public target - every future bug in everything exposed is reachable from anywhere on Earth, forever, until you close it.</li>
 <li>Brute-force traffic is not hypothetical; it starts within hours of opening a port.</li>
-<li>A real certificate (or a private CA on every device) is still mandatory - a forwarded plain-HTTP port is worse than useless here, because the Secure-cookie rule means you cannot even log in over it.</li>
+<li>A real certificate (or a private CA on every device) is still mandatory - a forwarded plain-HTTP port is worse than useless here: login sticks over it, and your session token rides the wire in the clear end to end.</li>
 <li>Residential ISPs: some block inbound ports, some reassign your IP, some consider it a ToS violation.</li>
 <li>DMZ and "expose everything" settings are strictly worse; nothing here ever needs them.</li>
 </ul>
@@ -20134,6 +20630,24 @@ def _host_is_loopback(h):
         return _h8ip.ip_address(h).is_loopback
     except ValueError:
         return False
+def _v18_transport_stance(bind_host, tls_served):
+    """V18: plaintext HTTP on a non-loopback bind is a DELIBERATE insecure-LAN
+    stance, never a silent one. The first-setup flow intentionally survives
+    plain HTTP (getting in must never require trusting a stranger's
+    certificate), so this warns prominently instead of refusing to boot -
+    the TLS-mode fail-closed (the H08 posture above) still refuses plaintext
+    non-loopback whenever TLS IS configured. Returns the warning string, or
+    None when the bind needs no warning."""
+    if tls_served or _host_is_loopback(bind_host):
+        return None
+    acked = (os.environ.get("MARA_ALLOW_INSECURE_LAN") or "").strip() == "1"
+    return ("PLAINTEXT HTTP on %s - the session cookie cannot carry the Secure "
+            "flag on this transport, so logins DO stick and tokens travel in "
+            "the clear for anyone on the path.%s"
+            % (bind_host,
+               " Acknowledged via MARA_ALLOW_INSECURE_LAN=1." if acked else
+               " Put TLS in front (/help/tls), bind MARA_HOST=127.0.0.1, or "
+               "set MARA_ALLOW_INSECURE_LAN=1 to run plain-on-LAN knowingly."))
 def _tls_wire(server):
     """H08: TLS wiring with fail-closed semantics. Returns True when TLS will be
     served (T-A3: per-connection wrap - the listener itself stays plain and
@@ -20215,6 +20729,9 @@ def main():
     _tls_wire(server)
     log.info("mara-home daemon v%s // %s // %s (sha %s) listening on %s:%d (pid %d)",
              VERSION, BUILD_SERIES, BUILD_NAME, DAEMON_BUILD_SHA[:12], HOST, PORT, os.getpid())
+    _v18_warn = _v18_transport_stance(HOST, TLS_SERVED)
+    if _v18_warn:
+        log.warning("V18: %s", _v18_warn)
     _logs_file_gate()
     log_event(DAEMON_OWNER, "daemon.boot", version=VERSION, series=BUILD_SERIES,
               build_name=BUILD_NAME, build_sha=DAEMON_BUILD_SHA[:12], pid=os.getpid())

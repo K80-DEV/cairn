@@ -8,20 +8,31 @@
 - Any OpenAI-compatible model endpoint + key (BYOK) — or Ollama on the same box
 
 ## 2. Download and verify
-Grab the build you want and check its checksum against the manifest the
-release was made with (`updates/manifest.json` in this repo is the *current*
-release; older ones are in the file's git history):
+Grab a release from its **immutable tag** (recommended over the mutable
+`main` branch: a tag never changes after it is pushed). Each release's file
+lives at `updates/<version>/marahome.py` inside its tag, and its bytes are
+attested by the signed manifest that shipped with it
+(`updates/manifest.json` at that tag):
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6v/marahome.py
+curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.6w/updates/0.6w/marahome.py
 sha256sum marahome.py
-# expected: c6c124c49fb9ceab28ddff2a9607e2a08d392e665d3098120cab3f4177b42a40 (969152 bytes)
+# expected: 837406e0f0a012dee5dc8837963601a3a493047442d404202b342870cab6d9a7 (1077504 bytes)
 ```
 
 The manifest itself is Ed25519-signed; the daemon verifies signatures against
 a key pinned inside the code, which catches a tampered manifest. The pin ships
 inside the file you just downloaded, so to close the loop fully, confirm the
 signing key fingerprint over a channel separate from this download.
+
+The master signing key fingerprint is the lowercase hex sha256 of the raw
+32-byte Ed25519 public key - the same formula the daemon itself computes:
+
+`a8d666d48cf3c5915ee715d23c573b790197053209b20ca08a6b91e5b53497ca`
+
+Once installed, your own daemon republishes the fingerprint of the key it
+actually uses at `/api/update/status` (`key_fp`, owner-only) - a second look
+at the same fact from inside the box, independent of this repo.
 
 ## 3. First boot
 ```bash
@@ -57,7 +68,7 @@ The updater is **off by default** and **pull-only**.
    pre-update snapshot, gold-boot-smoke-tests the staged file in a scratch
    environment, swaps, and restarts itself.
 5. Watch the console/journal: the boot line should read
-   `mara-home daemon v<new-version> // Basalt // Ghostlight (sha <new-sha>)`.
+   `mara-home daemon v<new-version> // BASALT // GHOSTLIGHT (sha <new-sha>)`.
    "Ghostlight" is the held build name for the whole Basalt (0.X) series through 1.0;
    each build differs only by its version letter and sha.
 6. The next Check should say you are up to date. From 0.6j1 onward, no URL
