@@ -13669,9 +13669,6 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;bac
   radial-gradient(700px 420px at -10% 110%, var(--glow2), transparent 65%)}
 .wrap{max-width:720px;margin:0 auto;position:relative;z-index:1}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.header{padding:12px 0 16px;border-bottom:1px solid var(--border);margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.header h1{font-size:17px;font-weight:600;letter-spacing:0.4px;display:flex;align-items:center}
-.header h1 .slash{color:var(--accent2);margin:0 6px}
 .header a{color:var(--dim);text-decoration:none;font-size:14px;padding:10px 12px;border-radius:8px;transition:color .15s,background .15s;min-height:40px;display:inline-flex;align-items:center}
 .header a:hover{color:var(--accent);background:var(--surface)}
 .logo{height:26px;width:26px;border-radius:50%;margin-right:10px;flex:none;border:1px solid var(--border)}
@@ -13734,7 +13731,6 @@ body{padding:10px;padding-bottom:44px}
 .row>label{width:100%}
 .row input:not([type=checkbox]):not([type=radio]),.row select,.row textarea{flex:1 1 100%;min-width:0;max-width:100%}
 #updUrl{width:100%;max-width:100%}
-.header{flex-wrap:wrap}
 .kv{flex-wrap:wrap}
 .kv .v{text-align:left}
 }
@@ -13765,7 +13761,15 @@ body{padding:10px;padding-bottom:44px}
 .secnav .sec-empty{color:var(--dim);font-size:12.5px;padding:10px 12px}
 .secflash{outline:2px solid var(--accent);outline-offset:4px;border-radius:14px}
 .card[data-sec]{scroll-margin-top:70px}
-#secBtn{margin-top:0;white-space:nowrap}
+.sbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:8px 12px;margin-bottom:16px;box-shadow:0 6px 18px rgba(0,0,0,0.25)}
+#secBtn{flex:none;width:40px;min-width:40px;height:40px;padding:0;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:9px;cursor:pointer;margin-top:0}
+#secBtn svg{width:20px;height:20px;stroke:currentColor;stroke-width:2;stroke-linecap:round;fill:none}
+.sbar-title{font-size:15px;font-weight:600;letter-spacing:0.4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sbar-title .slash{color:var(--accent2);margin:0 4px}
+.secchat{display:block;margin:0 10px 6px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;color:var(--accent);text-decoration:none;font-size:13.5px;font-weight:600}
+.secchat:hover{background:var(--bg)}
+.sechelp{display:block;padding:6px 10px 2px;color:var(--dim);text-decoration:none;font-size:12.5px;line-height:1.35}
+.sechelp b{color:var(--accent);font-weight:600}
 body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admin"] .card:not([data-sec="admin"]),body[data-page="owner"] .card:not([data-sec="owner"]){display:none!important}
 .conn{border-top:1px solid rgba(255,255,255,.07);padding:12px 0}
 .conn>b{margin-right:8px}
@@ -13781,6 +13785,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
 <div class="sbackdrop" id="secBackdrop"></div>
 <aside class="sdrawer" id="secDrawer" aria-label="Settings sections" aria-hidden="true">
 <div class="sdrawer-head"><h2>Settings sections</h2><button id="secClose" aria-label="Close menu">&#10005;</button></div>
+<span class="secchatbox"><a class="secchat" href="." onclick="secClose()">&#8592; Back to chat</a><a class="sechelp" href="help" onclick="secClose()">Questions about your data? <b>Help Center &#8594;</b></a></span>
   <div class="sectabs" role="tablist">
   <button class="sectab" data-page="personal" role="tab">Personal</button>
   <button class="sectab" data-page="admin" role="tab" hidden>Admin</button>
@@ -13789,10 +13794,10 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <div class="secnav" id="secNav"></div>
 </aside>
 <div class="wrap">
-<div class="header">
-  <h1><img class="logo" src="api/avatar" onerror="this.onerror=null;this.src='static/color.png'" alt="">Mara<span class="slash">//</span>Settings</h1>
-  <p style="margin:4px 0 0;font-size:12.5px"><a href="help" style="color:var(--accent);text-decoration:none">How any of this stores or records your data? The Help Center answers it honestly &rarr;</a></p>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button id="secBtn" class="btn" aria-haspopup="true" aria-controls="secDrawer">Sections</button><a href=".">← Chat</a></div>
+<div class="sbar">
+  <button id="secBtn" aria-label="Settings menu" aria-haspopup="true" aria-controls="secDrawer"><svg viewBox="0 0 24 24" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg></button>
+  <div class="sbar-title">Mara<span class="slash">//</span>Settings</div>
+  <span class="sbar-title" style="margin-left:auto;color:var(--dim);font-weight:400;font-size:12.5px"><a href="." style="color:var(--dim);text-decoration:none">Chat</a></span>
 </div>
 
 <div class="card" data-sec="personal">
