@@ -11330,6 +11330,68 @@ def model_headers(cfg):
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 
 
+# ── B-24 (K80 ask 2026-09-27): full provider catalog, searched server-side ──
+# Providers like Featherless list ~22,000 model ids. The old handler shipped
+# the first 200 and called it a day; now CAIRN caches the FULL id list per
+# user+provider+key and /api/models answers either the first page (no q - the
+# old contract) or the top matches of a type-to-find query (?q=, optionally
+# ?provider= to search another configured provider's catalog). Keys never
+# leave the settings rows; the fingerprint below is cache hygiene only.
+_MODEL_LIST_TTL = 3600    # seconds a cached catalog stays fresh
+_MODEL_PAGE = 200         # ids returned with no q (unchanged old behavior)
+_MODEL_SEARCH_CAP = 50    # ids returned per search
+_MODEL_Q_MAX = 80         # bound on the search query itself
+_model_cat_lock = threading.Lock()
+_model_cat = {}  # (user, provider, base, keyfp) -> [ts, names]
+
+def _models_fetch_ids(mc):
+    """Full provider id list through the ONE provider door (P1-C/F2 door and
+    P1-H/W body cap preserved). Raises on any transport/HTTP error."""
+    mreq = urllib.request.Request(mc["base"] + "/models", headers=model_headers(mc))
+    with _provider_urlopen(mc, mreq, timeout=30) as mresp:
+        mdata = json.loads(_p1h_read(mresp, _P1H_PROVIDER_BODY_CAP, "model list"))  # P1-H/W
+    return [m.get("id") for m in (mdata.get("data") or []) if m.get("id")]
+
+def _model_catalog(username, provider=""):
+    """(names, err, stale). A fresh cache answers with NO provider call. A
+    failed refresh over a stale entry serves the stale list (stale=True tells
+    the truth), so type-to-find keeps working through provider hiccups."""
+    mc, me = model_config(username, {"provider": provider} if provider else None)
+    if mc is None:
+        return None, me, False
+    fp = hashlib.sha256((mc["key"] + "\0" + mc["base"]).encode("utf-8", "replace")).hexdigest()[:16]
+    ck = (mc["username"], mc["provider"], mc["base"], fp)
+    now = time.time()
+    with _model_cat_lock:
+        ent = _model_cat.get(ck)
+        if ent and now - ent[0] < _MODEL_LIST_TTL:
+            return ent[1], None, False
+    try:
+        names = _models_fetch_ids(mc)
+    except Exception as e:
+        if ent:
+            return ent[1], None, True
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                detail = e.read(200).decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            return None, "upstream HTTP %s: %s" % (e.code, detail), False
+        return None, "could not list models: %s" % e, False
+    with _model_cat_lock:
+        _model_cat[ck] = [now, names]
+        if len(_model_cat) > 64:  # tiny hygiene: evict oldest first
+            for _k in sorted(_model_cat, key=lambda k: _model_cat[k][0])[:-32]:
+                _model_cat.pop(_k, None)
+    return names, None, False
+
+def _model_qfilter(names, q, cap):
+    """AND-match of up to 6 whitespace tokens, case-insensitive substring."""
+    toks = [t for t in q.split() if t][:6]
+    if not toks:
+        return names[:cap]
+    return [n for n in names if all(t in n.lower() for t in toks)][:cap]
+
 def build_model_request(cfg, payload):
     """urllib Request for cfg: OAI-compat gets the user's params merged in;
     Anthropic gets a converted body. The shared file key is NOT consulted
@@ -12624,7 +12686,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 <footer class="composer">
   <div id="queueBar" class="queuebar" hidden></div>
   <div id="attachChips" class="attach-chips"></div>
-  <div id="chatModelBar" style="font-size:12px;color:var(--dim);padding:0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%"></span><button id="chatModelEdit" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
+  <div id="chatModelBar" style="font-size:12px;color:var(--dim);padding:0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%"></span><button id="chatModelEdit" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span><span id="cmHits" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
   <div class="composer-col">
     <button id="attachBtn" class="icon-btn" title="Attach files">
       <svg viewBox="0 0 24 24"><path d="M21 12l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8L13 4.5a3.7 3.7 0 0 1 5.2 5.2l-8.2 8.2a1.85 1.85 0 0 1-2.6-2.6L15 7.5"/></svg>
@@ -12725,6 +12787,44 @@ function cmSuggest() {
   }
 }
 if ($('cmProv')) $('cmProv').addEventListener('change', cmSuggest);
+// B-24: type-to-find across the provider's FULL catalog (server-side search
+// of the cached id list). Datalist plus tappable hit-chips, because mobile
+// Safari treats datalist as decoration (B-21 scar).
+let cmSearchSeq = 0, cmSearchTimer = null;
+function cmHitsRender(list) {
+  const box = $('cmHits'); if (!box) return;
+  box.textContent = '';
+  const inp = $('cmModel');
+  list.slice(0, 8).forEach(function (id) {
+    const b = document.createElement('button');
+    b.className = 'btn';
+    b.style.cssText = 'padding:0 8px;height:22px;font-size:12px';
+    b.textContent = f21ChipName({ model: id });
+    b.title = id;
+    b.addEventListener('click', function () { inp.value = id; });
+    box.appendChild(b);
+  });
+}
+function cmSearchRun() {
+  const dl = $('cmModelList'), inp = $('cmModel');
+  const v = ((inp && inp.value) || '').trim().toLowerCase();
+  if (v.length < 2) { cmHitsRender([]); cmSuggest(); return; }
+  const prov = ($('cmProv') && $('cmProv').value) || '';
+  const my = ++cmSearchSeq;
+  fetch('api/models?q=' + encodeURIComponent(v) + (prov ? '&provider=' + encodeURIComponent(prov) : ''))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (my !== cmSearchSeq) return;
+      const list = (d && d.models) || [];
+      if (!list.length) { cmHitsRender([]); cmSuggest(); return; }
+      if (dl) {
+        dl.textContent = '';
+        list.forEach(function (id) { const o = document.createElement('option'); o.value = id; dl.appendChild(o); });
+      }
+      cmHitsRender(list);
+    }).catch(function () {});
+}
+if ($('cmModel')) $('cmModel').addEventListener('input', function () { clearTimeout(cmSearchTimer); cmSearchTimer = setTimeout(cmSearchRun, 300); });
 f21Init();
 $('chatModelEdit').addEventListener('click', () => {
   const n = $('chatModelNote'); n.hidden = !n.hidden;
@@ -13816,7 +13916,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     </select>
   </div>
   <div class="row" id="modelCustomRow" style="display:none"><label>Base URL</label><input id="model_custom" value="" placeholder="https://localhost:11434/v1" autocomplete="off"></div>
-  <div class="row"><label>Model</label><input id="model" value="" autocomplete="off" placeholder="type to search loaded models - or paste any model id" oninput="modelSearchInput()" onfocus="modelSearchInput()">
+  <div class="row"><label>Model</label><input id="model" value="" autocomplete="off" placeholder="type to search ALL provider models - or paste any model id" oninput="modelSearchInput()" onfocus="modelSearchInput()">
   <button class="btn" style="margin-top:0;padding:0 12px" onclick="loadModels()">Load models</button></div>
   <div class="model-drop" id="modelDrop" style="display:none"></div>
   <div class="status" id="modelLoadStatus"></div>
@@ -14566,12 +14666,31 @@ async function smLoad() {
     if (r.ok && d.models && d.models.length) {
       dl.textContent = '';
       d.models.forEach(function (id) { const o = document.createElement('option'); o.value = id; dl.appendChild(o); });
-      setStatus('smStatus', 'ok', d.models.length + ' ids loaded from your account provider - type in the model id box to search');
+      setStatus('smStatus', 'ok', d.models.length + ' ids loaded from your account provider' + (d.total ? ' (catalog holds ' + d.total + ')' : '') + ' - type in the model id box to search them all');
     } else {
       setStatus('smStatus', 'err', 'Could not list models (' + (d.error || ('HTTP ' + r.status)) + ') - type or paste the id');
     }
   } catch (e) { setStatus('smStatus', 'err', 'Could not list models (network) - type or paste the id'); }
 }
+// B-24: the shortcut model box searches the FULL cached catalog too.
+let smSearchSeq = 0, smSearchTimer = null;
+function smSearchRun() {
+  const dl = s$('smModelList'), mv = s$('smModel');
+  const v = ((mv && mv.value) || '').trim().toLowerCase();
+  if (v.length < 2) return;
+  const my = ++smSearchSeq;
+  fetch('api/models?q=' + encodeURIComponent(v))
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (my !== smSearchSeq) return;
+      const list = (d && d.models) || [];
+      if (!list.length) { setStatus('smStatus', 'err', 'No catalog id matches "' + v + '"' + (d && d.error ? ' (' + d.error + ')' : '') + ' - keep typing, or paste the id'); return; }
+      dl.textContent = '';
+      list.forEach(function (id) { const o = document.createElement('option'); o.value = id; dl.appendChild(o); });
+      setStatus('smStatus', 'ok', list.length + (d.total ? ' of ' + d.total : '') + ' ids match - keep typing to narrow');
+    }).catch(function () {});
+}
+document.addEventListener('DOMContentLoaded', function () { var _sm = document.getElementById('smModel'); if (_sm) _sm.addEventListener('input', function () { clearTimeout(smSearchTimer); smSearchTimer = setTimeout(smSearchRun, 300); }); });
 function renderConnectors(s) {
   var c = s && s.connectors; if (!c) return;
   var cfg = c.config || {};
@@ -14933,21 +15052,40 @@ function clearModelKey() {
   saveSettings();
 }
 
-let MODELS = [];
+let MODELS = [], MODELS_TOTAL = 0, mSearchSeq = 0, mSearchTimer = null;
 function modelSearchInput() {
-  // Live-filtered picker over the loaded catalog. textContent only: model
-  // ids are provider DATA and must never parse as markup.
+  // B-24: type-to-find over the FULL provider catalog (server searches the
+  // cached id list). Instant local hits first; when the catalog is bigger
+  // than the loaded page, the server answer replaces them ~250ms later.
   const inp = document.getElementById('model');
   const drop = document.getElementById('modelDrop');
   if (!inp || !drop) return;
-  if (!MODELS.length) { drop.style.display = 'none'; return; }
   const q = (inp.value || '').trim().toLowerCase();
-  const hits = MODELS.filter(m => m.toLowerCase().indexOf(q) !== -1).slice(0, 60);
+  clearTimeout(mSearchTimer);
+  if (!q && !MODELS.length) { drop.style.display = 'none'; return; }
+  const seq = ++mSearchSeq;
+  modelDropShow(MODELS.filter(m => m.toLowerCase().indexOf(q) !== -1).slice(0, 60), q, false);
+  if (q.length >= 2 && MODELS_TOTAL > MODELS.length) {
+    mSearchTimer = setTimeout(function () {
+      fetch('api/models?q=' + encodeURIComponent(q))
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (seq !== mSearchSeq) return;
+          modelDropShow((d && d.models) || [], q, true);
+        }).catch(function () {});
+    }, 250);
+  }
+}
+function modelDropShow(hits, q, fromServer) {
+  // textContent only: model ids are provider DATA and must never parse as markup.
+  const inp = document.getElementById('model');
+  const drop = document.getElementById('modelDrop');
   drop.textContent = '';
   if (!hits.length) {
-    const d = document.createElement('div');
-    d.className = 'md-empty';
-    d.textContent = 'no loaded model matches - paste the id anyway; free text is fine';
+    const d = document.createElement('div'); d.className = 'md-empty';
+    d.textContent = (!fromServer && MODELS_TOTAL > MODELS.length && q.length >= 2)
+      ? 'searching the full catalog (' + MODELS_TOTAL + ' ids)...'
+      : 'no model matches - paste the id anyway; free text is fine';
     drop.appendChild(d);
   } else {
     hits.forEach(m => {
@@ -14956,6 +15094,11 @@ function modelSearchInput() {
       d.onclick = () => { inp.value = m; drop.style.display = 'none'; };
       drop.appendChild(d);
     });
+    if (fromServer) {
+      const d = document.createElement('div'); d.className = 'md-empty';
+      d.textContent = 'top ' + hits.length + ' of ' + MODELS_TOTAL + ' catalog ids - keep typing to narrow';
+      drop.appendChild(d);
+    }
   }
   drop.style.display = 'block';
 }
@@ -14972,7 +15115,8 @@ async function loadModels() {
     const d = await r.json();
     if (r.ok && d.models && d.models.length) {
       MODELS = d.models;
-      setStatus('modelLoadStatus', 'ok', MODELS.length + ' models loaded - type in the Model box to search them all');
+      MODELS_TOTAL = d.total || d.models.length;
+      setStatus('modelLoadStatus', 'ok', MODELS_TOTAL + ' models in your provider catalog - type in the Model box to search them all');
     } else {
       MODELS = [];
       setStatus('modelLoadStatus', 'warn', 'Could not list models (' + (d.error || 'HTTP ' + r.status) + ') - paste the model id by hand');
@@ -16952,23 +17096,31 @@ class MaraHandler(BaseHTTPRequestHandler):
         elif path == "/api/models":
             # S4e tail: list the provider's model ids with the user's saved
             # key (GET {base}/models). The UI keeps a paste fallback.
+            # B-24 (K80 ask 2026-09-27): providers like Featherless list ~22k
+            # ids. The full list is cached server-side (TTL below); ?q=
+            # searches ALL of it (bounded answer), ?provider= switches which
+            # configured provider is searched. No q keeps the old first-page
+            # contract and the 503/502 shapes exactly.
             u = self._need_user()
             if not u:
                 return
-            mc, me = model_config(u["username"])
-            if mc is None:
-                self._json(503, {"error": me, "models": []})
+            _bq = dict(_nc_up.parse_qsl(_nc_up.urlsplit(self.path).query))  # house query pattern
+            _mq = (_bq.get("q") or "").strip().lower()[:_MODEL_Q_MAX]
+            _mp = (_bq.get("provider") or "").strip().lower()[:32]
+            names, merr, stale = _model_catalog(u["username"], _mp)
+            if names is None:
+                if merr.startswith("upstream HTTP") or merr.startswith("could not list"):
+                    self._json(502, {"error": merr, "models": []})
+                else:
+                    self._json(503, {"error": merr, "models": []})
                 return
-            try:
-                mreq = urllib.request.Request(mc["base"] + "/models", headers=model_headers(mc))
-                with _provider_urlopen(mc, mreq, timeout=30) as mresp:  # P1-C/F2
-                    mdata = json.loads(_p1h_read(mresp, _P1H_PROVIDER_BODY_CAP, "model list"))  # P1-H/W
-                names = [m.get("id") for m in (mdata.get("data") or []) if m.get("id")]
-                self._json(200, {"models": names[:200]})
-            except urllib.error.HTTPError as e:
-                self._json(502, {"error": "upstream HTTP %s: %s" % (e.code, e.read(1024)[:200].decode("utf-8", "replace")), "models": []})  # P1-H/W bounded
-            except Exception as e:
-                self._json(502, {"error": "could not list models: %s" % e, "models": []})
+            hits = _model_qfilter(names, _mq, _MODEL_SEARCH_CAP if _mq else _MODEL_PAGE)
+            out = {"models": hits, "total": len(names)}
+            if _mq:
+                out["matched"] = len(hits)
+            if stale:
+                out["stale"] = True
+            self._json(200, out)
         elif path == "/api/vault":
             self._handle_vault_get()
         elif path == "/api/cmd-approvals":
