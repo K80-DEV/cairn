@@ -62,6 +62,7 @@ from html.parser import HTMLParser
 BASE = Path(os.environ.get("MARA_HOME", "/var/lib/cairn"))
 IDENTITY = BASE / "identity"
 MEMORY_DIR = IDENTITY / "memory"
+SKILLS_DIR = IDENTITY / "skills"  # B-15: per-principal instruction files (Agora-style skills)
 STATE = BASE / "state"
 SECRETS = BASE / "secrets"
 LOGS = BASE / "logs"
@@ -105,8 +106,8 @@ SP_WARN_CHARS = 100000
 INSTANCE_SLUG = os.path.basename(os.path.dirname(str(BASE)))
 STATIC_DIR = BASE / "static"
 AVATAR_DIR = BASE / "avatars"   # S4f10: per-user agent faces (raw bytes, no transcoding)
-AVATAR_MAX = 1048576            # S4f10: 1 MB decoded image cap
-AVATAR_BODY_MAX = 2 * 1048576   # S4f10: request cap (1 MB base64 ~ 1.37 MB + JSON)
+AVATAR_MAX = 10 * 1048576        # S4f10: decoded image cap (owner raised 1 MB -> 10 MB, 2026-09-26)
+AVATAR_BODY_MAX = 14 * 1048576  # S4f10: request cap (10 MB base64 ~ 13.4 MB + JSON)
 AVATAR_EXTS = ("png", "jpg", "gif", "webp")
 AVATAR_TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
 DEFAULT_AVATAR = STATIC_DIR / "agent.png"  # S4f10: house default face - drop-in file
@@ -300,7 +301,7 @@ COMPACT_KEEP_RECENT = 12
 COMPACT_MAX_TOKENS = 30000
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
-for d in [STATE, SECRETS, LOGS, IDENTITY, MEMORY_DIR, UPLOADS_DIR, AVATAR_DIR]:
+for d in [STATE, SECRETS, LOGS, IDENTITY, MEMORY_DIR, SKILLS_DIR, UPLOADS_DIR, AVATAR_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -421,6 +422,109 @@ def _share_tier_projected(username, key):
         return bool(_share_grants(sh).get(key, 0))  # unknown key fail-closed; real keys always present in the dict
     except Exception:
         return False
+# ---------------------------------------------------------------------------
+# B-15 (0.6x, K80 2026-09-26 "skills, Agora-style"): per-principal instruction
+# FILES. A skill is one .md file in SKILLS_DIR/<principal>/ - same namespace
+# discipline as memory (R7a rules: caller-verified principal, basename-only,
+# never created implicitly). The SELECTION file (skills.json) lists which
+# skills ship in the prompt; a brand-new skill is enabled on save, and every
+# change lands in the selection explicitly. Share principals get NOTHING
+# projected here - their seed-memory/room layering owns that plane.
+_SKILLS_LOCK = Lock()
+SKILL_FILE_CAP = 64 * 1024      # per-file ceiling (memory files allow 256KB; skills ride every request too)
+SKILL_TOTAL_WARN = 48 * 1024    # soft "this eats your context" threshold across SELECTED skills
+def _user_skills_dir(username=None):
+    """B-15: principal -> their private skills directory (NEVER created here).
+    Same shape rules as _user_memory_dir; import strings re-validated too."""
+    who = username or DAEMON_OWNER
+    if not isinstance(who, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{2,31}", who):
+        return None
+    return SKILLS_DIR / who
+def _skill_file_path(name, username=None):
+    """B-15: basename-only, .md required, no dotfiles, no separators. The
+    namespace comes from the authenticated principal, never the request text.
+    skills.json is the selection file and is NOT addressable through here."""
+    if not name or len(name) > 100 or name != name.strip():
+        return None
+    if name.startswith(".") or "/" in name or name in (".", ".."):
+        return None
+    if not name.endswith(".md") or name == "skills.json.md":
+        return None
+    d = _user_skills_dir(username)
+    if d is None:
+        return None
+    return d / name
+def _skills_sel_path(username=None):
+    d = _user_skills_dir(username)
+    return None if d is None else d / "skills.json"
+def _skills_selected(username=None):
+    """Selection list; unreadable/corrupt selection = select NONE (fail-closed:
+    inert bytes must never steer the model). A selection referencing a deleted
+    file simply drops that entry at read time."""
+    p = _skills_sel_path(username)
+    if p is None or not p.exists():
+        return None  # None = no explicit choice recorded yet
+    try:
+        data = json.loads(p.read_text())
+        sel = data.get("selected") if isinstance(data, dict) else None
+        if not isinstance(sel, list):
+            return []
+        return [x for x in sel if isinstance(x, str)]
+    except Exception:
+        return []
+def _skills_set_selected(username, selected):
+    p = _skills_sel_path(username)
+    if p is None:
+        return False
+    with _SKILLS_LOCK:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.parent.chmod(0o700)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"selected": sorted(set(selected))}))
+        tmp.chmod(0o600)
+        tmp.replace(p)
+    return True
+def _skills_list(username=None):
+    d = _user_skills_dir(username)
+    out = []
+    if d is not None and d.exists():
+        for f in sorted(d.glob("*.md")):
+            try:
+                out.append({"name": f.name, "size": f.stat().st_size})
+            except OSError:
+                continue
+    return out
+def _skills_block_for(username=None):
+    """B-15 injection: framed block of the SELECTED skills, or "" when nothing
+    applies. Owner+resident principals only (callers gate shares); missing
+    selection file = all files selected (a saved skill works immediately)."""
+    if (username or "").startswith("share-"):
+        return ""  # B-15 fence: share clones never see the skills plane
+    files = _skills_list(username)
+    if not files:
+        return ""
+    sel = _skills_selected(username)
+    chosen = files if sel is None else [f for f in files if f["name"] in sel]
+    if not chosen:
+        return ""
+    d = _user_skills_dir(username)
+    parts = []
+    total = 0
+    for f in chosen:
+        try:
+            text = (d / f["name"]).read_text()
+        except Exception as e:
+            log.warning("B-15: failed to read skill %s: %s", f["name"], e)
+            continue
+        total += len(text.encode("utf-8"))
+        parts.append("\n\n=== SKILL FILE: %s ===\n%s" % (f["name"], text))
+    if not parts:
+        return ""
+    if total > SKILL_TOTAL_WARN:
+        log.info("B-15: selected skills for %s total %d bytes - context budget warning",
+                 username or DAEMON_OWNER, total)
+    return ("\n\n=== SKILLS (saved instruction files selected by this user; "
+            "follow them in your work) ===" + "".join(parts))
 def load_system_prompt(username=None, gid=None) -> str:
     """R7a (S21 Tier 3, K80 2026-09-23 "memories definitely should NOT be
     B5 (round-9, 0.6w): for SHARE principals the memory plane is layered by
@@ -475,6 +579,13 @@ def load_system_prompt(username=None, gid=None) -> str:
     elif _sp_seed_dir is not None and _sp_seed_dir.exists():
         for f in sorted(_sp_seed_dir.glob("*.md")):
             _sp_add_mem(f, f.name)
+    # B-15: selected skill files ride the prompt for non-share principals.
+    # Share namespaces stay byte-stable for the B5/S06 fences above; a share
+    # that needs the content gets it merged into its own memory by the sharer.
+    if not (username or "").startswith("share-"):
+        _b15 = _skills_block_for(username)
+        if _b15:
+            parts.append(_b15)
     return "\n\n".join(parts) if parts else "You are Mara, a helpful assistant."
 # R7a request-path cache: rebuilt per principal, cleared by reload_identity()
 # (every memory/identity write path calls it), so an append is visible on the
@@ -2476,7 +2587,14 @@ td,th{padding:8px;border-bottom:1px solid #223046;text-align:left;vertical-align
 #pwcard{display:none}#grantscard{display:none}.toolgrid{columns:2;gap:8px;font-size:13px}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#888;margin-right:6px}
 .dot.on{background:#49c98a}.dot.off{background:#c94b4b}label{cursor:pointer}
-.badge{background:#8a5a1b;color:#ffe9c9;border-radius:10px;padding:1px 8px;font-size:12px}</style></head><body><main>
+.badge{background:#8a5a1b;color:#ffe9c9;border-radius:10px;padding:1px 8px;font-size:12px}
+input[type=checkbox]{accent-color:#49c98a;width:16px;height:16px}
+select{background:#121a26;color:#d8e2ee;border:1px solid #2a3646;border-radius:8px;padding:9px;font:inherit}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#49c98a;box-shadow:0 0 0 2px rgba(73,201,138,.35)}
+button:focus-visible,input[type=checkbox]:focus-visible{outline:2px solid #49c98a;outline-offset:2px}
+table{display:block;max-width:100%;overflow-x:auto}
+@media (max-width:560px){.newshare{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.newshare #label{flex:1 1 100%}.newshare #days{flex:0 0 90px}.newshare label{flex:1 1 auto}.newshare #createBtn{flex:0 0 auto}}
+:root{color-scheme:dark}</style></head><body><main>
 <h1><a href="/" style="text-decoration:none;color:inherit">C.A.I.R.N.</a> // Shares
 <span id="pres" class="hint" style="margin-left:12px"><span class="dot"></span>presence: ...</span></h1>
 <p class="hint">A share is a snapshot copy of your agent that a guest can chat with. It rides YOUR provider keys and starts
@@ -2487,7 +2605,7 @@ Passwords are shown once - the link alone is not the secret. <a href="/help/shar
 Keeping THIS tab open is also what keeps granted tools alive - step away over a minute and every share goes chat-only until you return.</p></div>
 <div class="card"><b>Approval inbox <span id="inboxcount" class="badge" style="display:none">0</span></b>
 <div id="inbox"><p class="hint">Nothing waiting. When a share clone asks you for a tool, the request lands here - never in your own chat.</p></div></div>
-<div class="card"><b>New share</b><p>
+<div class="card"><b>New share</b><p class="newshare">
 <input id="label" maxlength="64" placeholder="label (what the guest sees)" style="width:320px">
 <input id="days" type="number" min="0" style="width:90px" placeholder="days">
 <label><input type="checkbox" id="inc_mem"> include a copy of my memories</label>
@@ -2584,7 +2702,7 @@ function loadMem(s){curMem=s;document.getElementById("memcard").style.display="b
  mk("Rotate password",function(){post("/api/shares",{action:"rotate",id:s.id}).then(function(d){if(d)showPw(d.password,"password rotated - older guests were signed out")})});
  mk("Expiry",function(){var v=prompt("Days from now (0 = never):","30");if(v===null)return;post("/api/shares",{action:"expiry",id:s.id,days:parseInt(v,10)}).then(load)});
  mk("Delete",function(){if(!confirm("Delete this share, its conversations, and everything it learned? This cannot be undone."))return;post("/api/shares",{action:"delete",id:s.id}).then(load)},"warn");
- rows.appendChild(tr)})(r[k])}})}
+ rows.appendChild(tr)})(r[k])}if(!(r&&r.length)){rows.innerHTML='<tr><td colspan="7" class="hint">No shares yet. Create one above - then open the link in a private window to see what a guest sees.</td></tr>'}})}
 document.getElementById("createBtn").addEventListener("click",function(){var label=document.getElementById("label").value.trim();
  if(!label){alert("a label is required");return}
  var days=parseInt(document.getElementById("days").value||"0",10)||0;
@@ -4191,7 +4309,8 @@ def ms_flow_status(username):
         e = _ms_flows.get(username)
         if not e:
             return None
-        return {"status": e["status"], "detail": e["detail"]}
+        return {"status": e["status"], "detail": e["detail"],
+                "user_code": e.get("user_code", ""), "uri": e.get("uri", "")}
 def ms_access_token(username):
     """Current Graph access token (in-memory cache, 60 s margin). Refreshes via
     vault_use(ms-refresh); rotated refresh tokens are re-sealed immediately."""
@@ -4430,18 +4549,30 @@ def _cst_unseal(username, name):
 # UX checks (catch a pasted mess), not security: the API itself is the judge.
 _CST_KINDS = {
     "github": (GH_TOKEN_NAME, "GitHub personal access token",
-               r"(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})"),
+               r"(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})",
+               "Ask me for github_connect to verify."),
     "ha": (HA_TOKEN_NAME, "Home Assistant long-lived access token",
-           r"eyJ[A-Za-z0-9_.\-]{40,4000}"),
+           r"eyJ[A-Za-z0-9_.\-]{40,4000}",
+           "Ask me for ha_connect to verify."),
     "opnsense": (OPN_SECRET_NAME, "OPNsense API secret",
-                 r"[A-Za-z0-9+/=]{32,512}"),
+                 r"[A-Za-z0-9+/=]{32,512}",
+                 "Ask me for opnsense_connect to verify."),
+    # B-18: the settings card seals the last two hand-carried credentials.
+    # NC app password lands under the SAME name the NC tools already read;
+    # the Google client secret under the name the OAuth flow already needs.
+    "nc": (NC_APPPW_NAME, "Nextcloud app password",
+           r"[A-Za-z0-9 \-]{8,256}",
+           "Then ask me to list a Nextcloud file to verify."),
+    "googsecret": (GOOGLE_SECRET_NAME, "Google OAuth client secret",
+                   r"[A-Za-z0-9_\-]{16,128}",
+                   "Then press Connect Google to verify."),
 }
 
 def _cst_seal(username, kind, value):
     """Seal (or with empty value, clear) a static-token credential.
     Returns (safe_message, None) or (None, error). The plaintext appears in
     neither - it goes from the caller's string straight into vault_encrypt."""
-    name, label, shape = _CST_KINDS[kind]
+    name, label, shape, verify = _CST_KINDS[kind]
     value = str(value or "").strip()
     if not value:
         _cst_unseal(username, name)
@@ -4449,8 +4580,8 @@ def _cst_seal(username, kind, value):
     if not re.fullmatch(shape, value):
         return None, ("%s looks malformed - check you pasted the whole token with no spaces" % label)
     _vault_seal(username, name, "api_key", value)
-    return ("%s sealed as vault entry %r (usable, never visible). Ask me for %s_connect to verify."
-            % (label, name, kind), None)
+    return ("%s sealed as vault entry %r (usable, never visible). %s"
+            % (label, name, verify), None)
 
 def _cst_url_ok(raw, label):
     """Validate a connector base URL. https anywhere; http only to
@@ -5136,7 +5267,7 @@ def _p1i_file_mode_sweep():
     0600, uploads tree 0700/0600. Directories only walk two levels (conv dirs
     and their files) - the tree is a fan, not a forest. Runs every boot:
     cheap, and it re-proves itself after anyone chmods behind our back."""
-    for d in (STATE, SECRETS, IDENTITY, LOGS, UPLOADS_DIR, AVATAR_DIR):
+    for d in (STATE, SECRETS, IDENTITY, LOGS, UPLOADS_DIR, AVATAR_DIR, SKILLS_DIR):
         try:
             d.mkdir(parents=True, exist_ok=True)
             d.chmod(0o700)
@@ -8133,6 +8264,10 @@ HELP_CSS = """<style>
 [data-theme="paper"]  { --bg:#f6f1e7; --surface:#fffdf8; --border:#d8cdb8; --text:#2b2620; --dim:#7a6f60; --accent:#b5482e; --accent2:#b5482e; --glow:rgba(181,72,46,0.06); --glow2:rgba(181,72,46,0.03); --user:#e8dcc4; --assistant:#ece4d2; --tool:#e4dcc9; }
 [data-theme="goblin"] { --bg:#101710; --surface:#1a241a; --border:#2f4a2f; --text:#dce8dc; --dim:#8aa08a; --accent:#7ac74f; --accent2:#7ac74f; --glow:rgba(122,199,79,0.07); --glow2:rgba(122,199,79,0.04); --user:#2c4a2c; --assistant:#1f331f; --tool:#243024; }
 [data-theme="oled"]   { --bg:#000000; --surface:#0a0a0a; --border:#1e1e1e; --text:#e6e6e6; --dim:#6e6e6e; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.05); --glow2:rgba(255,45,149,0.04); --user:#241019; --assistant:#0a0a0a; --tool:#101010; }
+[data-theme="miku"] { --bg:#071013; --surface:#0e1c20; --border:#1f4a49; --text:#e2f6f4; --dim:#7fa8a6; --accent:#22e8c5; --accent2:#ff7ebc; --glow:rgba(34,232,197,0.08); --glow2:rgba(255,126,188,0.05); --user:#123c3a; --assistant:#0d1e23; --tool:#0f2429; }
+[data-theme="cyberpunk"] { --bg:#120a04; --surface:#1f1208; --border:#4a2a10; --text:#ffe8d1; --dim:#b08a68; --accent:#ff6a1a; --accent2:#ff9e3d; --glow:rgba(255,106,26,0.08); --glow2:rgba(255,158,61,0.05); --user:#5a2c10; --assistant:#2b1a0d; --tool:#241609; }
+[data-theme="dendra"] { --bg:#0d0714; --surface:#170d24; --border:#33204d; --text:#ece4f7; --dim:#9c8ab8; --accent:#b967ff; --accent2:#ff4fd8; --glow:rgba(185,103,255,0.08); --glow2:rgba(255,79,216,0.05); --user:#3a1f5c; --assistant:#1c1230; --tool:#251638; }
+[data-theme="moon"] { --bg:#efeef6; --surface:#fbfafe; --border:#cfcbe0; --text:#2a2440; --dim:#6f688a; --accent:#6a4fd8; --accent2:#a855c8; --glow:rgba(106,79,216,0.06); --glow2:rgba(168,85,200,0.03); --user:#ddd8ef; --assistant:#e4e1f0; --tool:#dcd7ec; }
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.55;-webkit-font-smoothing:antialiased}
 .wrap{max-width:880px;margin:0 auto;padding:20px 22px 80px}
@@ -8144,6 +8279,7 @@ p,li{font-size:14px;margin:7px 0}ul,ol{padding-left:22px}a{color:var(--accent)}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin:14px 0}
 .topic{display:block;text-decoration:none;color:var(--text);border:1px solid var(--border);border-radius:12px;padding:12px 16px;margin:10px 0;background:var(--surface)}
 .topic:hover{border-color:var(--accent)}.topic b{color:var(--accent)}.topic span{color:var(--dim);font-size:12px;display:block}
+pre{white-space:pre-wrap;word-break:break-word;overflow-x:auto}
 code{background:var(--tool);border:1px solid var(--border);border-radius:5px;padding:1px 5px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 table{border-collapse:collapse;width:100%;margin:10px 0}th,td{border-bottom:1px solid var(--border);padding:5px 8px;text-align:left;font-size:12.5px;vertical-align:top}th{color:var(--dim);font-weight:600}
 .warn{border-left:3px solid var(--accent2)}.ok{border-left:3px solid var(--accent)}
@@ -8663,6 +8799,10 @@ button.ghost{background:transparent;border:1px solid var(--line);color:var(--mut
 a{color:var(--accent);text-decoration:none}
 .foot{margin-top:26px;font-size:12px;color:var(--mut)}
 .hidden{display:none}
+input[type=checkbox],input[type=radio]{accent-color:var(--accent);width:16px;height:16px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
+input[type=checkbox]:focus-visible,input[type=radio]:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+:root{color-scheme:dark}
 </style>
 </head>
 <body>
@@ -8848,6 +8988,7 @@ CAIRN_EXPORT_VERSION = 4
 # tells the truth now: no live credential leaves in a plain .cairn archive.
 EXPORT_SECRET_PREFIXES = ("model_key_", "search_key_")
 EXPORT_SECRET_NAMES = ("v1_token", "opnsense_key")
+EXPORT_MAX_BYTES = 512 * 1024 * 1024  # V20/T-B21 (0.6x): hard cap for ONE export archive
 IMPORT_MAX_BYTES = 64 * 1024 * 1024   # decoded archive cap (K80's real .agora = 38 MB)
 IMPORT_BODY_MAX = 90 * 1024 * 1024    # hard JSON body cap (64 MB decodes to ~86 MB b64)
 
@@ -8996,6 +9137,21 @@ def _iter_json_doc(s):
         yield key, body[j:e2]
         j = e2
 
+def _export_tmp_sweep():
+    """V20/T-B21 (0.6x): export temps are unlinked by their handler, but a
+    crashed build used to leave cairn-export-*.tmp litter in BASE - live
+    conversation data on disk with no owner view. Nothing serving can predate
+    boot, so any such file at boot is trash."""
+    try:
+        for f in BASE.glob("cairn-export-*.tmp"):
+            try:
+                f.unlink()
+                log.info("T-B21: swept stale export temp %s", f.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
 def _build_cairn_export(username):
     """S4f7: build the .cairn archive for one user's account.
     Returns (tmp_path, stats, filename). Caller unlinks tmp_path."""
@@ -9010,17 +9166,25 @@ def _build_cairn_export(username):
     atts = {}
     comps = []
     if ids:
-        q = ",".join("?" * len(ids))
+        # V20/T-B21 (0.6x): IN-lists chunked to <=500 placeholders per query.
+        # The old single-shot build hit SQLite variable limits on older builds
+        # and dragged every row of every conversation through one statement.
+        # msgs order is irrelevant (grouped + sorted per conv below), atts is
+        # a dict, comps get their global ts order restored after the merge.
         with sqlite3.connect(DB_PATH) as db:
             db.row_factory = sqlite3.Row
-            msgs = [dict(r) for r in db.execute(
-                "SELECT id, conv_id, role, content, tool_calls, ts, attachments, reasoning, stopped "
-                "FROM messages WHERE conv_id IN (%s)" % q, ids)]
-            for r in db.execute(
-                "SELECT id, conv_id, name, stored_name, mime, size, kind FROM attachments WHERE conv_id IN (%s)" % q, ids):
-                atts[r["id"]] = dict(r)
-            comps = [dict(r) for r in db.execute(
-                "SELECT conv_id, summary, msg_count, ts FROM compactions WHERE conv_id IN (%s) ORDER BY ts" % q, ids)]
+            for _i in range(0, len(ids), 500):
+                _chunk = ids[_i:_i + 500]
+                q = ",".join("?" * len(_chunk))
+                msgs.extend(dict(r) for r in db.execute(
+                    "SELECT id, conv_id, role, content, tool_calls, ts, attachments, reasoning, stopped "
+                    "FROM messages WHERE conv_id IN (%s)" % q, _chunk))
+                for r in db.execute(
+                    "SELECT id, conv_id, name, stored_name, mime, size, kind FROM attachments WHERE conv_id IN (%s)" % q, _chunk):
+                    atts[r["id"]] = dict(r)
+                comps.extend(dict(r) for r in db.execute(
+                    "SELECT conv_id, summary, msg_count, ts FROM compactions WHERE conv_id IN (%s) ORDER BY ts" % q, _chunk))
+        comps.sort(key=lambda r: r["ts"] or 0)
     settings = {}
     with sqlite3.connect(DB_PATH) as db:
         for r in db.execute("SELECT key, value FROM settings WHERE username=?", (username,)):
@@ -9059,7 +9223,13 @@ def _build_cairn_export(username):
             _r7_scan(_my_md, username)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".000000Z"
     fname = "Cairn_export_%s.cairn" % time.strftime("%Y-%m-%d", time.gmtime(now))
+    # V20/T-B21 (0.6x): the temp is created O_WRONLY|O_CREAT|O_EXCL at 0600
+    # BEFORE a single byte is written. The archive carries every conversation,
+    # memory file and non-secret setting of this account: under the old
+    # zipfile path it inherited the process umask (0644) and sat in BASE
+    # world-readable for as long as the build took.
     tmp = str(BASE / ("cairn-export-%s.tmp" % uuid.uuid4().hex[:12]))
+    _tmp_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     stats = {"conversations": len(convs), "messages": 0, "attachments": 0, "missing_files": 0}
     conv_objs = []
     run_objs = []
@@ -9148,7 +9318,7 @@ def _build_cairn_export(username):
     sp_entry = {"id": sp_id, "title": "Cairn " + INSTANCE_SLUG,
                 "systemItems": [{"id": "cairn-main", "type": "CUSTOM", "value": sp_text}],
                 "userItems": [], "assistantItems": []}
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+    with os.fdopen(_tmp_fd, "wb") as _tmp_fh, zipfile.ZipFile(_tmp_fh, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", json.dumps({
             "agora_export_version": CAIRN_EXPORT_VERSION,
             "app_version": "C.A.I.R.N. v" + VERSION,
@@ -9166,6 +9336,15 @@ def _build_cairn_export(username):
             {("%s/%s" % (ns, n2)): "" for ns in mem_ns for n2 in mem_ns[ns]}))
         z.writestr("system_prompts.json", json.dumps([sp_entry], ensure_ascii=False))
         z.writestr("settings.json", json.dumps(settings, ensure_ascii=False))
+    # V20/T-B21: hard ceiling. An archive over EXPORT_MAX_BYTES is deleted
+    # here so the caller never streams it; the handler surfaces a plain error.
+    _sz = os.path.getsize(tmp)
+    if _sz > EXPORT_MAX_BYTES:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("export too large (%d bytes; cap %d)" % (_sz, EXPORT_MAX_BYTES))
     return tmp, stats, fname
 
 def _import_cairn_archive(zf, username, restore, restore_identity=False):
@@ -9738,7 +9917,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "nextcloud_list",
-            "description": "List a folder on the Nextcloud share. Path is relative to the user's files root; omit or empty for root.",
+            "description": "List a folder on your Nextcloud share. Path is relative to the user's files root; omit or empty for root.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -9751,7 +9930,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "nextcloud_read",
-            "description": "Read a text file from the Nextcloud share. Path is relative to the user's files root.",
+            "description": "Read a text file from your Nextcloud share. Path is relative to the user's files root.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -10515,6 +10694,55 @@ MODEL_PROVIDERS = (
 )
 MODEL_PROVIDER_IDS = tuple(p[0] for p in MODEL_PROVIDERS)
 MODEL_KEY_PROVIDERS = tuple(p[0] for p in MODEL_PROVIDERS)  # every provider needs a key
+
+# B-21 (K80 2026-09-26 18:40): per-user model shortcuts ("saved models").
+# The chat model bar and the Settings Model card both read this list;
+# free-text model ids STAY valid everywhere (a 22k-model Featherless
+# catalog cannot be a bare <select>) - shortcuts just save typing
+# 64-char ids on a phone. Stored as ONE JSON row in the per-user
+# settings table: [{"provider": "<id>", "model": "<id>", "label": "..."}]
+# Model ids and provider ids are not secret. Deliberately NOT on
+# _CAIRN_SAFE_SETTINGS yet: a .cairn import carrying someone else's
+# shortcut list is harmless but pointless until K80 rules she wants
+# shortcuts to travel between boxes.
+_SAVED_MODELS_MAX = 40
+_SAVED_MODEL_ID_RE = re.compile(r"[A-Za-z0-9._:/\-\u00a1-\uffff]{1,256}")
+def _saved_models_parse(raw):
+    # All-or-nothing contract (B-18 pattern): a bad SHAPE is an error the
+    # caller must surface as a 400 - never a half-applied list.
+    # Returns (clean_list, "") or (None, "reason").
+    if raw is None or str(raw).strip() == "":
+        return [], ""
+    try:
+        data = json.loads(str(raw))
+    except Exception:
+        return None, "saved_models is not valid JSON"
+    if not isinstance(data, list):
+        return None, "saved_models must be a list"
+    if len(data) > _SAVED_MODELS_MAX:
+        return None, "too many saved models (max %d)" % _SAVED_MODELS_MAX
+    out, seen = [], set()
+    for i, it in enumerate(data):
+        if not isinstance(it, dict):
+            return None, "saved_models[%d] is not an object" % i
+        prov = str(it.get("provider") or "").strip()
+        mdl = str(it.get("model") or "").strip()
+        if prov not in MODEL_PROVIDER_IDS:
+            return None, "saved_models[%d] has an unknown provider" % i
+        if not _SAVED_MODEL_ID_RE.fullmatch(mdl):
+            return None, ("saved_models[%d] has a bad model id (1-256 chars, "
+                          "no spaces or control characters)") % i
+        label = str(it.get("label") or "").strip()[:64]
+        k = (prov, mdl.lower())
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({"provider": prov, "model": mdl, "label": label})
+    return out, ""
+def _saved_models(username):
+    # Read path: hand-edited junk in the DB degrades to empty, never 500s.
+    lst, err = _saved_models_parse(get_setting("saved_models", "", username) or "")
+    return [] if err else (lst or [])
 # S4f2: the S4e 128K floor / 1M cap on context_budget are RETIRED (K80
 # 10:34/11:36 — any model, even local, no matter the size). No floor, no
 # ceiling; the settings page warns when the window is smaller than the
@@ -12182,7 +12410,7 @@ WEB_UI_CHAT = """<!DOCTYPE html>
 <html lang="en" data-theme="neon">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" id="themeColor" content="#05070d">
 <base href="/mara/">
 <script>try{document.documentElement.dataset.theme=localStorage.getItem('mara-theme')||'neon';}catch(e){}</script>
@@ -12190,6 +12418,7 @@ WEB_UI_CHAT = """<!DOCTYPE html>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="static/color.png">
 <meta name="mobile-web-app-capable" content="yes">
+<link rel="apple-touch-icon" href="static/color.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
@@ -12199,6 +12428,10 @@ WEB_UI_CHAT = """<!DOCTYPE html>
 [data-theme="paper"]  { --bg:#f6f1e7; --surface:#fffdf8; --border:#d8cdb8; --text:#2b2620; --dim:#7a6f60; --accent:#b5482e; --accent2:#b5482e; --glow:rgba(181,72,46,0.06); --glow2:rgba(181,72,46,0.03); --user:#e8dcc4; --assistant:#ece4d2; --tool:#e4dcc9; }
 [data-theme="goblin"] { --bg:#101710; --surface:#1a241a; --border:#2f4a2f; --text:#dce8dc; --dim:#8aa08a; --accent:#7ac74f; --accent2:#7ac74f; --glow:rgba(122,199,79,0.07); --glow2:rgba(122,199,79,0.04); --user:#2c4a2c; --assistant:#1f331f; --tool:#243024; }
 [data-theme="oled"]   { --bg:#000000; --surface:#0a0a0a; --border:#1e1e1e; --text:#e6e6e6; --dim:#6e6e6e; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.05); --glow2:rgba(255,45,149,0.04); --user:#241019; --assistant:#0a0a0a; --tool:#101010; }
+[data-theme="miku"] { --bg:#071013; --surface:#0e1c20; --border:#1f4a49; --text:#e2f6f4; --dim:#7fa8a6; --accent:#22e8c5; --accent2:#ff7ebc; --glow:rgba(34,232,197,0.08); --glow2:rgba(255,126,188,0.05); --user:#123c3a; --assistant:#0d1e23; --tool:#0f2429; }
+[data-theme="cyberpunk"] { --bg:#120a04; --surface:#1f1208; --border:#4a2a10; --text:#ffe8d1; --dim:#b08a68; --accent:#ff6a1a; --accent2:#ff9e3d; --glow:rgba(255,106,26,0.08); --glow2:rgba(255,158,61,0.05); --user:#5a2c10; --assistant:#2b1a0d; --tool:#241609; }
+[data-theme="dendra"] { --bg:#0d0714; --surface:#170d24; --border:#33204d; --text:#ece4f7; --dim:#9c8ab8; --accent:#b967ff; --accent2:#ff4fd8; --glow:rgba(185,103,255,0.08); --glow2:rgba(255,79,216,0.05); --user:#3a1f5c; --assistant:#1c1230; --tool:#251638; }
+[data-theme="moon"] { --bg:#efeef6; --surface:#fbfafe; --border:#cfcbe0; --text:#2a2440; --dim:#6f688a; --accent:#6a4fd8; --accent2:#a855c8; --glow:rgba(106,79,216,0.06); --glow2:rgba(168,85,200,0.03); --user:#ddd8ef; --assistant:#e4e1f0; --tool:#dcd7ec; }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased}
@@ -12224,6 +12457,15 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;bac
 .drawer-head h2{font-size:12px;color:var(--accent);text-transform:uppercase;letter-spacing:1.5px;font-weight:600}
 .btn-small{background:var(--accent);color:var(--bg);border:none;border-radius:8px;padding:0 14px;min-height:38px;font-size:13px;font-weight:600;cursor:pointer;transition:filter .15s,box-shadow .15s}
 .btn-small:hover{filter:brightness(1.12);box-shadow:0 0 12px var(--glow)}
+.btn{background:var(--accent);color:var(--bg);border:none;border-radius:8px;padding:0 16px;min-height:40px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;transition:filter .15s,box-shadow .15s}
+.btn:hover{filter:brightness(1.12);box-shadow:0 0 12px var(--glow)}
+button:not(.btn):not(.btn-small):not(.icon-btn):not(.jumpbtn):not(.pop-item){background:var(--surface);color:var(--accent);border:1px solid var(--border);border-radius:8px;padding:0 12px;min-height:34px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+#chatModelNote:not([hidden]){display:flex;gap:8px;align-items:center;flex-wrap:wrap;width:100%}
+#chatModelBar select,#chatModelBar input{box-sizing:border-box;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;font-family:inherit;min-width:0;max-width:100%}
+input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px}
+::-webkit-scrollbar-track{background:transparent}
 .conv-list{flex:1;overflow-y:auto;padding:4px 10px 20px}
 .conv-item{display:flex;align-items:center;gap:4px;padding:12px 14px;border-radius:12px;cursor:pointer;border:1px solid transparent;margin-bottom:4px;transition:background .15s,border-color .15s}
 .conv-body{flex:1;min-width:0}
@@ -12248,7 +12490,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;bac
 .msg.user{align-self:flex-end;background:var(--user);border-bottom-right-radius:4px}
 .msg.assistant{align-self:flex-start;display:flex;gap:10px;align-items:flex-start;background:var(--assistant);border:1px solid var(--border);border-bottom-left-radius:4px;max-width:94%}
 .msg-avatar{width:30px;height:30px;border-radius:50%;flex:none;border:1px solid var(--border)}
-.msg-avwrap{flex:1;min-width:0}
+.msg-avwrap{flex:1 1 auto;min-width:0;overflow-wrap:break-word}
 .thoughts{margin:0 0 8px;border:1px dashed var(--border);border-radius:10px;padding:4px 10px}
 .thoughts summary{cursor:pointer;font-size:11px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;user-select:none;list-style:none;display:flex;gap:6px;align-items:center;min-height:30px}
 .thoughts summary::-webkit-details-marker{display:none}
@@ -12319,6 +12561,14 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;bac
 .pop{position:fixed;top:calc(56px + env(safe-area-inset-top));right:10px;background:var(--surface);border:1px solid var(--border);border-radius:12px;z-index:50;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.45)}
 .pop-item{display:block;width:100%;padding:0 18px;background:none;border:none;color:var(--text);font-size:14px;text-align:left;cursor:pointer;min-height:44px;transition:background .15s,color .15s}
 .pop-item:hover{background:var(--bg);color:var(--accent)}
+@media (max-width:640px){
+.chat{padding:14px 10px 8px}
+.msg{max-width:94%}
+.msg.assistant{max-width:97%}
+.chat-col{gap:8px}
+.topbar{gap:2px;padding-left:6px;padding-right:6px}
+#chatModelBar{font-size:11px}
+}
 @media (min-width:900px){
   .chat{padding:24px 24px 12px}
   .msg{font-size:15.5px}
@@ -12374,7 +12624,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;bac
 <footer class="composer">
   <div id="queueBar" class="queuebar" hidden></div>
   <div id="attachChips" class="attach-chips"></div>
-  <div id="chatModelBar" style="font-size:12px;color:var(--dim);padding:0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%"></span><button id="chatModelEdit" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button></span></div>
+  <div id="chatModelBar" style="font-size:12px;color:var(--dim);padding:0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%"></span><button id="chatModelEdit" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
   <div class="composer-col">
     <button id="attachBtn" class="icon-btn" title="Attach files">
       <svg viewBox="0 0 24 24"><path d="M21 12l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8L13 4.5a3.7 3.7 0 0 1 5.2 5.2l-8.2 8.2a1.85 1.85 0 0 1-2.6-2.6L15 7.5"/></svg>
@@ -12414,6 +12664,7 @@ const msgInput = $('msgInput'), sendBtn = $('sendBtn');
 // account default without a key: the 503 error card points at Settings.
 const f21Convs = new Map();
 let f21Acct = { provider: 'featherless', model: '' };
+let f21Saved = [];  // B-21: saved_models from api/settings (ids only, never keys)
 const f21ProvNames = { featherless:'Featherless', openai:'OpenAI', openrouter:'OpenRouter', gemini:'Gemini', anthropic:'Anthropic', groq:'Groq', mistral:'Mistral', together:'Together', custom:'Custom' };
 function f21Parse(raw) { if (!raw) return null; try { const o = JSON.parse(raw); return (o && typeof o === 'object') ? o : null; } catch (e) { return null; } }
 function f21Label() {
@@ -12426,18 +12677,58 @@ function f21Label() {
   }
 }
 async function f21Init() {
-  try { const r = await fetch('api/settings'); if (r.ok) { const s = await r.json(); f21Acct = { provider: s.model_provider || 'featherless', model: s.model || '' }; } } catch (e) {}
+  try { const r = await fetch('api/settings'); if (r.ok) { const s = await r.json(); f21Acct = { provider: s.model_provider || 'featherless', model: s.model || '' }; f21Saved = Array.isArray(s.saved_models) ? s.saved_models : []; } } catch (e) {}
   const sel = $('cmProv');
   if (sel && !sel.options.length) {
     const d = document.createElement('option'); d.value = ''; d.textContent = 'account default'; sel.appendChild(d);
     Object.keys(f21ProvNames).forEach((p) => { const o = document.createElement('option'); o.value = p; o.textContent = f21ProvNames[p]; sel.appendChild(o); });
   }
+  cmSuggest();
   f21Label();
 }
+function f21ChipName(m) {
+  if (m.label) return m.label;
+  const id = m.model;
+  return id.length > 30 ? id.slice(0, 14) + '…' + id.slice(-12) : id;
+}
+function cmSuggest() {
+  // B-21: chips + datalist from the user's own saved models. Chips render
+  // on every phone (datalist is unreliable on mobile Safari); neither ever
+  // suggests anything the user did not save themselves.
+  const dl = $('cmModelList'), chips = $('cmChips');
+  const sel = $('cmProv');
+  const want = (sel && sel.value) || f21Acct.provider;
+  const fits = f21Saved.filter(function (m) { return m.provider === want; });
+  if (dl) {
+    dl.textContent = '';
+    fits.forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m.model;
+      o.label = (m.label || m.model) + ' · ' + m.provider;
+      dl.appendChild(o);
+    });
+  }
+  if (chips) {
+    chips.textContent = '';
+    fits.slice(0, 12).forEach(function (m) {
+      const b = document.createElement('button');
+      b.className = 'btn';
+      b.style.cssText = 'padding:0 8px;height:22px;font-size:12px';
+      b.textContent = f21ChipName(m);
+      b.title = m.provider + ' / ' + m.model;
+      b.addEventListener('click', function () {
+        if (sel) sel.value = m.provider;
+        $('cmModel').value = m.model;
+      });
+      chips.appendChild(b);
+    });
+  }
+}
+if ($('cmProv')) $('cmProv').addEventListener('change', cmSuggest);
 f21Init();
 $('chatModelEdit').addEventListener('click', () => {
   const n = $('chatModelNote'); n.hidden = !n.hidden;
-  if (!n.hidden) { const ov = currentConv ? f21Convs.get(currentConv) : null; $('cmProv').value = (ov && ov.provider) || ''; $('cmModel').value = (ov && ov.model) || ''; }
+  if (!n.hidden) { const ov = currentConv ? f21Convs.get(currentConv) : null; $('cmProv').value = (ov && ov.provider) || ''; $('cmModel').value = (ov && ov.model) || '';  cmSuggest(); }
 });
 $('cmApply').addEventListener('click', async () => {
   const lab = $('chatModelLabel');
@@ -12611,7 +12902,7 @@ async function loadMessages(id) {
       }
       const b = addAssistantMsg(m.content);
       const acA = attChipsFor(m);
-      if (acA) b.div.appendChild(acA);
+      if (acA) b.body.parentElement.insertBefore(acA, b.body); /* B-13: chips belong INSIDE the text column; as a bubble child they joined the flex row and stole ~210px of text width (K80 2026-09-26) */
       if (m.stopped) {
         const sm = document.createElement('span');
         sm.className = 'stoppedmark';
@@ -13103,7 +13394,7 @@ function send() {
           if (payload.attachments && payload.attachments.length) {
             const fb = ensureBubble();
             const acF = attChipsFor({ attachments: payload.attachments });
-            if (acF) fb.div.appendChild(acF);
+            if (acF) fb.body.parentElement.insertBefore(acF, fb.body); /* B-13: same row-theft fix as the history path */
           }
           scrollBottom(true);
         }
@@ -13239,7 +13530,7 @@ async function attachStream(id) {
           if (payload.attachments && payload.attachments.length) {
             const fb = ensureBubble();
             const acF = attChipsFor({ attachments: payload.attachments });
-            if (acF) fb.div.appendChild(acF);
+            if (acF) fb.body.parentElement.insertBefore(acF, fb.body); /* B-13: same row-theft fix as the history path */
           }
           scrollBottom(true);
         }
@@ -13355,6 +13646,7 @@ WEB_UI_SETTINGS = """
 <meta name="theme-color" id="themeColor" content="#05070d">
 <base href="/mara/">
 <script>try{document.documentElement.dataset.theme=localStorage.getItem('mara-theme')||'neon';}catch(e){}</script>
+<link rel="apple-touch-icon" href="static/color.png">
 <title>Mara // Settings</title>
 <style>
 :root, [data-theme="neon"] { --bg:#05070d; --surface:#0b111c; --border:#1c2b45; --text:#dfe9f5; --dim:#5f7896; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.07); --glow2:rgba(255,45,149,0.05); }
@@ -13363,6 +13655,13 @@ WEB_UI_SETTINGS = """
 [data-theme="paper"]  { --bg:#f6f1e7; --surface:#fffdf8; --border:#d8cdb8; --text:#2b2620; --dim:#7a6f60; --accent:#b5482e; --accent2:#b5482e; --glow:rgba(181,72,46,0.06); --glow2:rgba(181,72,46,0.03); }
 [data-theme="goblin"] { --bg:#101710; --surface:#1a241a; --border:#2f4a2f; --text:#dce8dc; --dim:#8aa08a; --accent:#7ac74f; --accent2:#7ac74f; --glow:rgba(122,199,79,0.07); --glow2:rgba(122,199,79,0.04); }
 [data-theme="oled"]   { --bg:#000000; --surface:#0a0a0a; --border:#1e1e1e; --text:#e6e6e6; --dim:#6e6e6e; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.05); --glow2:rgba(255,45,149,0.04); }
+[data-theme="miku"] { --bg:#071013; --surface:#0e1c20; --border:#1f4a49; --text:#e2f6f4; --dim:#7fa8a6; --accent:#22e8c5; --accent2:#ff7ebc; --glow:rgba(34,232,197,0.08); --glow2:rgba(255,126,188,0.05); }
+[data-theme="cyberpunk"] { --bg:#120a04; --surface:#1f1208; --border:#4a2a10; --text:#ffe8d1; --dim:#b08a68; --accent:#ff6a1a; --accent2:#ff9e3d; --glow:rgba(255,106,26,0.08); --glow2:rgba(255,158,61,0.05); }
+[data-theme="dendra"] { --bg:#0d0714; --surface:#170d24; --border:#33204d; --text:#ece4f7; --dim:#9c8ab8; --accent:#b967ff; --accent2:#ff4fd8; --glow:rgba(185,103,255,0.08); --glow2:rgba(255,79,216,0.05); }
+[data-theme="moon"] { --bg:#efeef6; --surface:#fbfafe; --border:#cfcbe0; --text:#2a2440; --dim:#6f688a; --accent:#6a4fd8; --accent2:#a855c8; --glow:rgba(106,79,216,0.06); --glow2:rgba(168,85,200,0.03); }
+:root{color-scheme:dark}
+[data-theme="paper"]{color-scheme:light}
+[data-theme="moon"]{color-scheme:light}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);padding:16px;padding-bottom:48px;min-height:100vh;-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;background:
@@ -13396,24 +13695,107 @@ input[type=number]{-moz-appearance:textfield}
 .kv:last-child{border-bottom:none}
 .kv .k{color:var(--dim)}
 .kv .v{color:var(--text);text-align:right;word-break:break-word}
-.memory-file{font-size:13px;padding:11px 12px;border-left:2px solid var(--accent);margin:6px 0;color:var(--dim);cursor:pointer;border-radius:0 8px 8px 0;display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:40px;transition:background .15s,color .15s}
+.memory-file{font-size:13px;padding:11px 12px;border-left:2px solid var(--accent);margin:6px 0;color:var(--dim);cursor:pointer;border-radius:0 8px 8px 0;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;min-height:40px;transition:background .15s,color .15s}
 .memory-file:hover{background:var(--bg);color:var(--text)}
 .memory-file .sz{color:var(--dim);font-size:11px;flex:none}
+.memory-file .mono{word-break:break-all}
+.memory-file .inv-meta{flex:1 1 auto;min-width:0}
 .memdel{cursor:pointer;color:var(--dim);flex:none;font-size:12px;padding:0 4px;user-select:none}
 .memdel:hover{color:var(--accent2)}
 pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-radius:8px;border:1px solid var(--border);overflow-x:auto;max-height:320px;overflow-y:auto;margin:8px 0 4px;white-space:pre-wrap;word-break:break-word;line-height:1.5}
 .hint{font-size:11.5px;color:var(--dim);margin-top:8px;line-height:1.5}
+textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:14px;font-family:inherit;line-height:1.45;resize:vertical;min-height:56px;transition:border-color .15s,box-shadow .15s}
+textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--glow)}
+textarea::placeholder{color:var(--dim);opacity:.85}
+input[type=file]{background:var(--bg);color:var(--dim);border:1px solid var(--border);border-radius:8px;padding:9px 12px;font-size:13px;max-width:100%}
+input[type=file]::file-selector-button{background:var(--surface);color:var(--accent);border:1px solid var(--border);border-radius:6px;padding:7px 14px;margin-right:12px;font-size:12.5px;cursor:pointer;font-family:inherit}
+input[type=file]::file-selector-button:hover{border-color:var(--accent)}
+input:not([type=checkbox]):not([type=radio]):not([type=file]){box-sizing:border-box;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:14px;font-family:inherit;min-width:0;transition:border-color .15s,box-shadow .15s}
+input:not([type=checkbox]):not([type=radio]):focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--glow)}
+input::placeholder{color:var(--dim);opacity:.85}
+select{box-sizing:border-box;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:14px;font-family:inherit;max-width:100%}
+input[type=checkbox],input[type=radio]{accent-color:var(--accent);width:16px;height:16px}
+button:not(.btn){background:var(--surface);color:var(--accent);border:1px solid var(--border);border-radius:8px;padding:0 14px;min-height:36px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:border-color .15s,filter .15s}
+button:not(.btn):hover{border-color:var(--accent);filter:brightness(1.12)}
+.model-drop{max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;background:var(--surface);padding:4px;margin:2px 0 6px}
+.model-drop div{padding:7px 10px;border-radius:6px;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.model-drop div:hover{background:var(--bg);color:var(--accent)}
+.model-drop .md-empty{color:var(--dim);cursor:default;font-family:inherit}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px}
+::-webkit-scrollbar-track{background:transparent}
+button{max-width:100%}
+.memory-file .warn{color:#ffb454;margin-left:6px;font-weight:600}
+/* mobile-first: rows stack, controls stretch - phones breathe, nothing clips */
+@media (max-width:640px){
+body{padding:10px;padding-bottom:44px}
+.card{padding:14px;border-radius:12px}
+.row{flex-wrap:wrap}
+.row>label{width:100%}
+.row input:not([type=checkbox]):not([type=radio]),.row select,.row textarea{flex:1 1 100%;min-width:0;max-width:100%}
+#updUrl{width:100%;max-width:100%}
+.header{flex-wrap:wrap}
+.kv{flex-wrap:wrap}
+.kv .v{text-align:left}
+}
+/* large screens: wider column, roomier cards - the big-TV pass */
+@media (min-width:1400px){
+.wrap{max-width:1080px}
+.card{padding:24px}
+.row input:not([type=checkbox]):not([type=radio]),.row select{width:340px}
+}
+
+/* B16 (K80 2026-09-26): section drawer + paged settings. Slide-over reuses the
+   chat drawer geometry. Paging hides only OFF-PAGE cards (!important); on-page
+   cards stay governed by their own inline role gating - this is navigation,
+   not authorization: every door is still locked server-side. */
+.sbackdrop{position:fixed;inset:0;background:rgba(0,0,0,0.5);opacity:0;pointer-events:none;transition:opacity .2s;z-index:35}
+.sbackdrop.show{opacity:1;pointer-events:auto}
+.sdrawer{position:fixed;top:0;left:0;bottom:0;width:min(320px,85vw);background:var(--surface);border-right:1px solid var(--border);z-index:40;transform:translateX(-105%);transition:transform .22s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;padding-top:env(safe-area-inset-top)}
+.sdrawer.open{transform:none;box-shadow:8px 0 32px rgba(0,0,0,0.4)}
+.sdrawer-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:14px 14px 10px}
+.sdrawer-head h2{font-size:12px;color:var(--accent);text-transform:uppercase;letter-spacing:1.5px;font-weight:600}
+.sectabs{display:flex;gap:6px;padding:4px 12px 10px;border-bottom:1px solid var(--border)}
+.sectab{flex:1 1 0;min-width:0;background:var(--bg);color:var(--dim);border:1px solid var(--border);border-radius:8px;padding:0 6px;min-height:36px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sectab.active{border-color:var(--accent);color:var(--accent);box-shadow:0 0 0 1px var(--glow)}
+.sectab[hidden]{display:none}
+.secnav{overflow-y:auto;flex:1;padding:8px 10px 20px}
+.secnav a{display:block;padding:10px 12px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13.5px;line-height:1.3}
+.secnav a:hover{background:var(--bg);color:var(--accent)}
+.secnav .sec-empty{color:var(--dim);font-size:12.5px;padding:10px 12px}
+.secflash{outline:2px solid var(--accent);outline-offset:4px;border-radius:14px}
+.card[data-sec]{scroll-margin-top:70px}
+#secBtn{margin-top:0;white-space:nowrap}
+body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admin"] .card:not([data-sec="admin"]),body[data-page="owner"] .card:not([data-sec="owner"]){display:none!important}
+.conn{border-top:1px solid rgba(255,255,255,.07);padding:12px 0}
+.conn>b{margin-right:8px}
+.conn-pill{font-size:12px;padding:2px 10px;border-radius:999px;border:1px solid;white-space:nowrap;display:inline-block}
+.conn-pill.on{color:#4ade80;border-color:rgba(74,222,128,.35)}
+.conn-pill.mid{color:#facc15;border-color:rgba(250,204,21,.35)}
+.conn-pill.off{color:#9ca3af;border-color:rgba(156,163,175,.28)}
+.conn code{word-break:break-all}
+.conn .chk{margin-left:10px}
 </style>
 </head>
 <body>
+<div class="sbackdrop" id="secBackdrop"></div>
+<aside class="sdrawer" id="secDrawer" aria-label="Settings sections" aria-hidden="true">
+<div class="sdrawer-head"><h2>Settings sections</h2><button id="secClose" aria-label="Close menu">&#10005;</button></div>
+  <div class="sectabs" role="tablist">
+  <button class="sectab" data-page="personal" role="tab">Personal</button>
+  <button class="sectab" data-page="admin" role="tab" hidden>Admin</button>
+  <button class="sectab" data-page="owner" role="tab" hidden>Owner</button>
+  </div>
+  <div class="secnav" id="secNav"></div>
+</aside>
 <div class="wrap">
 <div class="header">
   <h1><img class="logo" src="api/avatar" onerror="this.onerror=null;this.src='static/color.png'" alt="">Mara<span class="slash">//</span>Settings</h1>
   <p style="margin:4px 0 0;font-size:12.5px"><a href="help" style="color:var(--accent);text-decoration:none">How any of this stores or records your data? The Help Center answers it honestly &rarr;</a></p>
-  <a href=".">← Chat</a>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button id="secBtn" class="btn" aria-haspopup="true" aria-controls="secDrawer">Sections</button><a href=".">← Chat</a></div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Model</h2>
   <div class="row"><label>Provider</label>
     <select id="model_provider" onchange="onModelProviderChange()">
@@ -13429,9 +13811,9 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
     </select>
   </div>
   <div class="row" id="modelCustomRow" style="display:none"><label>Base URL</label><input id="model_custom" value="" placeholder="https://localhost:11434/v1" autocomplete="off"></div>
-  <div class="row"><label>Model</label><input id="model" value="" autocomplete="off" list="modelList">
-  <datalist id="modelList"></datalist>
+  <div class="row"><label>Model</label><input id="model" value="" autocomplete="off" placeholder="type to search loaded models - or paste any model id" oninput="modelSearchInput()" onfocus="modelSearchInput()">
   <button class="btn" style="margin-top:0;padding:0 12px" onclick="loadModels()">Load models</button></div>
+  <div class="model-drop" id="modelDrop" style="display:none"></div>
   <div class="status" id="modelLoadStatus"></div>
   <div class="row"><label>API key</label>
     <input id="model_key" type="password" autocomplete="off" oninput="modelKeyTouched = true" placeholder="write-only — never returned by the server">
@@ -13445,11 +13827,32 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="row"><label>Context window</label><input id="context_budget" type="number" step="8192" min="1" list="ctxList" placeholder="pick or type any value" style="max-width:180px">
   <datalist id="ctxList"><option value="4096"></option><option value="8192"></option><option value="16384"></option><option value="32768"></option><option value="65536"></option><option value="131072"></option><option value="196608"></option><option value="262144"></option><option value="393216"></option><option value="524288"></option><option value="786432"></option><option value="1048576"></option></datalist></div>
   <div class="hint">No floor, no ceiling — pick a common size or type any value (small local models included). <span id="budgetWarn"></span></div>
+  <div class="hint" style="margin-top:12px"><b>Model shortcuts</b>: named models you use often. They show as one-tap chips in the chat model bar and as autocomplete suggestions - no typing 64-char ids on a phone. Free-text model ids always work too.</div>
+  <div id="smList" class="hint"></div>
+  <div class="row" style="margin-top:6px;gap:6px;flex-wrap:wrap"><label>Add</label>
+    <select id="smProv" style="max-width:150px">
+      <option value="featherless">Featherless</option>
+      <option value="openai">OpenAI</option>
+      <option value="openrouter">OpenRouter</option>
+      <option value="gemini">Gemini</option>
+      <option value="anthropic">Anthropic</option>
+      <option value="groq">Groq</option>
+      <option value="mistral">Mistral</option>
+      <option value="together">Together</option>
+      <option value="custom">Custom</option>
+    </select>
+    <input id="smModel" list="smModelList" placeholder="model id" autocomplete="off" style="max-width:300px;flex:2">
+    <datalist id="smModelList"></datalist>
+    <input id="smLabel" placeholder="label (optional)" autocomplete="off" style="max-width:170px;flex:1">
+    <button class="btn" onclick="smAdd()">+ add</button>
+    <button class="btn" onclick="smLoad()" title="Fetch model ids from your account provider (needs its API key)">load ids</button>
+  </div>
+  <div class="status" id="smStatus"></div>
   <button class="btn" id="saveBtn" onclick="saveSettings()">Save</button>
   <div class="status" id="saveStatus"></div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Your persona</h2>
   <div class="row"><label>Custom instructions</label>
     <textarea id="custom_instructions" rows="5" style="width:100%;max-width:520px" placeholder="Standing directions for your agent (voice, focus, standing rules). Shapes how it works - it can never grant or remove tools."></textarea>
@@ -13457,12 +13860,12 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <p style="font-size:12px;opacity:.6;margin:0">Shown to your agent in every conversation. Saved with the Save button on the Model card. <span id="ciCount" style="opacity:.7"></span></p>
 </div>
 
-<div class="card" id="tlsCard">
+<div class="card" id="tlsCard" data-sec="owner">
   <h2>Connection & TLS</h2>
   <div class="hint" id="tlsBody">Loading connection status&hellip;</div>
   <div class="hint" style="margin-top:10px">No front-end knowledge needed: leave <b>Proxy</b> selected if Caddy or another reverse proxy already does TLS (the standard install). <b>Local CA</b> makes the daemon serve HTTPS itself using its own certificate authority - you install its small CA certificate on each device once. <b>Existing certificate</b> is for a cert you (or certbot / Caddy tls internal) already obtained. This daemon never requests certificates from the internet by itself (no built-in ACME - on purpose). Walkthroughs: <a href="help/tls" style="color:var(--accent)">Help &rarr; TLS & remote access</a>.</div>
 </div>
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Agent face</h2>
   <div class="row" style="align-items:center">
     <img id="avatarPreview" src="api/avatar" onerror="this.onerror=null;this.src='static/color.png'" style="width:64px;height:64px;border-radius:50%;border:1px solid var(--border);flex:none">
@@ -13476,10 +13879,10 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
     <button class="btn" onclick="resetAvatarCard()">Reset to default</button>
   </div>
   <div class="status" id="avatarStatus"></div>
-  <p class="hint">PNG, JPEG, WebP, or GIF - 1 MB max - stored as-is (no transcoding). Magic bytes checked server-side.</p>
+  <p class="hint">PNG, JPEG, WebP, or GIF - 10 MB max - stored as-is (no transcoding). Magic bytes checked server-side.</p>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Tools</h2>
   <p style="font-size:12px;opacity:.65;margin:0 0 10px">What your agent can call. Its prompt carries a tool list generated by the daemon from these settings - it can never drift. Unchecking only removes; it can never grant a tool this instance's tier doesn't have. All off = brain-only (model testing).</p>
   <div id="toolToggles" style="margin-bottom:10px"><div class="status">Loading…</div></div>
@@ -13490,7 +13893,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="status" id="toolsStatus"></div>
 </div>
 
-<div class="card" id="compactionCard" style="display:none">
+<div class="card" id="compactionCard" style="display:none" data-sec="admin">
   <h2>Compaction</h2>
   <p style="font-size:12px;opacity:.65;margin:0 0 10px">When a conversation outgrows its context window, the agent compresses the older part into a continuity handoff and keeps the recent messages. The prompt below steers that handoff - blank = the house original (the verbatim prompt that ships in the daemon). Threshold = the fraction of the context window at which compaction fires - 0.3 to 0.95, blank = 0.8. Admin/owner only: users do not edit their own amnesia.</p>
   <div class="row"><label>Compaction prompt</label>
@@ -13506,7 +13909,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="status" id="compactionStatus"></div>
 </div>
 
-<div class="card" id="syspromptCard" style="display:none">
+<div class="card" id="syspromptCard" style="display:none" data-sec="admin">
   <h2>System prompt</h2>
   <p style="font-size:12px;opacity:.65;margin:0 0 10px">What your agent IS. Editing this changes how it behaves - deliberately. A broken prompt is one restore away (the last 5 versions are kept).</p>
   <textarea id="spText" rows="12" style="width:100%;font-family:monospace;font-size:12px" placeholder="Loading…"></textarea>
@@ -13519,7 +13922,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="hint" id="spScope"></div>
   <div class="status" id="spStatus"></div>
 </div>
-<div class="card" id="tier0Card" style="display:none">
+<div class="card" id="tier0Card" style="display:none" data-sec="owner">
   <h2>Tier 0 — the constitution</h2>
   <div class="row" style="margin:0 0 8px"><label>Scope</label>
     <select id="t0Scope" onchange="loadTier0()">
@@ -13534,7 +13937,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="status" id="t0Status"></div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Advanced — model parameters</h2>
   <p style="font-size:12px;opacity:.65;margin:0 0 10px">Not all models or providers accept every parameter. Unsupported values may be ignored or rejected — if a setting breaks your model, use its reset. Reset clears the value: it is not sent, and the provider's own default applies.</p>
   <div class="row"><label>Temperature</label><input id="temperature" type="number" step="0.1" min="0" max="2" placeholder="blank = model default" style="max-width:140px">
@@ -13553,7 +13956,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="status" id="advStatus"></div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Web Search</h2>
   <div class="row"><label>Provider</label>
     <select id="search_provider" onchange="onSearchProviderChange()">
@@ -13589,22 +13992,26 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="status" id="searchSaveStatus"></div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Appearance</h2>
   <div class="row"><label>Theme</label><select id="theme" onchange="onThemeChange()">
     <option value="neon">Neon (cyan, flagship)</option>
     <option value="den">Den (dark blue)</option>
     <option value="ember">Ember (dark warm)</option>
-    <option value="paper">Paper (light)</option>
     <option value="goblin">Goblin (dark green)</option>
     <option value="oled">OLED (true black)</option>
+    <option value="miku">Miku (teal × pink, dark)</option>
+    <option value="cyberpunk">Cyberpunk Orange (dark)</option>
+    <option value="dendra">Dragon's Den (violet, dark)</option>
+    <option value="paper">Paper (light)</option>
+    <option value="moon">Moonlit (lavender, light)</option>
   </select></div>
   <div class="hint">Applies immediately on change and is saved to the rock (settings table) + remembered per-browser (localStorage).</div>
   <div class="row"><label>Auto-titles</label><label><input type="checkbox" id="title_gen"> Generate a short title after the first reply</label></div>
   <div class="hint">One tiny capped request to your own model, once per new conversation. If it ever hiccups the first-50-chars snippet title stays - nothing breaks. Unchecked = never call for titles.</div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Media generation</h2>
   <div class="row"><label>Image generation</label>
   <select id="imagegen_mode"><option value="off">Off (agent never sees the tool)</option><option value="current">Current chat provider</option><option value="custom">Custom provider</option></select></div>
@@ -13623,7 +14030,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="row"><label>Per-generation cap (MB)</label><input id="mediagen_max_mb" type="number" min="1" max="512" style="max-width:7em"><span id="mediaCapStatus" class="hint"></span></div>
   <div class="hint">Each feature is a separate door: reuse your chat provider or point at any provider of your choice, and each one turns off completely (the tool disappears) whenever you like. Generated media lands in the chat as attachments (owner/admin). Video: registry slot reserved, zero blind adapters - the first video provider ships when it can actually be tested. The per-generation cap is the OWNER's transport fuse against a broken provider (default 25 MB - far beyond any sane image or audio file); it is not a storage quota. Storage is owner discretion, never enforced.</div>
 </div>
-<div class="card">
+<div class="card" data-sec="admin">
   <h2>Scheduled Tasks</h2>
   <div class="hint">Cron for the daemon: each task fires as a real agent turn in its own &ldquo;Task: …&rdquo; conversation, using the owner's model and tools. 5-field cron (minute hour day month weekday), matched in YOUR time zone below. Admin/owner only; the scheduler runs whether or not anyone is signed in.</div>
   <div class="row"><label>Your time zone</label><input id="tzName" type="text" size="24" list="tzList" placeholder="America/Chicago"><button id="tzSaveBtn">Set</button><span id="tzStatus" class="status" style="margin-left:8px"></span></div>
@@ -13636,14 +14043,14 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div><button id="taskAddBtn">Add task</button><span id="taskStatus" class="status" style="margin-left:8px"></span></div>
 </div>
   <div id="f22Wrap" style="display:none">
-  <div class="card">
+  <div class="card" data-sec="owner">
   <h2>Backup & Restore</h2>
   <p class="hint">Export seals EVERYTHING (databases, identity, secrets, settings, optionally uploads) into one encrypted file under a backup password. The password is the only key &mdash; lost password means lost backup. Store the file off this machine.</p>
   <input id="f22ExpPw" type="password" placeholder="backup password" autocomplete="new-password">
   <input id="f22ExpPw2" type="password" placeholder="repeat password" autocomplete="new-password">
   <label><input id="f22ExpUp" type="checkbox" checked> include uploads</label>
   <button id="f22ExpBtn">Export backup</button>
-  <p class="hint">Verify only reads and checks the file &mdash; it touches nothing. Stage verifies a container and saves it (still encrypted) on this box; it changes NOTHING. Applying a backup is a deliberate maintenance step run from a shell with the daemon STOPPED: <code>python3 marahome.py --import-staged</code> (takes a pre-import snapshot first, asks you to type REPLACE).</p>
+  <p class="hint">Verify only reads and checks the file &mdash; it touches nothing. Stage verifies a container and saves it (still encrypted) on this box; it changes NOTHING. Applying a backup is a deliberate maintenance step run from a shell with the daemon STOPPED: <code>python3 marahome.py --import-staged</code> (takes a pre-import snapshot first, asks you to type REPLACE). Exports are built as owner-only (0600) temp files and deleted the moment your download finishes; anything a crashed build leaves behind is swept at next boot. One archive is capped at 512&nbsp;MiB &mdash; very large histories should be backed up with Export backup instead.</p>
   <input id="f22ImpFile" type="file">
   <input id="f22ImpPw" type="password" placeholder="backup password" autocomplete="off">
   <button id="f22VerBtn">Verify</button>
@@ -13717,7 +14124,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   })();
   </script>
   </div>
-  <div class="card" id="f27Card" style="display:none">
+  <div class="card" id="f27Card" style="display:none" data-sec="owner">
   <h2>Invites</h2>
   <p class="hint">Send someone a code; their signup arrives at the front desk pre-tagged with what you offered.
   Family invites ride YOUR model key for chat traffic; residents bring their own. Single-use, expiring, revocable.</p>
@@ -13731,13 +14138,13 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="status" id="f27Status" style="margin-top:8px"></div>
   <div id="f27List" style="margin-top:10px"></div>
   </div>
-  <div class="card">
+  <div class="card" data-sec="personal">
   <h2>System</h2>
   <div id="status"><div class="status">Loading…</div></div>
   <div class="hint" id="versionLine" style="margin-top:6px"></div>
 </div>
   <div id="updWrap" style="display:none">
-  <div class="card">
+  <div class="card" data-sec="owner">
   <h2>Updates</h2>
   <p class="hint">Signed, pull-based, owner-only. Disabled until you flip it on. The daemon verifies
   everything against a key pinned in its own source; installs happen only when you press Install.
@@ -13802,7 +14209,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   </script>
 
 <div id="apWrap" style="display:none">
-  <div class="card">
+  <div class="card" data-sec="owner">
   <h2>Credential Approvals</h2>
   <p class="hint">ssh_run and run_with_secret wait here until YOU approve them &mdash;
   one approval, one execution, five-minute expiry. Deny is final. The gate decides
@@ -13862,7 +14269,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   </script>
 </div>
 
-<div class="card">
+<div class="card" data-sec="owner">
   <h2>Pending Access</h2>
   <div id="approvalList"><div class="status">Loading…</div></div>
   <div id="userRoleBox" style="display:none">
@@ -13872,7 +14279,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   </div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Session</h2>
   <div class="row"><label>Signed in as</label><span id="whoami" class="mono" style="color:var(--text);text-align:right">…</span></div>
   <button class="btn" style="margin-top:10px;margin-right:8px" onclick="doLogout()">Log out</button>
@@ -13880,7 +14287,7 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="status" id="sessStatus"></div>
 </div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Your Memory Files</h2>
   <div id="memoryList"><div class="status">Loading…</div></div>
   <div id="memoryEdit">
@@ -13894,17 +14301,32 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   </div>
   <div class="hint" id="memStatus">Saving replaces the file if it exists. Files over 32KB are flagged: they ship in the agent's system prompt on every request and eat the context budget. 256KB per-file ceiling.</div>
 </div>
+<div class="card" data-sec="personal">
+  <h2>Your Skills</h2>
+  <div class="hint">Saved instruction files available to the model. Tick the skills you want active - selected skills ship in the agent's system prompt on every request, so keep them short and sharp.</div>
+  <div id="skillsList"><div class="status">Loading\u2026</div></div>
+  <div id="skillsEdit">
+  <div class="row" style="margin-top:12px"><label>New or imported skill</label><input id="skillName" class="mono" value="style.md"></div>
+  <div class="row"><textarea id="skillContent" rows="6" placeholder="Write an instruction file - tone rules, house conventions, how you want the agent to work. Markdown, one topic per file." style="width:100%"></textarea></div>
+  <div class="row" style="margin-top:8px">
+    <button class="btn" onclick="saveSkillFile()">Save skill</button>
+    <button class="btn" style="background:var(--accent2)" onclick="document.getElementById('skillFilePick').click()">Upload .md / .txt</button>
+    <input type="file" id="skillFilePick" accept=".md,.txt" style="display:none" onchange="pickSkillFile(this)">
+  </div>
+  </div>
+  <div class="hint" id="skillStatus">Saving a new skill enables it immediately. 64KB per-file ceiling.</div>
+</div>
 
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Credential Vault</h2>
   <div id="vaultList"><div class="status">Loading…</div></div>
   <div class="row" style="margin-top:12px"><label>New entry</label><input id="vaultName" class="mono" placeholder="e.g. opnsense-api"></div>
   <div class="row"><label>Type</label><select id="vaultType"><option value="secret">secret</option><option value="api_key">api key</option><option value="ssh_key">ssh key</option><option value="password">password</option><option value="note">note</option></select></div>
   <div class="row"><textarea id="vaultValue" rows="4" placeholder="Paste the credential. It is sealed with the house key and can never be read back."></textarea></div>
   <div class="row" style="margin-top:8px"><button class="btn" onclick="saveVaultEntry()">Seal it</button></div>
-  <div class="hint" id="vaultStatus">Entered, encrypted, never returned: no API, export, or agent can read these back. Stored AES-256-GCM; the key lives with the key server, never on this disk. Rotation = seal a new value under the same name. 64KB per entry.</div>
+  <div class="hint" id="vaultStatus">Entered, encrypted, never returned: no API, export, or agent can read these back. Stored AES-256-GCM; the master key lives outside this database - ideally on a second machine, staged to this one only at boot. Rotation = seal a new value under the same name. 64KB per entry.</div>
 </div>
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Instance Logs</h2>
   <div class="hint">Opt-in, metadata-only, self-only. Nothing is recorded until you flip this switch;
   switching it off deletes every event. At any level this records timing and outcomes — never your
@@ -13930,12 +14352,12 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   </details>
   <pre id="logsTail" class="mono" style="font-size:11px;white-space:pre-wrap;max-height:300px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px;margin-top:8px"></pre>
 </div>
-<div class="card">
+<div class="card" data-sec="personal">
   <h2>Export / Import</h2>
   <div class="row"><label>Export everything</label>
     <button class="btn" onclick="exportAll()">Download my .cairn export (chats + attachments + memory + system prompt + settings)</button>
   </div>
-  <div class="row"><label>Import an archive</label>
+  <div class="row" style="flex-wrap:wrap"><label>Import an archive</label>
     <input type="file" id="importFile" accept=".cairn,.agora,.zip,.json,application/json,application/zip">
     <button class="btn" onclick="importArchive()">Import</button>
     <label style="display:inline-block;margin-left:12px"><input type="checkbox" id="importRestore"> Also restore settings (safe keys only; every changed key is logged)</label>
@@ -13944,9 +14366,55 @@ pre{font-size:11.5px;background:var(--bg);color:var(--text);padding:12px;border-
   <div class="hint" id="impStatus">Exports are Agora-compatible (.cairn, format v4) - importable here, in Agora, or between accounts (the name-change escape). Import accepts Cairn/Agora archives, ChatGPT exports, and Claude exports. API keys are never included.</div>
 </div>
 
-<div class="card">
-  <h2>Connectors (P3)</h2>
-  <div class="status">No connectors configured. Extensible tool slots will appear here.</div>
+<div class="card" data-sec="personal">
+  <h2>Connectors</h2>
+  <div class="hint">Read-only by design: connectors fetch and report, never send or delete. Secrets go <b>straight into the vault</b> - password fields are write-only and never echoed. Tick <i>clear</i> and save to remove a seal. Connector <i>tools</i> run only for admin/owner-tier accounts; this page configures them.</div>
+  <div class="hint" id="connStatus"></div>
+  <div class="conn">
+    <b>Nextcloud</b> <span class="conn-pill off" id="connNCpill">checking…</span>
+    <div class="row"><label>Server URL (https)</label><input id="connNCurl" placeholder="https://cloud.example.com"></div>
+    <div class="row"><label>Username</label><input id="connNCuser"></div>
+    <div class="row"><label>App password (write-only)</label><input type="password" id="connNCpw" autocomplete="new-password" oninput="_connT.ncpw=1"><label class="chk"><input type="checkbox" id="connNCpwClr"> clear</label></div>
+    <div class="hint" id="connNCtxt"></div>
+    <button class="btn" onclick="connSave('nc')">Save Nextcloud</button>
+  </div>
+  <div class="conn">
+    <b>Google</b> <span class="conn-pill off" id="connGpill">checking…</span>
+    <div class="hint">Redirect URI to allow in your Google console: <code id="connGred"></code></div>
+    <div class="row"><label>Client ID</label><input id="connGcid"></div>
+    <div class="row"><label>Client secret (write-only)</label><input type="password" id="connGsec" autocomplete="new-password" oninput="_connT.gsec=1"><label class="chk"><input type="checkbox" id="connGsecClr"> clear</label></div>
+    <div class="hint" id="connGtxt"></div>
+    <button class="btn" onclick="connSave('g')">Save Google</button>
+    <a class="btn" href="oauth/google/start">Connect Google</a>
+  </div>
+  <div class="conn">
+    <b>Microsoft 365</b> <span class="conn-pill off" id="connMpill">checking…</span>
+    <div class="row"><label>Entra application (client) ID</label><input id="connMcid"></div>
+    <div class="hint" id="connMflow"></div>
+    <button class="btn" onclick="connSave('m')">Save Microsoft</button>
+    <button class="btn" onclick="connMsStart()">Start device flow</button>
+  </div>
+  <div class="conn">
+    <b>GitHub</b> <span class="conn-pill off" id="connGHpill">checking…</span>
+    <div class="row"><label>Personal access token (write-only)</label><input type="password" id="connGHtok" autocomplete="new-password" oninput="_connT.ghtok=1"><label class="chk"><input type="checkbox" id="connGHclr"> clear</label></div>
+    <div class="hint" id="connGHtxt"></div>
+    <button class="btn" onclick="connSave('gh')">Save GitHub</button>
+  </div>
+  <div class="conn">
+    <b>Home Assistant</b> <span class="conn-pill off" id="connHApill">checking…</span>
+    <div class="row"><label>Base URL</label><input id="connHAurl" placeholder="https://ha.example.com (http only for LAN IPs)"></div>
+    <div class="row"><label>Long-lived token (write-only)</label><input type="password" id="connHAtok" autocomplete="new-password" oninput="_connT.hatok=1"><label class="chk"><input type="checkbox" id="connHAclr"> clear</label></div>
+    <div class="hint" id="connHAtxt"></div>
+    <button class="btn" onclick="connSave('ha')">Save Home Assistant</button>
+  </div>
+  <div class="conn">
+    <b>OPNsense</b> <span class="conn-pill off" id="connOpill">checking…</span>
+    <div class="row"><label>Base URL</label><input id="connOurl" placeholder="https://firewall.example.com (http only for LAN IPs)"></div>
+    <div class="row"><label>API key</label><input id="connOkey"></div>
+    <div class="row"><label>API secret (write-only)</label><input type="password" id="connOtok" autocomplete="new-password" oninput="_connT.otok=1"><label class="chk"><input type="checkbox" id="connOclr"> clear</label></div>
+    <div class="hint" id="connOtxt"></div>
+    <button class="btn" onclick="connSave('o')">Save OPNsense</button>
+  </div>
 </div>
 </div>
 
@@ -14013,11 +14481,164 @@ async function loadSettings() {
     onSearchProviderChange();
     updateVersionLine(s);
     initLogsPanel(s);
+    renderConnectors(s);
+    renderShortcuts(s);  // B-21
   } catch (e) {
     setStatus('saveStatus', 'warn', 'Could not load settings.');
   }
 }
 
+// B-18: connectors card. The engine shipped ages ago - this is its face.
+// Secrets are write-only: an untouched field sends NOTHING; "clear" sends ""
+// which the server reads as unseal. Presence text comes from /api/settings.
+var _connT = {};
+function _connPill(id, state, text) {
+  var el = s$(id); if (!el) return;
+  el.className = 'conn-pill ' + state; el.textContent = text;
+}
+function _connTxt(id, sealed) {
+  var el = s$(id); if (!el) return;
+  el.textContent = sealed ? 'credential: sealed in your vault (write-only)' : 'credential: none yet';
+}
+// B-21: model shortcuts (Settings side). The chat model bar reads the same
+// saved_models list; add/remove replaces the whole list server-side (POST is
+// all-or-nothing) and we re-render from the GET echo, never from hope.
+let smSaved = [];
+function renderShortcuts(s) {
+  smSaved = (s && Array.isArray(s.saved_models)) ? s.saved_models : [];
+  const box = s$('smList'); if (!box) return;
+  box.textContent = '';
+  if (!smSaved.length) {
+    const d = document.createElement('div');
+    d.textContent = 'No shortcuts yet - add one below.';
+    box.appendChild(d);
+    return;
+  }
+  smSaved.forEach(function (m, idx) {
+    const row = document.createElement('div');
+    const b = document.createElement('b'); b.textContent = m.label || m.model;
+    row.appendChild(b);
+    row.appendChild(document.createTextNode(' - ' + m.provider + ' / ' + m.model));
+    const x = document.createElement('button'); x.className = 'btn';
+    x.style.cssText = 'margin-left:8px;padding:0 8px;height:20px;font-size:11px';
+    x.textContent = 'remove';
+    x.onclick = function () { smDel(idx); };
+    row.appendChild(x);
+    box.appendChild(row);
+  });
+}
+async function smPost(arr) {
+  try {
+    const r = await fetch('api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ saved_models: arr }) });
+    const j = await r.json().catch(function () { return {}; });
+    if (!r.ok) { setStatus('smStatus', 'err', 'Shortcuts not saved: ' + (j.error || ('HTTP ' + r.status))); return false; }
+    const rr = await fetch('api/settings'); const s2 = await rr.json();
+    renderShortcuts(s2);
+    setStatus('smStatus', 'ok', 'Shortcuts saved');
+    return true;
+  } catch (e) { setStatus('smStatus', 'err', 'Shortcuts not saved: ' + e); return false; }
+}
+function smAdd() {
+  const mdl = s$('smModel').value.trim();
+  if (!mdl) { setStatus('smStatus', 'err', 'Type a model id first'); return; }
+  const prov = s$('smProv').value;
+  if (smSaved.some(function (m) { return m.provider === prov && m.model.toLowerCase() === mdl.toLowerCase(); })) {
+    setStatus('smStatus', 'err', 'That shortcut already exists'); return;
+  }
+  const arr = smSaved.concat([{ provider: prov, model: mdl, label: s$('smLabel').value.trim() }]);
+  smPost(arr).then(function (ok) { if (ok) { s$('smModel').value = ''; s$('smLabel').value = ''; } });
+}
+function smDel(i) {
+  const arr = smSaved.slice(); arr.splice(i, 1); smPost(arr);
+}
+async function smLoad() {
+  // Reuses api/models (account provider's own model list with the saved
+  // key). No key or no network = honest warning; the id box takes a paste.
+  try {
+    const r = await fetch('api/models');
+    const d = await r.json();
+    const dl = s$('smModelList');
+    if (r.ok && d.models && d.models.length) {
+      dl.textContent = '';
+      d.models.forEach(function (id) { const o = document.createElement('option'); o.value = id; dl.appendChild(o); });
+      setStatus('smStatus', 'ok', d.models.length + ' ids loaded from your account provider - type in the model id box to search');
+    } else {
+      setStatus('smStatus', 'err', 'Could not list models (' + (d.error || ('HTTP ' + r.status)) + ') - type or paste the id');
+    }
+  } catch (e) { setStatus('smStatus', 'err', 'Could not list models (network) - type or paste the id'); }
+}
+function renderConnectors(s) {
+  var c = s && s.connectors; if (!c) return;
+  var cfg = c.config || {};
+  var setv = function (id, v) { var el = s$(id); if (el && !el.value) el.value = v || ''; };
+  setv('connNCurl', cfg.nc_url); setv('connNCuser', cfg.nc_user);
+  setv('connGcid', cfg.google_client_id); setv('connMcid', cfg.ms_client_id);
+  setv('connHAurl', cfg.ha_url);
+  setv('connOurl', cfg.opnsense_url); setv('connOkey', cfg.opnsense_key);
+  var red = s$('connGred'); if (red) red.textContent = c.oauth_redirect_uri || '(default)';
+  var g = c.google || {}, m = c.microsoft || {}, gh = c.github || {},
+      ha = c.homeassistant || {}, o = c.opnsense || {}, nc = c.nextcloud || {};
+  _connPill('connNCpill', (nc.url_set && nc.user_set && nc.apppw_sealed) ? 'on' : ((nc.url_set || nc.user_set || nc.apppw_sealed) ? 'mid' : 'off'),
+            (nc.url_set && nc.user_set && nc.apppw_sealed) ? 'ready' : 'needs URL + user + app password');
+  _connTxt('connNCtxt', nc.apppw_sealed);
+  _connPill('connGpill', g.refresh_sealed ? 'on' : ((g.client_id_set && g.client_secret_sealed) ? 'mid' : 'off'),
+            g.refresh_sealed ? 'connected' : ((g.client_id_set && g.client_secret_sealed) ? 'ready - press Connect Google' : 'needs client id + secret'));
+  _connTxt('connGtxt', g.client_secret_sealed);
+  var mst = m.refresh_sealed ? 'on' : (m.client_id_set ? 'mid' : 'off');
+  var mtxt = m.refresh_sealed ? 'connected' : (m.client_id_set ? 'ready - start device flow' : 'needs client id');
+  if (m.flow && m.flow.status === 'pending') { mst = 'mid'; mtxt = 'waiting for you to enter the code'; }
+  if (m.flow && m.flow.status === 'approved') { mst = 'on'; }
+  _connPill('connMpill', mst, mtxt);
+  var mf = s$('connMflow');
+  if (mf && m.flow && m.flow.status === 'pending' && m.flow.user_code) {
+    mf.textContent = 'Enter code ' + m.flow.user_code + ' at ' + (m.flow.uri || 'https://microsoft.com/devicelogin') + ' (expires in ~15 min).';
+  }
+  _connPill('connGHpill', gh.token_sealed ? 'on' : 'off', gh.token_sealed ? 'token sealed' : 'needs token');
+  _connTxt('connGHtxt', gh.token_sealed);
+  _connPill('connHApill', (ha.url_set && ha.token_sealed) ? 'on' : ((ha.url_set || ha.token_sealed) ? 'mid' : 'off'),
+            (ha.url_set && ha.token_sealed) ? 'ready' : 'needs URL + token');
+  _connTxt('connHAtxt', ha.token_sealed);
+  _connPill('connOpill', (o.url_set && o.key_set && o.secret_sealed) ? 'on' : ((o.url_set || o.key_set || o.secret_sealed) ? 'mid' : 'off'),
+            (o.url_set && o.key_set && o.secret_sealed) ? 'ready' : 'needs URL + key + secret');
+  _connTxt('connOtxt', o.secret_sealed);
+}
+async function connSave(kind) {
+  var body = {}, done = kind;
+  var val = function (id) { var el = s$(id); return el ? el.value : ''; };
+  var chk = function (id) { var el = s$(id); return !!(el && el.checked); };
+  var sec = function (fid, cid, key, touched) {
+    if (_connT[touched] || chk(cid)) body[key] = chk(cid) ? '' : val(fid);
+  };
+  if (kind === 'nc') { body = {nc_url: val('connNCurl'), nc_user: val('connNCuser')}; sec('connNCpw', 'connNCpwClr', 'nc_app_password', 'ncpw'); done = 'Nextcloud'; }
+  else if (kind === 'g') { body = {google_client_id: val('connGcid')}; sec('connGsec', 'connGsecClr', 'google_client_secret', 'gsec'); done = 'Google'; }
+  else if (kind === 'm') { body = {ms_client_id: val('connMcid')}; done = 'Microsoft'; }
+  else if (kind === 'gh') { sec('connGHtok', 'connGHclr', 'github_token', 'ghtok'); done = 'GitHub'; }
+  else if (kind === 'ha') { body = {ha_url: val('connHAurl')}; sec('connHAtok', 'connHAclr', 'ha_token', 'hatok'); done = 'Home Assistant'; }
+  else if (kind === 'o') { body = {opnsense_url: val('connOurl'), opnsense_key: val('connOkey')}; sec('connOtok', 'connOclr', 'opnsense_secret', 'otok'); done = 'OPNsense'; }
+  var st = s$('connStatus');
+  try {
+    var r = await fetch('api/settings', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    var j = await r.json().catch(function () { return {}; });
+    if (!r.ok) { if (st) st.textContent = done + ': ' + (j.error || ('HTTP ' + r.status)); return; }
+    ['gsec', 'ncpw', 'ghtok', 'hatok', 'otok'].forEach(function (k) { _connT[k] = 0; });
+    ['connGsec', 'connNCpw', 'connGHtok', 'connHAtok', 'connOtok'].forEach(function (id) { var el = s$(id); if (el) el.value = ''; });
+    // stale "clear" ticks are spent ammunition once the save landed -
+    // un-tick them so a later save cannot silently unseal again.
+    ['connGsecClr', 'connNCpwClr', 'connGHclr', 'connHAclr', 'connOclr'].forEach(function (id) { var el = s$(id); if (el) el.checked = false; });
+    var rr = await fetch('api/settings');
+    renderConnectors(await rr.json());
+    if (st) st.textContent = done + ' saved.';
+  } catch (e) { if (st) st.textContent = done + ': save failed (' + e + ')'; }
+}
+async function connMsStart() {
+  var st = s$('connMflow');
+  try {
+    var r = await fetch('api/connectors/ms/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    var j = await r.json().catch(function () { return {}; });
+    if (st) st.textContent = r.ok ? (j.display || 'device flow started - enter the code at Microsoft')
+                                  : ('Microsoft: ' + (j.error || ('HTTP ' + r.status)));
+  } catch (e) { if (st) st.textContent = 'Microsoft: could not start the flow'; }
+}
 // S4f2: context-window vs prompt-size fit warning (K80 10:34/11:36: no
 // floor, no ceiling — but a window smaller than the prompt cannot
 // generate). The estimate includes custom instructions.
@@ -14307,24 +14928,53 @@ function clearModelKey() {
   saveSettings();
 }
 
+let MODELS = [];
+function modelSearchInput() {
+  // Live-filtered picker over the loaded catalog. textContent only: model
+  // ids are provider DATA and must never parse as markup.
+  const inp = document.getElementById('model');
+  const drop = document.getElementById('modelDrop');
+  if (!inp || !drop) return;
+  if (!MODELS.length) { drop.style.display = 'none'; return; }
+  const q = (inp.value || '').trim().toLowerCase();
+  const hits = MODELS.filter(m => m.toLowerCase().indexOf(q) !== -1).slice(0, 60);
+  drop.textContent = '';
+  if (!hits.length) {
+    const d = document.createElement('div');
+    d.className = 'md-empty';
+    d.textContent = 'no loaded model matches - paste the id anyway; free text is fine';
+    drop.appendChild(d);
+  } else {
+    hits.forEach(m => {
+      const d = document.createElement('div');
+      d.textContent = m;
+      d.onclick = () => { inp.value = m; drop.style.display = 'none'; };
+      drop.appendChild(d);
+    });
+  }
+  drop.style.display = 'block';
+}
+document.addEventListener('click', (ev) => {
+  const drop = document.getElementById('modelDrop');
+  if (!drop || drop.style.display === 'none') return;
+  const t = ev.target;
+  if (t && (t.id === 'model' || (drop.contains && drop.contains(t)))) return;
+  drop.style.display = 'none';
+});
 async function loadModels() {
-  const dl = document.getElementById('modelList');
-  dl.innerHTML = '';
   try {
     const r = await fetch('api/models');
     const d = await r.json();
     if (r.ok && d.models && d.models.length) {
-      d.models.slice(0, 200).forEach(m => {
-        const o = document.createElement('option');
-        o.value = m;
-        dl.appendChild(o);
-      });
-      setStatus('modelLoadStatus', 'ok', d.models.length + ' models loaded — type to choose or paste any model id');
+      MODELS = d.models;
+      setStatus('modelLoadStatus', 'ok', MODELS.length + ' models loaded - type in the Model box to search them all');
     } else {
-      setStatus('modelLoadStatus', 'warn', 'Could not list models (' + (d.error || 'HTTP ' + r.status) + ') — paste the model id by hand');
+      MODELS = [];
+      setStatus('modelLoadStatus', 'warn', 'Could not list models (' + (d.error || 'HTTP ' + r.status) + ') - paste the model id by hand');
     }
   } catch (e) {
-    setStatus('modelLoadStatus', 'warn', 'Could not list models (network) — paste the model id by hand');
+    MODELS = [];
+    setStatus('modelLoadStatus', 'warn', 'Could not list models (network) - paste the model id by hand');
   }
 }
 
@@ -14373,7 +15023,7 @@ async function loadVault() {
     if (!d.key || !d.crypto) {
       const w = document.createElement('div');
       w.className = 'warn';
-      w.textContent = 'Vault key not staged right now - sealing is disabled until the key server is reachable. Existing entries are safe.';
+      w.textContent = 'Vault key not staged right now - sealing is disabled until the master key is staged. Existing entries are safe.';
       div.appendChild(w);
     }
     const es = d.entries || [];
@@ -14457,11 +15107,12 @@ async function loadMemory() {
     files.forEach(f => {
       const el = document.createElement('div');
       el.className = 'memory-file';
-      const big = f.size > 32768 ? ' <span class="warn" title="Over 32KB - ships in the system prompt on every request">large</span>' : '';
       // P1-B: file names are data - textContent, never markup.
+      // The size badge is a real element too - markup never rides in textContent.
       el.textContent = '';
       const nm = document.createElement('span'); nm.className = 'mono'; nm.textContent = f.name;
-      const sz = document.createElement('span'); sz.className = 'sz'; sz.textContent = f.size + ' B' + big;
+      const sz = document.createElement('span'); sz.className = 'sz'; sz.textContent = f.size + ' B';
+      if (f.size > 32768) { const bg = document.createElement('span'); bg.className = 'warn'; bg.title = 'Over 32KB - ships in the system prompt on every request'; bg.textContent = 'large'; sz.appendChild(bg); }
       el.appendChild(nm); el.appendChild(sz);
       const del = document.createElement('span');
       del.className = 'memdel';
@@ -14504,6 +15155,114 @@ async function deleteMemoryFile(name) {
   }
 }
 
+let _skillsState = { files: [], selected: [] };
+async function loadSkills() {
+  const div = document.getElementById('skillsList');
+  if (!div) return;
+  try {
+    const r = await fetch('api/skills');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    _skillsState = { files: d.files || [], selected: d.selected || [] };
+    div.innerHTML = '';
+    if (!_skillsState.files.length) {
+      div.innerHTML = '<div class="status">No skills yet. Write one below \u2014 or import one another agent uses.</div>';
+      return;
+    }
+    _skillsState.files.forEach(f => {
+      const el = document.createElement('div');
+      el.className = 'memory-file';
+      el.textContent = '';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = _skillsState.selected.indexOf(f.name) >= 0;
+      cb.title = 'Include this skill in the system prompt';
+      cb.onchange = () => applySkillSelect();
+      const nm = document.createElement('span'); nm.className = 'mono'; nm.textContent = f.name;
+      const sz = document.createElement('span'); sz.className = 'sz'; sz.textContent = f.size + ' B';
+      const ed = document.createElement('span'); ed.className = 'sz'; ed.textContent = 'edit'; ed.style.cursor = 'pointer';
+      ed.title = 'Load this skill into the editor';
+      ed.onclick = (ev) => { ev.stopPropagation(); editSkill(f.name); };
+      const del = document.createElement('span'); del.className = 'memdel'; del.textContent = '\u2715';
+      del.title = 'Delete this skill';
+      del.onclick = (ev) => { ev.stopPropagation(); deleteSkill(f.name); };
+      el.appendChild(cb); el.appendChild(nm); el.appendChild(ed); el.appendChild(sz); el.appendChild(del);
+      div.appendChild(el);
+    });
+  } catch (e) {
+    div.innerHTML = '<div class="status warn">\u2717 Could not load skills.</div>';
+  }
+}
+async function applySkillSelect() {
+  const boxes = Array.from(document.querySelectorAll('#skillsList input[type=checkbox]'));
+  const rows = Array.from(document.querySelectorAll('#skillsList .memory-file'));
+  const want = [];
+  rows.forEach((row, i) => { const nm = row.querySelector('.mono'); if (boxes[i] && boxes[i].checked && nm) want.push(nm.textContent); });
+  const st = document.getElementById('skillStatus');
+  try {
+    const r = await fetch('api/skills', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'select', selected: want }) });
+    const d = await r.json();
+    if (!r.ok) { st.textContent = '\u2717 ' + (d.error || ('select failed (HTTP ' + r.status + ')')); return; }
+    _skillsState.selected = d.selected || want;
+    st.textContent = want.length ? ('Active skills: ' + _skillsState.selected.join(', ')) : 'No skills selected \u2014 the model sees none.';
+  } catch (e) {
+    st.textContent = '\u2717 select failed (network)';
+  }
+}
+async function editSkill(name) {
+  const st = document.getElementById('skillStatus');
+  try {
+    const r = await fetch('api/skills/' + encodeURIComponent(name));
+    if (!r.ok) { st.textContent = '\u2717 could not load ' + name; return; }
+    const d = await r.json();
+    document.getElementById('skillName').value = d.name;
+    document.getElementById('skillContent').value = d.content || '';
+    st.textContent = 'Editing ' + d.name + ' \u2014 save replaces it.';
+  } catch (e) {
+    st.textContent = '\u2717 load failed (network)';
+  }
+}
+async function saveSkillFile() {
+  const st = document.getElementById('skillStatus');
+  const name = document.getElementById('skillName').value.trim();
+  const content = document.getElementById('skillContent').value;
+  if (!name) { st.textContent = '\u2717 give the skill a file name ending in .md'; return; }
+  try {
+    const r = await fetch('api/skills', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name, content: content }) });
+    const d = await r.json();
+    if (!r.ok) { st.textContent = '\u2717 ' + (d.error || ('save failed (HTTP ' + r.status + ')')); return; }
+    st.textContent = 'Saved ' + d.name + ' (' + d.size + ' B)' + (d.warning ? ' \u2014 ' + d.warning : '');
+    loadSkills();
+  } catch (e) {
+    st.textContent = '\u2717 save failed (network)';
+  }
+}
+async function deleteSkill(name) {
+  if (!confirm('Delete skill ' + name + '?')) return;
+  const st = document.getElementById('skillStatus');
+  try {
+    const r = await fetch('api/skills', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'delete', name: name }) });
+    const d = await r.json();
+    if (!r.ok) { st.textContent = '\u2717 ' + (d.error || ('delete failed (HTTP ' + r.status + ')')); return; }
+    st.textContent = 'Deleted ' + name + '.';
+    loadSkills();
+  } catch (e) {
+    st.textContent = '\u2717 delete failed (network)';
+  }
+}
+function pickSkillFile(inp) {
+  const f = inp.files && inp.files[0];
+  if (!f) return;
+  const st = document.getElementById('skillStatus');
+  const rd = new FileReader();
+  rd.onload = () => {
+    const nm = (f.name || 'skill.md').replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[.]+/, '');
+    document.getElementById('skillName').value = /[.](md|txt)$/.test(nm) ? nm : nm + '.md';
+    document.getElementById('skillContent').value = String(rd.result || '');
+    st.textContent = 'Loaded ' + f.name + ' into the editor \u2014 review and Save skill.';
+  };
+  rd.onerror = () => { st.textContent = '\u2717 could not read that file'; };
+  rd.readAsText(f);
+  inp.value = '';
+}
 async function saveMemoryFile() {
   const name = document.getElementById('memName').value.trim();
   const content = document.getElementById('memContent').value;
@@ -14547,6 +15306,62 @@ async function doLogout() {
 async function doLogoutAll() {
   try { await fetch('api/logout-all', { method: 'POST' }); } catch (e) {}
   location.href = 'login';
+}
+
+
+/* ── B16 sections drawer (K80 2026-09-26 ruling) ──
+   Top tabs: Personal for everyone, Admin for admin+owner, Owner for owner.
+   Tabs filter the VIEW; the server gates every route. Cards keep their own
+   display gating - a nav link is only ever offered for a card that is
+   currently rendered. */
+const s$ = (id) => document.getElementById(id);
+let secPageNow = 'personal';
+function secOpen() { const d = s$('secDrawer'); if (!d) return; d.classList.add('open'); d.setAttribute('aria-hidden', 'false'); s$('secBackdrop').classList.add('show'); renderSecNav(); }
+function secClose() { const d = s$('secDrawer'); if (!d) return; d.classList.remove('open'); d.setAttribute('aria-hidden', 'true'); s$('secBackdrop').classList.remove('show'); }
+function secSetPage(p) {
+  secPageNow = p;
+  document.body.dataset.page = p;
+  document.querySelectorAll('.sectab').forEach(function(b) { b.classList.toggle('active', b.dataset.page === p); });
+  renderSecNav();
+  secClose();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+function renderSecNav() {
+  const nav = s$('secNav'); if (!nav) return;
+  nav.innerHTML = '';
+  let shown = 0;
+  document.querySelectorAll('.card[data-sec="' + secPageNow + '"]').forEach(function(c, i) {
+    if (!c.offsetParent) return;
+    if (!c.id) c.id = 'seccard-' + secPageNow + '-' + i;
+    const h = c.querySelector('h2'); if (!h) return;
+    const a = document.createElement('a');
+    a.href = '#' + c.id;
+    a.textContent = h.textContent;
+    a.onclick = function(ev) {
+      ev.preventDefault();
+      secClose();
+      c.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      c.classList.add('secflash');
+      setTimeout(function() { c.classList.remove('secflash'); }, 1200);
+    };
+    nav.appendChild(a); shown++;
+  });
+  if (!shown) { const e = document.createElement('div'); e.className = 'sec-empty'; e.textContent = 'Nothing here for your role yet.'; nav.appendChild(e); }
+}
+async function initSections() {
+  const btn = s$('secBtn'); if (!btn) return;
+  let role = 'user';
+  try { const m = await (await fetch('api/me', { credentials: 'same-origin' })).json(); if (m && m.authenticated) role = m.role || 'user'; } catch (e) {}
+  const tabA = document.querySelector('.sectab[data-page="admin"]');
+  const tabO = document.querySelector('.sectab[data-page="owner"]');
+  if (tabA && (role === 'admin' || role === 'owner')) tabA.hidden = false;
+  if (tabO && role === 'owner') tabO.hidden = false;
+  document.querySelectorAll('.sectab').forEach(function(b) { b.addEventListener('click', function() { secSetPage(b.dataset.page); }); });
+  btn.addEventListener('click', secOpen);
+  s$('secClose').addEventListener('click', secClose);
+  s$('secBackdrop').addEventListener('click', secClose);
+  document.addEventListener('keydown', function(e) { if (e.key === 'Escape') secClose(); });
+  secSetPage('personal');
 }
 
 async function loadSession() {
@@ -14621,29 +15436,29 @@ async function loadInvites() {
     const box = document.getElementById('f27List');
     box.textContent = '';
     if (!list.length) { box.textContent = 'No invites yet.'; return; }
-    async function act(body) {
+    async function act(body, label) {
       try {
         const rr = await fetch('api/invites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         let j = null; try { j = await rr.json(); } catch (e) {}
-        if (rr.ok) { loadInvites(); return; }
+        if (rr.ok) { st.textContent = label || ''; loadInvites(); return; }
         st.textContent = 'invite action failed: ' + ((j && j.error) || ('HTTP ' + rr.status));
       } catch (e) { st.textContent = 'invite action failed: ' + e; }
     }
     list.forEach(function (v) {
       const row = document.createElement('div'); row.className = 'memory-file'; row.style.cursor = 'default';
       const code = document.createElement('span'); code.className = 'mono'; code.textContent = v.code;
-      const meta = document.createElement('span'); meta.className = 'sz';
+      const meta = document.createElement('span'); meta.className = 'sz inv-meta';
       const when = v.expires_at ? new Date(v.expires_at * 1000).toLocaleString() : 'no expiry';
-      meta.textContent = ' ' + v.kind + ' - ' + v.role + ' - uses ' + v.uses + '/' + v.max_uses + ' - ' + v.status + ' - expires ' + when + (v.note ? ' - ' + v.note : '');
+      meta.textContent = v.kind + ' \u00b7 ' + v.role + ' \u00b7 ' + v.uses + ' of ' + v.max_uses + ' used \u00b7 ' + v.status + ' \u00b7 expires ' + when + (v.note ? ' \u00b7 for: ' + v.note : '');
       row.appendChild(code); row.appendChild(meta);
       const bar = document.createElement('div');
       bar.style.cssText = 'display:flex;gap:8px;margin:6px 0 10px';
       const bCopy = document.createElement('button'); bCopy.className = 'btn'; bCopy.textContent = 'Copy code';
       bCopy.onclick = function () { try { navigator.clipboard.writeText(v.code); st.textContent = 'code copied'; } catch (e) { st.textContent = v.code; } };
       const bRev = document.createElement('button'); bRev.className = 'btn'; bRev.textContent = 'Revoke';
-      bRev.onclick = function () { act({ action: 'revoke', id: v.id }); };
+      bRev.onclick = function () { act({ action: 'revoke', id: v.id }, 'invite revoked'); };
       const bDel = document.createElement('button'); bDel.className = 'btn'; bDel.textContent = 'Delete';
-      bDel.onclick = function () { act({ action: 'delete', id: v.id }); };
+      bDel.onclick = function () { act({ action: 'delete', id: v.id }, 'invite deleted'); };
       bar.appendChild(bCopy); bar.appendChild(bRev); bar.appendChild(bDel);
       box.appendChild(row); box.appendChild(bar);
     });
@@ -15135,7 +15950,7 @@ function bustAvatarPreview() {
 async function saveAvatarCard() {
   const f = document.getElementById('avatarFile').files[0];
   if (!f) { avatarStatus('Pick an image first', false); return; }
-  if (f.size > 1048576) { avatarStatus('1 MB max', false); return; }
+  if (f.size > 10 * 1048576) { avatarStatus('10 MB max', false); return; }
   let dataUrl = null;
   try {
     dataUrl = await new Promise((res, rej) => {
@@ -15249,13 +16064,13 @@ document.getElementById('tzSaveBtn').onclick = async () => {
   } catch (e) { st.textContent = '\u2717 network'; }
 };
 loadTasks();
-loadSettings(); loadMemory(); loadSession(); loadApprovals(); loadSysPrompt(); loadTier0(); loadUserRoles(); loadToolsCard(); loadTlsCard(); loadCompactionCard(); loadAvatarCard(); loadVault(); loadInvites();
+loadSettings(); loadMemory(); loadSkills(); loadSession(); loadApprovals(); loadSysPrompt(); loadTier0(); loadUserRoles(); loadToolsCard(); loadTlsCard(); loadCompactionCard(); loadAvatarCard(); loadVault(); loadInvites(); loadStatus(); setInterval(loadStatus, 30000); loadModels(); initSections();
 </script>
 </body>
 </html>
 """
 
-MANIFEST_WEB = """{"id": "/mara/", "name": "Mara", "short_name": "Mara", "description": "Mara's home on the rock - chat, memory, and the whole house's tools.", "start_url": "/mara/", "scope": "/mara/", "display": "standalone", "orientation": "portrait", "background_color": "#05070d", "theme_color": "#05070d", "icons": [{"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "any"}, {"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"}]}"""
+MANIFEST_WEB = """{"id": "/mara/", "name": "Mara", "short_name": "Mara", "description": "Mara's home on the rock - chat, memory, and the whole house's tools.", "start_url": "/mara/", "scope": "/mara/", "display": "standalone", "orientation": "any", "background_color": "#05070d", "theme_color": "#05070d", "icons": [{"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "any"}, {"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"}]}"""
 
 SERVICE_WORKER = """/* Mara PWA service worker — app-shell cache, API never cached.
    Mara | Auth: K80 | 2026-09-15 (P3.1) */
@@ -15497,6 +16312,14 @@ class MaraHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+
+    def version_string(self):
+        # B-12: never advertise the interpreter. The stock banner reads
+        # "BaseHTTP/0.6 Python/3.x.y" on EVERY response - send_response and
+        # the stock 501 for unimplemented methods (HEAD, PUT, ...) both call
+        # this one hook. A free stack fingerprint on a public surface; the
+        # house standard is neutral bytes. Product name only, no version.
+        return "CAIRN"
 
     def end_headers(self):
         # P1-B (audit): nosniff everywhere. Uploads are served from this
@@ -15879,6 +16702,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 "v1_token_len": len(_v1tok),
                 "v1_token_weak": bool(_v1tok) and len(_v1tok) < 32,
                 "model_custom": get_setting("model_custom", "", u["username"]) or "",
+                "saved_models": _saved_models(u["username"]),  # B-21: ids only, never keys
                 "custom_instructions": get_setting("custom_instructions", "", u["username"]) or "",
                 # S4f8: tool toggles (this tier's tool universe + this
                 # user's disabled set - remove-only, never grants) and tool
@@ -15921,7 +16745,22 @@ class MaraHandler(BaseHTTPRequestHandler):
                               "microsoft": ms_connection_status(u["username"]),
                               "github": github_connection_status(u["username"]),
                               "homeassistant": ha_connection_status(u["username"]),
-                              "opnsense": opnsense_connection_status(u["username"])},
+                              "opnsense": opnsense_connection_status(u["username"]),
+                              # B-18: Nextcloud joins the presence census (names
+                              # and booleans only, same contract as the others)
+                              # plus the values the settings card pre-fills - all
+                              # the caller's OWN non-secret settings.
+                              "nextcloud": {"url_set": bool((get_setting("nc_url", "", u["username"]) or "").strip()),
+                                            "user_set": bool((get_setting("nc_user", "", u["username"]) or "").strip()),
+                                            "apppw_sealed": _vault_peek_exists(u["username"], NC_APPPW_NAME)},
+                              "oauth_redirect_uri": _google_redirect_uri(),
+                              "config": {"nc_url": get_setting("nc_url", "", u["username"]) or "",
+                                         "nc_user": get_setting("nc_user", "", u["username"]) or "",
+                                         "ha_url": get_setting("ha_url", "", u["username"]) or "",
+                                         "opnsense_url": get_setting("opnsense_url", "", u["username"]) or "",
+                                         "opnsense_key": get_setting("opnsense_key", "", u["username"]) or "",
+                                         "google_client_id": get_setting("google_client_id", "", u["username"]) or "",
+                                         "ms_client_id": get_setting("ms_client_id", "", u["username"]) or ""}},
                 "logs": _logs_status_dict(u["username"]),
                 "context_budget": ctx_budget(u["username"]),
                 # S4f2: est. size of what the prompt actually ships (seed +
@@ -16174,6 +17013,27 @@ class MaraHandler(BaseHTTPRequestHandler):
                 self._json(200, {"name": fname, "content": fpath.read_text()[:50000]})
             else:
                 self._json(404, {"error": "not found"})
+        elif path == "/api/skills":
+            # B-15: list MY skills + which are selected. No share gate needed:
+            # the namespace helper scopes everything to the caller.
+            u = self._need_user()
+            if not u:
+                return
+            sel = _skills_selected(u["username"])
+            files = _skills_list(u["username"])
+            names = set(f["name"] for f in files)
+            sel = files if sel is None else [n for n in sel if n in names]
+            self._json(200, {"files": files, "selected": sel})
+        elif path.startswith("/api/skills/"):
+            u = self._need_user()
+            if not u:
+                return
+            fname = urllib.parse.unquote(path[len("/api/skills/"):])
+            fpath = _skill_file_path(fname, u["username"])
+            if fpath is not None and fpath.exists():
+                self._json(200, {"name": fname, "content": fpath.read_text()[:64000]})
+            else:
+                self._json(404, {"error": "not found"})
         elif path == "/manifest.webmanifest":
             # T-A6: PWA identity is per-base - an installed /alice/ clone must
             # not collide with the same box's /bob/ one.
@@ -16360,7 +17220,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._json(503, {"error": "vault crypto library unavailable"})
             return False
         if _vault_master_key() is None:
-            self._json(503, {"error": "vault key not staged (the key server unreachable? check the vault key staging service)"})
+            self._json(503, {"error": "vault key not staged (stage the master key file at VAULT_KEY_PATH)"})
             return False
         return True
 
@@ -16457,6 +17317,79 @@ class MaraHandler(BaseHTTPRequestHandler):
             n = cur.rowcount
         self._json(200, {"deleted": n})
 
+    def _handle_skills_post(self):
+        # B-15: save / delete / select / deselect skills in MY OWN namespace.
+        # Same namespace discipline as memory (R7a): the caller-verified
+        # principal owns the directory; request text never picks a namespace.
+        u = self._need_user()
+        if not u:
+            return
+        try:
+            body = self._read_body()
+            if body is None:
+                return
+            body = json.loads(body)
+        except Exception:
+            self._json(400, {"error": "invalid JSON body"})
+            return
+        if not isinstance(body, dict):
+            self._json(400, {"error": "JSON body must be an object"})
+            return
+        who = u["username"]
+        act = str(body.get("action") or "save")
+        try:
+            if act == "select":
+                allnames = set(f["name"] for f in _skills_list(who))
+                want = body.get("selected")
+                if not isinstance(want, list):
+                    self._json(400, {"error": "selected must be a list of skill file names"})
+                    return
+                chosen = [str(x) for x in want if str(x) in allnames]  # foreign/ghost names dropped
+                _skills_set_selected(who, chosen)
+                reload_identity()
+                self._json(200, {"ok": True, "selected": sorted(chosen)})
+                return
+            name = str(body.get("name") or "").strip()
+            p = _skill_file_path(name, who)
+            if not p:
+                self._json(400, {"error": "invalid skill file name (basename only, must end in .md)"})
+                return
+            if act == "delete":
+                if not p.exists():
+                    self._json(404, {"error": "not found"})
+                    return
+                with _SKILLS_LOCK:
+                    p.unlink()
+                sel = _skills_selected(who)
+                if sel is not None and name in sel:
+                    _skills_set_selected(who, [n for n in sel if n != name])
+                reload_identity()
+                self._json(200, {"ok": True, "deleted": name})
+                return
+            if body.get("content") is None:
+                self._json(400, {"error": "provide content (or action: delete / select)"})
+                return
+            content = str(body["content"])
+            size = len(content.encode("utf-8"))
+            if size > SKILL_FILE_CAP:
+                self._json(400, {"error": "skill files are capped at %d bytes (got %d) - trim and retry" % (SKILL_FILE_CAP, size)})
+                return
+            existed = p.exists()
+            with _SKILLS_LOCK:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.parent.chmod(0o700)
+                p.write_text(content)
+                p.chmod(0o600)
+            sel = _skills_selected(who)
+            sel = [f["name"] for f in _skills_list(who)] if sel is None else sel
+            if not existed:
+                sel.append(name)  # a brand-new skill starts enabled
+            _skills_set_selected(who, sel)
+            reload_identity()
+            self._json(200, {"ok": True, "name": name, "size": size})
+        except Exception as e:
+            log.exception("B-15: skills POST failed")
+            self._json(500, {"error": "skill operation failed: %s" % e})
     def _handle_memory_post(self):
         u = self._need_user()
         if not u:
@@ -16585,6 +17518,8 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._handle_conv_delete(path[len("/api/conversations/"):-len("/delete")])
         elif path == "/api/memory":
             self._handle_memory_post()
+        elif path == "/api/skills":
+            self._handle_skills_post()
         elif path == "/api/vault":
             self._handle_vault_post()
         elif path == "/api/vault/delete":
@@ -16648,6 +17583,19 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._handle_avatar_reset()
         elif path == "/api/import":
             self._handle_import()
+        elif path == "/api/connectors/ms/start":
+            # B-18: the settings card's "start device flow" button drives the
+            # SAME engine as the ms_connect chat tool. The display string is
+            # the one-time user code + Microsoft's verification URL; nothing
+            # secret rides it (the device_code stays in the flow entry).
+            u = self._need_user()
+            if not u:
+                return
+            msg, err = ms_start_device_flow(u["username"])
+            if err:
+                self._json(400, {"error": err})
+                return
+            self._json(200, {"ok": True, "display": msg})
         elif path == "/api/settings":
             u = self._need_user()
             if not u:
@@ -16688,7 +17636,16 @@ class MaraHandler(BaseHTTPRequestHandler):
                 if not _instance_access(u, _instance_principal()):
                     self._json(403, {"error": "forbidden - not your instance (the owner's instance is owner-only)"})
                     return
-            for k in ["model", "theme"]:
+            # B-22: theme is a closed set. The picker is a <select> but the
+            # POST is a public door; an unvalidated string must not reach the
+            # settings table (it lands in data-theme via the user's own echo
+            # on every page). Unknown values normalize to neon rather than
+            # 400, so a stale client can never wedge an unrelated save.
+            THEME_IDS = ("neon", "den", "ember", "goblin", "oled",
+                         "miku", "cyberpunk", "dendra", "paper", "moon")
+            if "theme" in body:
+                muts.append(("theme", body["theme"] if body["theme"] in THEME_IDS else "neon", u["username"]))
+            for k in ["model"]:
                 if k in body:
                     muts.append((k, body[k], u["username"]))
             # F16: per-user auto-title toggle, normalized to on/off (only a
@@ -16807,7 +17764,9 @@ class MaraHandler(BaseHTTPRequestHandler):
             # the vault (never stored as settings, never echoed); empty value
             # clears the vault entry. URL/key settings are not secrets.
             for _ckind, _ckey in (("github", "github_token"), ("ha", "ha_token"),
-                                  ("opnsense", "opnsense_secret")):
+                                  ("opnsense", "opnsense_secret"),
+                                  ("nc", "nc_app_password"),
+                                  ("googsecret", "google_client_secret")):
                 if _ckey in body:
                     # T-V23: sealing is a WRITE - stage it. The apply block
                     # runs seals BEFORE the settings transaction, so the
@@ -16826,6 +17785,33 @@ class MaraHandler(BaseHTTPRequestHandler):
                         return
                     v = _cv
                 muts.append(("ha_url", v, u["username"]))
+            if "nc_url" in body:
+                v = str(body["nc_url"] or "").strip()
+                if v:
+                    _cv, _err = _cst_url_ok(v, "nc_url")
+                    if _err:
+                        self._json(400, {"error": _err})
+                        return
+                    v = _cv
+                muts.append(("nc_url", v, u["username"]))
+            if "nc_user" in body:
+                # B-18: this value lands inside the WebDAV path, so no
+                # spaces, slashes, or control characters - one plain token.
+                v = str(body["nc_user"] or "").strip()
+                if v and (len(v) > 128 or not re.fullmatch(r"[A-Za-z0-9._@\'\-\u00a1-\uffff]+", v)):
+                    self._json(400, {"error": "nc_user looks malformed (expected the Nextcloud username: no spaces or slashes)"})
+                    return
+                muts.append(("nc_user", v, u["username"]))
+            if "saved_models" in body:
+                # B-21: full-list replacement. muts are applied AFTER every
+                # validation pass, so this 400 aborts the whole write
+                # (all-or-nothing, same contract as the B-18 connector fields).
+                _raw = body["saved_models"]
+                _sm, _smerr = _saved_models_parse(_raw if isinstance(_raw, str) else json.dumps(_raw))
+                if _smerr:
+                    self._json(400, {"error": _smerr})
+                    return
+                muts.append(("saved_models", json.dumps(_sm), u["username"]))
             if "opnsense_url" in body:
                 v = str(body["opnsense_url"] or "").strip()
                 if v:
@@ -18650,7 +19636,7 @@ class MaraHandler(BaseHTTPRequestHandler):
         except ValueError:
             length = 0
         if length > AVATAR_BODY_MAX:
-            self._json(413, {"error": "avatar too large (1 MB image cap)"})
+            self._json(413, {"error": "avatar too large (10 MB image cap)"})
             return
         try:
             body = self._read_body()
@@ -18669,7 +19655,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "image must be base64-encoded bytes"})
             return
         if not (1 <= len(raw) <= AVATAR_MAX):
-            self._json(400, {"error": "avatar must be 1 byte - 1 MB after decode"})
+            self._json(400, {"error": "avatar must be 1 byte - 10 MB after decode"})
             return
         ext = _avatar_ext(raw)
         if ext is None:
@@ -18725,22 +19711,47 @@ class MaraHandler(BaseHTTPRequestHandler):
         if not fpath.is_file():
             self._json(404, {"error": "file missing on disk"})
             return
-        body = fpath.read_bytes()
-        # P1-C/F4 (round-2 audit): inline is earned by MAGIC BYTES, not by a
-        # stored client declaration. Raster only - everything else (including
-        # any svg stored before this fix) downloads as a dumb octet-stream
-        # file. nosniff can only enforce the declared type; here WE pick the
-        # type from the bytes.
-        _snip = _avatar_ext(body[:32])
-        _sniff_mime = {"png": "image/png", "jpg": "image/jpeg",
-                       "gif": "image/gif", "webp": "image/webp"}.get(_snip)
-        self.send_response(200)
-        self.send_header("Content-Type", _sniff_mime or "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
-        disp = "inline" if _sniff_mime else "attachment"
-        self.send_header("Content-Disposition", '%s; filename="%s"' % (disp, _cd_filename(row[1])))  # P1-E/J: THE live sink (name is data-derived)
-        self.end_headers()
-        self.wfile.write(body)
+        # V20/T-B21 (0.6x): streamed. This used to read_bytes() the whole
+        # file into RAM. Now opened once with O_RDONLY|O_NOFOLLOW (a
+        # symlinked stored_name is a 404, same posture as upload
+        # hardening), Content-Length from fstat (never the DB row - sizes
+        # drift), magic sniffed from the first 32 bytes, then rewound and
+        # served in 64KB chunks. P1-C/F4 still rules: inline is earned by
+        # MAGIC BYTES, raster only - everything else downloads as a dumb
+        # octet-stream file. nosniff can only enforce the declared type;
+        # here WE pick the type from the bytes.
+        try:
+            _fd = os.open(str(fpath), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            self._json(404, {"error": "file missing on disk"})
+            return
+        try:
+            with os.fdopen(_fd, "rb") as _f:
+                _fd = -1
+                _size = os.fstat(_f.fileno()).st_size
+                _snip = _avatar_ext(_f.read(32))
+                _sniff_mime = {"png": "image/png", "jpg": "image/jpeg",
+                               "gif": "image/gif", "webp": "image/webp"}.get(_snip)
+                self.send_response(200)
+                self.send_header("Content-Type", _sniff_mime or "application/octet-stream")
+                self.send_header("Content-Length", str(_size))
+                disp = "inline" if _sniff_mime else "attachment"
+                self.send_header("Content-Disposition", '%s; filename="%s"' % (disp, _cd_filename(row[1])))  # P1-E/J: THE live sink (name is data-derived)
+                self.end_headers()
+                _f.seek(0)
+                while True:
+                    _b = _f.read(65536)
+                    if not _b:
+                        break
+                    self.wfile.write(_b)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client walked off mid-download; not a server fault
+        finally:
+            if _fd != -1:
+                try:
+                    os.close(_fd)
+                except OSError:
+                    pass
 
     # ─── S4f7: full account export + archive import ───────────────────────────
     def _handle_export_all(self):
@@ -20351,8 +21362,21 @@ HELP_BODIES["shares"] = """
 <p>When the memory box is on, a clone writes to <b>its own private memory</b>. Nothing is ever copied into your memory automatically. The <b>Memories</b> button on the Shares page lists what a clone has learned; reading it there is review-only, and merging a file back into your own memory is deliberate, per-file, and marked with its provenance - "learned during a share, not lived experience." The include-memories box at creation copies your memory files into that clone's namespace as a starting point; after that the copies diverge and your originals are never touched by anything the clone does. The clone's memory is layered while it runs: each guest visit files into its own private partition while the history box is off, and a single shared room applies while it is on. Switch history back off and the room stays readable to every guest, read-only - it simply stops taking notes, because new facts then land in the per-visit partitions. The Memories review lists every layer, and merging a visit file back names it with its visit so you always know where a fact came from.</p><h2>Deleting</h2>
 <p>Disabling closes the door instantly (sessions die mid-conversation). Deleting removes the share, its conversations, and anything its private memory learned. Neither can be undone, and neither ever touches your own data.</p>
 """
-_HELP_TITLE.update({"shares": "Share clones"})
+HELP_BODIES["skills"] = """<p><b>Skills are saved instruction files</b> - plain Markdown that lives on THIS instance, in your own private folder, under the same owner-only file permissions as your memory files. Nothing here is fetched from anywhere; a skill is bytes you wrote (or imported), stored on your disk, and shown to the model only when you tick it.</p>
+<h2>What selecting a skill actually does</h2>
+<p>Every skill you have ticked is appended to your <b>system prompt</b> - the standing briefing the model reads before every reply in your conversations. Framed as <code>=== SKILLS ===</code> / <code>=== SKILL FILE: name.md ===</code> so the model knows whose instructions it is following. Untick a skill and it is gone from the prompt on your very next request.</p>
+<h2>The honest cost</h2>
+<p>Selected skills ride <b>every request</b>. A 10KB skill set is roughly 2,500 tokens spent on instructions before your message is even read - less room for conversation, and older history reaches compaction sooner. One topic per file, short and sharp. Files are capped at 64KB each; the daemon logs when your selected total passes 48KB.</p>
+<h2>Skills vs memory files</h2>
+<p>Memory is what the agent <b>knows</b>; skills are how you want it to <b>behave</b>. Both are per-account .md files, both ship in the prompt, both stay on this instance. If a fact changes, edit memory. If a habit should change, edit a skill.</p>
+<h2>Who can see them</h2>
+<p>Only you. Each account has its own skills folder; nobody lists, reads, or selects anyone else's - same namespace fence as memory. Share clones see <b>no</b> skills: their briefing is the seed-memory layer you chose when creating the share. If a clone should follow a skill, merge the file into that clone's memory deliberately.</p>
+<h2>Fail-closed by design</h2>
+<p>A corrupt selection file selects nothing - inert bytes must never steer the model by accident. Deleting a skill removes it from your selection in the same breath. There is no cloud sync here and no telemetry: the file list, the selection, and the contents never leave this machine except inside chat requests to the model provider you configured.</p>
+"""
+_HELP_TITLE.update({"shares": "Share clones", "skills": "Skills"})
 HELP_INDEX.append(("shares", "Share clones", "what a share link is, what a guest can do, grants, the approval inbox, and the one-minute presence switch"))
+HELP_INDEX.append(("skills", "Skills", "saved instruction files that ship with your prompt - what they are and what they cost"))
 HELP_BODIES["tls"] = """<p>This daemon speaks <b>plain HTTP to itself</b> and lets <b>you</b> decide where encryption lives. Three modes, chosen in <b>Settings &rsaquo; TLS</b> - owner only, because the transport belongs to the owner. The daemon never requests certificates from the internet by itself: there is no built-in ACME client, on purpose (last section explains why).</p>
 <h2>The three modes</h2>
 <table>
@@ -20704,6 +21728,7 @@ def main():
     if "--reset-password" in sys.argv[1:]:  # T-B15 (R9 B15): locked-out recovery
         sys.exit(_cli_reset_password(sys.argv[1:]))
     _p1i_file_mode_sweep()   # P1-I/S09/S20: state 0700, DBs 0600, uploads 0600
+    _export_tmp_sweep()      # V20/T-B21: reap export temps from crashed builds
     _f26_seed_tier_files()   # F26: seed lore-free Tier-1 base where absent (no-op on CAIRN)
     _sp_history_migrate()    # T-A1 (0.6w): archive pre-buckets flat history entries (once)
     reload_identity()
