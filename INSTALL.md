@@ -40,12 +40,25 @@ at the same fact from inside the box, independent of this repo.
 
 ## 3. First boot
 ```bash
+mkdir -p ~/cairn
+export MARA_HOME="$HOME/cairn/mh"        # state tree (defaults below need root)
+export MARA_REGISTRY="$HOME/cairn/reg.db" # account registry
 python3 marahome.py            # listens on 127.0.0.1:8470 (loopback only)
 ```
+> The default locations (`/var/lib/cairn`, `/var/lib/mara/users.db`) assume a
+> system-service install. Running as a regular user without those two exports
+> fails on first boot while creating them — point both at writable paths, or
+> run as root.
 Open **http://localhost:8470 on the machine itself** (or behind any TLS you
 control — see README about the Secure-cookie rule) and follow the wizard:
 you will be asked to read and accept what an AI with local tools can do,
 create the owner account, and connect a model.
+> **Setup token:** on a loopback bind (the default above) the wizard needs no
+> token. If you bind the daemon to a non-loopback address *before* an owner
+> account exists, the daemon prints a one-use setup token at first boot
+> (`SETUP TOKEN (first boot, one use)` in the console/journal) and the wizard
+> demands `/setup?t=<token>` — so whoever is on your LAN cannot claim the box
+> before you do.
 
 State lives under `$MARA_HOME/state/` (default `/var/lib/cairn/state/`); the
 account registry is `$MARA_REGISTRY` (default `/var/lib/mara/users.db`). Back it
