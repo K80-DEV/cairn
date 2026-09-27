@@ -15,10 +15,14 @@ attested by the signed manifest that shipped with it
 (`updates/manifest.json` at that tag):
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.6w/updates/0.6w/marahome.py
+curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.6x/updates/0.6x/marahome.py
 sha256sum marahome.py
-# expected: 837406e0f0a012dee5dc8837963601a3a493047442d404202b342870cab6d9a7 (1077504 bytes)
+# expected: 4eaa0f9f4da38039c3ce32092ba84efed77c9eed0bc33d7e9085cfac0a7d26ab (1180897 bytes)
 ```
+
+> **ALPHA build:** automatic update from older builds is not supported. If you run
+> an earlier build, please update manually (download and swap) after taking a
+> backup.
 
 The manifest itself is Ed25519-signed; the daemon verifies signatures against
 a key pinned inside the code, which catches a tampered manifest. The pin ships

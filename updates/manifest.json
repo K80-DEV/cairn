@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-26T15:13:17Z",
-  "version": "0.6w",
+  "released_utc": "2026-09-27T18:34:40Z",
+  "version": "0.6x",
   "min_allowed_version": "0.6",
-  "nonce": 14,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6w/",
+  "nonce": 15,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6x/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "837406e0f0a012dee5dc8837963601a3a493047442d404202b342870cab6d9a7",
-      "bytes": 1077504
+      "sha256": "4eaa0f9f4da38039c3ce32092ba84efed77c9eed0bc33d7e9085cfac0a7d26ab",
+      "bytes": 1180897
     }
   ],
-  "notes": "v0.6w // BASALT // GHOSTLIGHT (ALPHA): broad hardening pass across the daemon. Per-target system-prompt history buckets; credential-approval previews now show the full frozen canonical request and refuse what cannot be displayed; TLS listeners accept per-connection with a bounded handshake so an idle socket can no longer stall the door; UI base is prefix-agnostic (own slug or none, foreign prefixes 404); community installs activate residents in-daemon; uploads are claimed, quota-charged and stamped before any file write; imports dedupe repeated attachments, charge per reference, and publish in one transaction with rollback; backups can no longer export containers their own verifier refuses, and CLI restore now stages a whole tree and swaps it atomically (replace finally means replace); updater swaps journal first, advance anti-rollback state only after a verified swap, and boot reconciles or discards honestly; update snapshots redact secret settings; revocation is enforced mid-turn; guest identity carries an early conversation announcement, a SQL-scoped list with an index, and no guest id in responses; approval decide+grant is one transaction; first boot welds until an active owner exists with a one-time setup token when bound beyond loopback; per-guest memory layers stay private while share history is off; guests can only demolish their own threads; the log catalog is complete and loud about unknown codes; v1 tokens enforce length with per-IP failure buckets; header-read deadlines and a per-IP concurrency cap blunt slow clients; pinned connections follow resolver order through vetted answers; responses carry X-Frame-Options, CSP frame-ancestors, Referrer-Policy and no-store on /api; local CA gets nameConstraints; passwords get self-service change, owner reset, and a CLI recovery door; and each share can now opt guests out of the sharer's constitution and persona projection independently. Evidence: 40-check regression bed green on these exact bytes, 13-block JS syntax gate, manifest round-trip through the shipped validator with teeth-tested negative controls. Alpha: further hardening is in progress; expect continued fixes before 0.7. Nonce 14.",
-  "sig": "rCgbJnRzIU2bZz8ZeMoqcraHad8MCKF9IQE/7eLmxENjrf/Rk3N7CCkm00xPnqwuKBJZzQuThEl5M/xL/hKZDg=="
+  "notes": "v0.6x // BASALT // GHOSTLIGHT (ALPHA): a usability and feature pass, phone-first. Settings gained a slide-over section drawer and a persistent compact header holding the menu, Back to chat, and Help. A new Skills surface manages per-resident instruction files with fail-closed selection. The Connectors card now configures Nextcloud, Google, Microsoft 365, GitHub, Home Assistant, and OPNsense from Settings with write-only secret fields. Model selection gained saved shortcuts, one-tap chips, and type-to-find across the full provider catalog in every model picker, with search served from a bounded server-side cache instead of shipping whole catalogs to the browser. Four new themes (miku, cyberpunk, dendra, moon) join the roster and the theme setting now accepts a closed set only. The mobile pass fixed narrow attachment bubbles, soft-keyboard chat clipping, wrapping flex rows, themed textareas and file buttons, and a phone-clean shares and setup wizard; keyboard focus is visible on every wizard step. Invites render human-readable meta and clear their code on delete. The response banner no longer discloses stack versions. Exports use private temps, sweep orphans at boot, chunk large queries, stream attachments, and honor an explicit size ceiling. Help and settings copy now match shipped behavior, including honest cookie and transport text. Evidence: 68-check regression bed green on these exact bytes, JS syntax gate 13 blocks, GUI pass at phone and desk widths with zero page errors, manifest round-trip through the shipped validator with teeth-tested negative controls. ALPHA build: automatic update from older builds is not supported. If you run an earlier build, please update manually (download and swap) after taking a backup. Alpha: further hardening is in progress; expect continued fixes before 0.7. Nonce 15.",
+  "sig": "JvD2Z1PYrBJBIEVBMjyndE3zNy/FTCvaORsLWh3WaawKqKJTRRoOtXUENigU487qbvqpVYPF79ZnMDa3MVeuAA=="
 }
