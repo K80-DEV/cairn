@@ -8381,8 +8381,8 @@ HELP_BODIES = {
 """,
 "glossary": """
 <dl>
-<dt>CAIRN</dt><dd>This VM: the box your Mara agent instance runs on. Self-hosted, encrypted at rest where it matters.</dd>
-<dt>Instance</dt><dd>Your Mara - conversations, settings, vault, memory - isolated per account. Other accounts cannot see yours; that's enforced by construction, not by politeness.</dd>
+<dt>CAIRN</dt><dd>This VM: the box your agent instance runs on. Self-hosted, encrypted at rest where it matters.</dd>
+<dt>Instance</dt><dd>Your agent - conversations, settings, vault, memory - isolated per account. Other accounts cannot see yours; that's enforced by construction, not by politeness.</dd>
 <dt>Door / slug</dt><dd>The web address an account signs in at. A door belongs to exactly one account; strangers get the landing page.</dd>
 <dt>Principal</dt><dd>Fancy word for "who an action is attributed to": a named account, or the owner/operator. Every stored thing and every tool call knows its principal.</dd>
 <dt>Tier</dt><dd>What a principal may command: <code>user</code> gets chat and their own settings; connector and credential-shell tools are owner/admin only.</dd>
@@ -8488,12 +8488,21 @@ def _help_body_index(u):
 
 
 def _help_page(slug, title, body, u=None):  # F19: u None = anon visitor, build stamp hidden
+    # dynbrand (K80 2026-09-28): help pages carry the agent's registry name when a
+    # session exists; anonymous readers see the product name, never a borrowed persona.
+    _bn = ''
+    try:
+        if u:
+            _bn = u["agent_name"] or ''
+    except (IndexError, KeyError, TypeError):
+        _bn = ''
+    _bn = _bn or 'C.A.I.R.N.'
     return ('<!DOCTYPE html>\n<html lang="en" data-theme="neon">\n<head>\n<meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
-            '<base href="/mara/">\n<title>Mara // Help - ' + html_mod.escape(title) + '</title>\n'
+            '<base href="/mara/">\n<title>' + html_mod.escape(_bn) + ' // Help - ' + html_mod.escape(title) + '</title>\n'
             '<script>try{document.documentElement.dataset.theme=localStorage.getItem("mara-theme")||"neon";}catch(e){}</script>\n'
             + HELP_CSS + '\n</head>\n<body>\n<div class="wrap">\n'
-            '<div class="top"><a class="brand" href="."><b>Mara</b><span class="slash">//</span>Help</a>'
+            '<div class="top"><a class="brand" href="."><b>' + html_mod.escape(_bn) + '</b><span class="slash">//</span>Help</a>'
             '<nav><a href=".">Chat</a><a href="settings">Settings</a><a href="help">Index</a></nav></div>\n'
             + '<h1>' + html_mod.escape(title) + '</h1>\n' + body +
             '\n<p class="foot">mara-home' + (' v' + VERSION if u else '') + ' // ' + BUILD_SERIES + ' // ' + BUILD_NAME +
@@ -8886,7 +8895,7 @@ var host = (location.hostname || "").toLowerCase();
     <div><label>Username</label><input id="uname" autocomplete="username" maxlength="32"></div>
     <div><label>Your display name (optional)</label><input id="dname" maxlength="64" placeholder="defaults to username"></div>
   </div>
-  <label>Agent name (what you will call this Mara)</label><input id="aname" maxlength="32" value="mara">
+  <label>Agent name (what you will call your agent)</label><input id="aname" maxlength="32" value="mara">
   <label>Password (minimum 14 characters)</label><input id="pw1" type="password" autocomplete="new-password">
   <label>Confirm password</label><input id="pw2" type="password" autocomplete="new-password">
   <p class="note">The agent name also becomes this account's door slug (lowercased, hyphenated). Everything else about account lifecycle - signups, approvals, tiers - lives in Settings after the wizard closes.</p>
@@ -8895,7 +8904,7 @@ var host = (location.hostname || "").toLowerCase();
 </div>
 
 <div class="card hidden" id="s3">
-  <p style="margin-top:0">Give your Mara a brain. The daemon talks OpenAI-compatible APIs and takes <b>your key</b> (BYOK) - prompts and memory descriptions travel to the endpoint you name, nowhere else. You can change all of this later in Settings; skipping is allowed.</p>
+  <p style="margin-top:0">Give your new agent a brain. The daemon talks OpenAI-compatible APIs and takes <b>your key</b> (BYOK) - prompts and memory descriptions travel to the endpoint you name, nowhere else. You can change all of this later in Settings; skipping is allowed.</p>
   <label>Provider</label>
   <select id="prov">__PROVIDERS__</select>
   <div id="customwrap" class="hidden">
@@ -12522,7 +12531,7 @@ WEB_UI_CHAT = """<!DOCTYPE html>
 <meta name="theme-color" id="themeColor" content="#05070d">
 <base href="/mara/">
 <script>try{document.documentElement.dataset.theme=localStorage.getItem('mara-theme')||'neon';}catch(e){}</script>
-<title>Mara</title>
+<title>C.A.I.R.N.</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="static/color.png">
 <meta name="mobile-web-app-capable" content="yes">
@@ -12766,6 +12775,16 @@ const menuBtn = $('menuBtn'), drawer = $('drawer'), backdrop = $('backdrop');
 const convList = $('convList'), newChatBtn = $('newChatBtn');
 const chatArea = $('chatArea'), chatCol = $('chatCol'), emptyState = $('emptyState');
 const msgInput = $('msgInput'), sendBtn = $('sendBtn');
+// dynbrand (K80 2026-09-28): the brand is the registry agent_name, not a constant.
+window.AGENT = 'Mara';
+fetch('api/me', {credentials: 'same-origin'}).then(function(r){ return r.json(); }).then(function(j){
+  if (j && j.authenticated && j.agent_name) {
+    window.AGENT = j.agent_name;
+    var _b = document.querySelector('.brand-name'); if (_b) _b.textContent = j.agent_name;
+    document.title = j.agent_name;
+    msgInput.setAttribute('placeholder', 'Message ' + j.agent_name + '…');
+  }
+}).catch(function(){});
 // F21: per-chat provider/model switcher (K80 2026-09-23). Overrides live
 // server-side per conversation; keys NEVER ride here - only provider ids
 // and model ids. A provider without your key behaves exactly like the
@@ -13476,7 +13495,7 @@ function send() {
       });
       if (resp.status === 409) {
         udiv.remove();
-        flashNote('Mara is still working on the previous message — showing live.');
+        flashNote((window.AGENT || 'Mara') + ' is still working on the previous message — showing live.');
         refreshSendFace();
         streaming = false;
         attachStream(conv);
@@ -13793,7 +13812,7 @@ WEB_UI_SETTINGS = """
 <base href="/mara/">
 <script>try{document.documentElement.dataset.theme=localStorage.getItem('mara-theme')||'neon';}catch(e){}</script>
 <link rel="apple-touch-icon" href="static/color.png">
-<title>Mara // Settings</title>
+<title>C.A.I.R.N. // Settings</title>
 <style>
 :root, [data-theme="neon"] { --bg:#05070d; --surface:#0b111c; --border:#1c2b45; --text:#dfe9f5; --dim:#5f7896; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.07); --glow2:rgba(255,45,149,0.05); }
 [data-theme="den"]    { --bg:#1a1a2e; --surface:#16213e; --border:#0f3460; --text:#e0e0e0; --dim:#888; --accent:#e94560; --accent2:#e94560; --glow:rgba(233,69,96,0.07); --glow2:rgba(233,69,96,0.04); }
@@ -14216,6 +14235,12 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     function msg(t){ document.getElementById('f22Msg').textContent = t; }
     function val(id){ return document.getElementById(id).value; }
     fetch('api/me').then(function(r){ return r.json(); }).then(function(j){
+      // dynbrand (K80 2026-09-28): header and tab carry the registry agent name.
+      if (j.authenticated && j.agent_name) {
+        var _sn = document.querySelector('.sbar-title');
+        if (_sn && _sn.firstChild) _sn.firstChild.textContent = j.agent_name;
+        document.title = j.agent_name + ' // Settings';
+      }
       if (j.authenticated && j.role === 'owner') {
         document.getElementById('f22Wrap').style.display = '';
         var _apw = document.getElementById('apWrap');
@@ -17274,7 +17299,22 @@ class MaraHandler(BaseHTTPRequestHandler):
         elif path == "/manifest.webmanifest":
             # T-A6: PWA identity is per-base - an installed /alice/ clone must
             # not collide with the same box's /bob/ one.
-            self._raw(200, MANIFEST_WEB.replace("/mara/", self._ui_base), "application/manifest+json")
+            # dynbrand (K80 2026-09-28): the installed app carries the registry
+            # agent name; an anonymous fetch keeps the product name. Parse/re-dump
+            # so the name can never break the JSON.
+            _mu = self._auth_user()
+            _mn = ''
+            try:
+                if _mu:
+                    _mn = _mu["agent_name"] or ''
+            except (IndexError, KeyError, TypeError):
+                _mn = ''
+            _mmap = json.loads(MANIFEST_WEB.replace("/mara/", self._ui_base))
+            if _mn:
+                _mmap["name"] = _mn
+                _mmap["short_name"] = _mn
+                _mmap["description"] = "Your agent's home - chat, memory, and the whole house's tools."
+            self._raw(200, json.dumps(_mmap), "application/manifest+json")
         elif path == "/sw.js":
             self._raw(200, SERVICE_WORKER, "application/javascript")
         elif path == "/api/export/all":
