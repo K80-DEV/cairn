@@ -8713,7 +8713,7 @@ def _f19_setup_owner(h):
                     # owner predicate - a pending signup row must NOT block the
                     # claim): two racing browsers cannot both mint an owner.
                     db.execute("ROLLBACK")
-                    h._json(403, {"error": "this instance is already initialized - the wizard is closed"})
+                    h._json(403, {"error": "this instance is already initialized - the wizard is closed; the owner account exists, use the login page"})
                     return
                 uid = str(uuid.uuid4())
                 salt = os.urandom(16).hex()
@@ -8952,9 +8952,10 @@ $("b2").onclick=function(){
 $("uname").value.trim(),password:$("pw1").value,display_name:$("dname").value.trim(),agent_name:$("aname").value.trim()}).then(function(r){
     $("b2").disabled=false;
     if(r.code===409&&r.j.reload){e.textContent=r.j.error;return}
+    if(r.code===403&&String(r.j.error||"").indexOf("already initialized")===0){e.className="err ok";e.innerHTML='This instance is already initialized - the owner account exists. If an earlier submit seemed to fail, it very likely <b>worked</b>. <a href=".">Go to the login page and sign in &rarr;</a>';return}
     if(r.code!==200||!r.j.ok){e.textContent=r.j.error||("failed (HTTP "+r.code+")");return}
     owner=r.j.username;$("pw1").value="";$("pw2").value="";step(3);
-  }).catch(function(){ $("b2").disabled=false; e.textContent="network error - the daemon did not answer."; });
+  }).catch(function(){ $("b2").disabled=false; e.textContent="network error - the daemon did not answer. If the account was already created, reopening this page will take you to the login page."; });
 };
 function modelDone(ok,msg){var e=$("e3");e.className="err"+(ok?" ok":"");e.textContent=msg||"";if(ok){setTimeout(function(){walkInit();step("35")},500)}}
 function saveModel(){
