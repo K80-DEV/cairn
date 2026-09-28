@@ -8254,6 +8254,7 @@ HELP_INDEX = [
     ("glossary",    "Glossary",               "the house vocabulary, in plain words"),
     ("tls",         "TLS & Certificates",       "proxy vs local CA vs your own cert: Caddy tls internal, certbot, acme.sh walkthroughs"),
     ("remote",      "Remote access & Firewall", "reaching the box from elsewhere: VPN first, firewall basics, the port-forward warning"),
+    ("v1",         "The v1 Door",              "letting another app talk to your Cairn like it is OpenAI: the token, the walkthrough, the fine print"),
 ]
 _HELP_TITLE = {s: t for s, t, _ in HELP_INDEX}
 
@@ -8399,6 +8400,42 @@ HELP_BODIES = {
 <dt>BYOK</dt><dd>Bring Your Own Key: your model provider account and API key do the answering - see <a href="help/limits">Honest Limits</a> #1.</dd>
 <dt>Data Home</dt><dd>The ladder of choices for where your data lives (local &rarr; encrypted copies in your Nextcloud &rarr; full replica). Its own page has the fine print.</dd>
 </dl>
+""",
+"v1": """
+<p>Your Cairn is not only a website you chat with. At the URL path <code>/v1</code> it also speaks <b>the same API dialect OpenAI invented</b> - so any phone or desktop app with a field labeled "custom OpenAI-compatible endpoint" (or similar) can point at your Cairn and chat through <b>your model, your provider key, your box</b>. That door is what the <b>v1 door token</b> locks.</p>
+<p>Start with the name, because it misleads everyone: <b>"v1" is not a version of anything here.</b> OpenAI's own API paths are literally <code>/v1/chat/completions</code>; Cairn copies that exact shape so client apps recognize it, and the name came along. The token is simply the password for that door.</p>
+<h2>The three keys of the house</h2>
+<table><tr><th>Key</th><th>Who presents it</th><th>To what</th><th>Direction</th></tr>
+<tr><td><b>Provider API key</b></td><td>Your Cairn</td><td>Featherless / OpenAI / etc.</td><td><b>Outbound</b> - "let me use your models"</td></tr>
+<tr><td><b>Login password</b></td><td>You, a human</td><td>The web UI</td><td><b>Inbound</b> - "let me into my house"</td></tr>
+<tr><td><b>v1 door token</b></td><td>Some other app</td><td>The <code>/v1</code> door</td><td><b>Inbound</b> - "let me chat through your Cairn"</td></tr></table>
+<h2>What actually answers when an app knocks</h2>
+<ul>
+<li>The door is exactly one endpoint: <code>POST /v1/chat/completions</code>. It answers with <b>the owner's</b> configured model, provider key and context settings - always the owner's, whoever knocks.</li>
+<li>It is <b>stateless plumbing, not your agent</b>: no memory of your conversations, no tools, no persona. Each call is fresh; if the app sends its own system message, it rides along untouched.</li>
+<li>The app's "model" field is decorative - the door always uses the model you saved in Settings. There is also <b>no model listing</b> on this door (no <code>/v1/models</code>), so if an app insists on fetching a list, type any name into it by hand; it will be ignored in favor of your saved model.</li>
+<li>Your provider key <b>never travels back out</b>. The app gets answers, not your wallet's PIN.</li>
+</ul>
+<h2>Setup walkthrough (owner only)</h2>
+<ol>
+<li>Generate something long and random - a password manager works, or on the box: <code>openssl rand -hex 24</code> (48 characters). The floor is <b>32 printable characters</b>; anything shorter is refused with a plain "no".</li>
+<li>As the <b>owner</b>, open Settings &rarr; <b>Session card</b> &rarr; <b>v1 door token</b>. Paste, save. The field is write-only like every secret here: once set, the server never shows it again - only whether it is set.</li>
+<li>In the app: <b>base URL</b> = your Cairn's address with <code>/v1</code> on the end (direct on the LAN: <code>http://BOX:8470/v1</code>; through your front proxy: the address it serves, plus <code>/v1</code>). <b>API key</b> field = your token. If the app asks for a model name, type your saved model's name (or anything - see above).</li>
+<li>Prove the wire from a terminal: <code>curl -s https://YOUR-CAIRN/v1/chat/completions -H "Authorization: Bearer YOUR-TOKEN" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"ping"}]}'</code> - JSON with an answer back means the door works end to end.</li>
+</ol>
+<h2>What the door says when it will not open</h2>
+<table><tr><th>Answer</th><th>Meaning</th></tr>
+<tr><td><code>401</code></td><td>No token, wrong token, and no logged-in owner session. The door does not explain which.</td></tr>
+<tr><td><code>429</code></td><td>Too many failed token guesses from that network (10/min, self-heals in a minute). A correct token never trips it.</td></tr>
+<tr><td><code>503</code></td><td>The door is open but the brain is off: the owner has no model provider key configured yet.</td></tr>
+<tr><td><code>502</code></td><td>Your provider answered badly. The door worked; the upstream had a day.</td></tr></table>
+<h2>The fine print</h2>
+<div class="card warn">
+<p><b>The token is an owner-level pass.</b> Whatever holds it can make your Cairn answer - on your model account, spending your provider credits, as far as the door is concerned <i>as you</i>. Hand it only to apps that are standing in for you. Treat it like a password, because it is one.</p>
+<p><b>TLS first.</b> A token sent over plain HTTP is a postcard. Get the padlock sorted first - the <a href="help/tls">TLS</a> and <a href="help/remote">Remote access</a> pages cover exactly that.</p>
+<p><b>Rotation and closing.</b> Rotating = paste a new value and save. Saving <b>empty</b> shuts the token door: after that only the owner's own logged-in session passes. And only the <i>owner's</i> token governs - a token set by any other account is dead weight by design.</p>
+</div>
+<p class="foot">One honest summary: this door exists so a pocket client can be pointed at your own box instead of a corporation's. Empty token = nobody but you. That is the correct state for most people, forever.</p>
 """,
 }
 
@@ -14402,7 +14439,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <div class="row" id="v1Row"><label>v1 door token</label>
     <input id="v1_token" type="password" autocomplete="off" oninput="v1KeyTouched = true" placeholder="write-only — bearer token for phone apps">
   </div>
-  <div class="hint" id="v1Hint"><b>Your Cairn's own door key — not a provider key.</b> It is the password YOUR Cairn asks of apps that use <i>it</i> as their model provider (phone apps pointed at your /v1 door). Locks the OpenAI-compatible /v1 door: phone apps must send <i>Authorization: Bearer &#60;this&#62;</i>. Only the owner's token governs; saving empty shuts the token door (the owner's own session still passes). <span id="v1TokenStatus"></span></div>
+  <div class="hint" id="v1Hint"><b>Your Cairn's own door key — not a provider key.</b> It is the password YOUR Cairn asks of apps that use <i>it</i> as their model provider (phone apps pointed at your /v1 door). Locks the OpenAI-compatible /v1 door: phone apps must send <i>Authorization: Bearer &#60;this&#62;</i>. Only the owner's token governs; saving empty shuts the token door (the owner's own session still passes). Full walkthrough: <a href="help/v1" style="color:var(--accent)">Help &rarr; The v1 Door</a>. <span id="v1TokenStatus"></span></div>
   <button class="btn" style="margin-top:10px;margin-right:8px" onclick="doLogout()">Log out</button>
   <button class="btn" style="margin-top:10px;background:var(--accent2)" onclick="doLogoutAll()">Log out all devices</button>
   <div class="status" id="sessStatus"></div>
@@ -20241,7 +20278,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             # with no response at all. Compare bytes; bytes have no opinions.
             self._json(401, {"error": {"message": "Unauthorized: send "
                 "'Authorization: Bearer <v1 token>' (owner sets it in "
-                "Settings > Model) or sign in.", "type": "authentication_error",
+                "Settings > Session) or sign in.", "type": "authentication_error",
                 "code": "invalid_api_key"}})
             return
         body = self._json_object_body()
