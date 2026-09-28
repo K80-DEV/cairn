@@ -14093,6 +14093,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   </div>
   <div class="status" id="searchKeyStatus"></div>
   <div id="searchCustomBox" style="display:none">
+    <div class="hint">Placeholders usable in the fields below: <i>{{query}}</i> = the search words, <i>{{n}}</i> = result count, <i>{{api_key}}</i> = the key you pasted above. Custom (form) = fill these fields; Custom (JSON) = paste one equivalent config object instead. Your search server receives only what you write here.</div>
     <div id="customFormBox" style="display:none">
       <div class="row"><label>URL</label><input id="custom_url" placeholder="https://api.example.com/search?q={{query}}&amp;n={{n}}" style="width:100%"></div>
       <div class="row"><label>Method</label><input id="custom_method" value="GET" style="max-width:90px"></div>
@@ -14123,7 +14124,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     <option value="paper">Paper (light)</option>
     <option value="moon">Moonlit (lavender, light)</option>
   </select></div>
-  <div class="hint">Applies immediately on change and is saved to the rock (settings table) + remembered per-browser (localStorage).</div>
+  <div class="hint">Applies immediately on change and is saved to your account on this instance + remembered per-browser (localStorage).</div>
   <div class="row"><label>Auto-titles</label><label><input type="checkbox" id="title_gen"> Generate a short title after the first reply</label></div>
   <div class="hint">One tiny capped request to your own model, once per new conversation. If it ever hiccups the first-50-chars snippet title stays - nothing breaks. Unchecked = never call for titles.</div>
 </div>
@@ -14131,7 +14132,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
 <div class="card" data-sec="personal">
   <h2>Media generation</h2>
   <div class="row"><label>Image generation</label>
-  <select id="imagegen_mode"><option value="off">Off (agent never sees the tool)</option><option value="current">Current chat provider</option><option value="custom">Custom provider</option></select></div>
+  <select id="imagegen_mode"><option value="off">Off (agent never sees the tool)</option><option value="current">Current chat provider (uses your chat API key)</option><option value="custom">Custom provider</option></select></div>
   <div class="row"><label>Image provider kind</label>
   <select id="imagegen_kind"><option value="openai">OpenAI-compatible (/images/generations)</option><option value="cloudflare">Cloudflare Workers AI</option></select></div>
   <div class="row"><label>Image model</label><input id="imagegen_model" type="text" placeholder="e.g. @cf/black-forest-labs/flux-1-schnell"></div>
@@ -14139,7 +14140,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <div class="row"><label>Image base URL</label><input id="imagegen_base" type="text" placeholder="custom kind only: https://api.example.com/v1"></div>
   <div class="row"><label>Cloudflare account id</label><input id="imagegen_cf_account" type="text" placeholder="32 hex chars (cloudflare kind only)"></div>
   <div class="row"><label>Speech generation (TTS)</label>
-  <select id="audiogen_mode"><option value="off">Off</option><option value="current">Current chat provider</option><option value="custom">Custom provider</option></select></div>
+  <select id="audiogen_mode"><option value="off">Off</option><option value="current">Current chat provider (uses your chat API key)</option><option value="custom">Custom provider</option></select></div>
   <div class="row"><label>Speech model</label><input id="audiogen_model" type="text" placeholder="e.g. gpt-4o-mini-tts"></div>
   <div class="row"><label>Voice</label><input id="audiogen_voice" type="text" placeholder="alloy"></div>
   <div class="row"><label>Audio base URL</label><input id="audiogen_base" type="text" placeholder="custom kind only: https://api.example.com/v1"></div>
@@ -14167,7 +14168,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <input id="f22ExpPw2" type="password" placeholder="repeat password" autocomplete="new-password">
   <label><input id="f22ExpUp" type="checkbox" checked> include uploads</label>
   <button id="f22ExpBtn">Export backup</button>
-  <p class="hint">Verify only reads and checks the file &mdash; it touches nothing. Stage verifies a container and saves it (still encrypted) on this box; it changes NOTHING. Applying a backup is a deliberate maintenance step run from a shell with the daemon STOPPED: <code>python3 marahome.py --import-staged</code> (takes a pre-import snapshot first, asks you to type REPLACE). Exports are built as owner-only (0600) temp files and deleted the moment your download finishes; anything a crashed build leaves behind is swept at next boot. One archive is capped at 512&nbsp;MiB &mdash; very large histories should be backed up with Export backup instead.</p>
+  <p class="hint">Verify only reads and checks the file &mdash; it touches nothing. Stage verifies a container and saves it (still encrypted) on this box; it changes NOTHING. Applying a backup is a deliberate maintenance step run from a shell with the daemon STOPPED: <code>python3 marahome.py --import-staged</code> (takes a pre-import snapshot first, asks you to type REPLACE). Exports are built as owner-only (0600) temp files and deleted the moment your download finishes; anything a crashed build leaves behind is swept at next boot. Uploading a backup here (Verify / Stage) is browser-capped at 128&nbsp;MB; the Export side is not upload-limited - the archive simply downloads, bounded only by disk.</p>
   <input id="f22ImpFile" type="file">
   <input id="f22ImpPw" type="password" placeholder="backup password" autocomplete="off">
   <button id="f22VerBtn">Verify</button>
@@ -14480,7 +14481,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     <label style="display:inline-block;margin-left:12px"><input type="checkbox" id="importRestore"> Also restore settings (safe keys only; every changed key is logged)</label>
     <label style="display:inline-block;margin-left:12px"><input type="checkbox" id="importIdentity"> FULL TRUST: also OVERWRITE my memory files and system prompt from this archive (principal only)</label>
   </div>
-  <div class="hint" id="impStatus">Exports are Agora-compatible (.cairn, format v4) - importable here, in Agora, or between accounts (the name-change escape). Import accepts Cairn/Agora archives, ChatGPT exports, and Claude exports. API keys are never included.</div>
+  <div class="hint" id="impStatus">Exports are Agora-compatible (.cairn, format v4) - importable here, in Agora, or between accounts. Import accepts Cairn/Agora archives, ChatGPT exports, and Claude exports. API keys are never included. Ceilings: one .cairn archive builds up to 512&nbsp;MiB; the import side decodes up to 64&nbsp;MB, so a huge export may not re-import whole in one pass.</div>
 </div>
 
 <div class="card" data-sec="personal">
@@ -14563,7 +14564,7 @@ async function loadSettings() {
     document.getElementById('model_custom').value = s.model_custom || '';
     document.getElementById('context_budget').value = s.context_budget || 262144;
     updateBudgetWarn(s);
-    document.getElementById('modelKeyStatus').textContent = s.model_key_set ? 'API key: set (write-only)' : 'API key: none — no chat until one is pasted';
+    document.getElementById('modelKeyStatus').textContent = s.model_key_set ? 'API key: set (write-only)' : 'API key: none — needed for hosted providers; Ollama / Custom run without one';
     document.getElementById('v1TokenStatus').textContent = s.v1_token_set ? (s.v1_token_weak ? 'v1 token: set (only ' + s.v1_token_len + ' chars - rotate it)' : 'v1 token: set') : 'v1 token: none — /v1 accepts the owner session only';
     onModelProviderChange();
     document.getElementById('custom_instructions').value = s.custom_instructions || '';
