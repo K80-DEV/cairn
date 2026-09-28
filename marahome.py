@@ -13936,10 +13936,6 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     <button class="btn" id="modelClearKeyBtn" onclick="clearModelKey()">clear</button>
   </div>
   <div class="status" id="modelKeyStatus"></div>
-  <div class="row"><label>v1 token</label>
-    <input id="v1_token" type="password" autocomplete="off" oninput="v1KeyTouched = true" placeholder="write-only — /v1 bearer token for phone apps">
-  </div>
-  <div class="hint"><b>This is not a provider key.</b> It is the password YOUR Cairn asks of apps that use <i>it</i> as their model provider (phone apps pointed at your /v1 door). Nothing above changes. Locks the OpenAI-compatible /v1 door: phone apps must send <i>Authorization: Bearer <this></i>. Only the owner's token governs; saving empty shuts the token door (the owner's own session still passes). <span id="v1TokenStatus"></span></div>
   <div class="row"><label>Context window</label><input id="context_budget" type="number" step="8192" min="1" list="ctxList" placeholder="pick or type any value" style="max-width:180px">
   <datalist id="ctxList"><option value="4096"></option><option value="8192"></option><option value="16384"></option><option value="32768"></option><option value="65536"></option><option value="131072"></option><option value="196608"></option><option value="262144"></option><option value="393216"></option><option value="524288"></option><option value="786432"></option><option value="1048576"></option></datalist></div>
   <div class="hint">No floor, no ceiling — pick a common size or type any value (small local models included). <span id="budgetWarn"></span></div>
@@ -13974,13 +13970,15 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <div class="row"><label>Custom instructions</label>
     <textarea id="custom_instructions" rows="5" style="width:100%;max-width:520px" placeholder="Standing directions for your agent (voice, focus, standing rules). Shapes how it works - it can never grant or remove tools."></textarea>
   </div>
-  <p style="font-size:12px;opacity:.6;margin:0">Shown to your agent in every conversation. Saved with the Save button on the Model card. <span id="ciCount" style="opacity:.7"></span></p>
+  <p style="font-size:12px;opacity:.6;margin:0">Shown to your agent in every conversation. <span id="ciCount" style="opacity:.7"></span></p>
+  <div class="row" style="margin-top:8px"><button class="btn" onclick="savePersonaCard()">Save persona</button></div>
+  <div class="status" id="personaStatus"></div>
 </div>
 
 <div class="card" id="tlsCard" data-sec="owner">
   <h2>Connection & TLS</h2>
   <div class="hint" id="tlsBody">Loading connection status&hellip;</div>
-  <div class="hint" style="margin-top:10px">No front-end knowledge needed: leave <b>Proxy</b> selected if Caddy or another reverse proxy already does TLS (the standard install). <b>Local CA</b> makes the daemon serve HTTPS itself using its own certificate authority - you install its small CA certificate on each device once. <b>Existing certificate</b> is for a cert you (or certbot / Caddy tls internal) already obtained. This daemon never requests certificates from the internet by itself (no built-in ACME - on purpose). Walkthroughs: <a href="help/tls" style="color:var(--accent)">Help &rarr; TLS & remote access</a>.</div>
+  <div class="hint" style="margin-top:10px">How your Cairn gets its padlock (HTTPS) - worth having before phone apps or the /v1 door need to reach you from outside the house. <b>Proxy</b> - the usual choice: something in front of Cairn (like Caddy) already handles HTTPS and Cairn just sits behind it. <b>Local CA</b> - Cairn serves HTTPS itself using its own mini certificate authority; you install its small certificate once on each device that connects. <b>Existing certificate</b> - you already have a certificate file (from certbot or Caddy, say) and point Cairn at it. Cairn never asks the internet for certificates by itself - on purpose; getting public padlocks stays the proxy's job. Walkthroughs: <a href="help/tls" style="color:var(--accent)">Help &rarr; TLS & remote access</a>.</div>
 </div>
 <div class="card" data-sec="personal">
   <h2>Agent face</h2>
@@ -14389,6 +14387,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
 
 <div class="card" data-sec="owner">
   <h2>Pending Access</h2>
+  <div class="hint" style="margin-bottom:10px">The front desk. Every new account waits here until <b>you</b> decide - nobody gets in on their own. <b>Approve</b> picks the role (user or admin), provisions their agent, and opens their door. <b>Reject</b> turns them away. This card is the owner's alone; other accounts never see it.</div>
   <div id="approvalList"><div class="status">Loading…</div></div>
   <div id="userRoleBox" style="display:none">
     <div class="hint" style="margin:14px 0 6px">Active users. Changing a role logs that user out of ALL devices (no stale session survives a role change).</div>
@@ -14400,6 +14399,10 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
 <div class="card" data-sec="personal">
   <h2>Session</h2>
   <div class="row"><label>Signed in as</label><span id="whoami" class="mono" style="color:var(--text);text-align:right">…</span></div>
+  <div class="row" id="v1Row"><label>v1 door token</label>
+    <input id="v1_token" type="password" autocomplete="off" oninput="v1KeyTouched = true" placeholder="write-only — bearer token for phone apps">
+  </div>
+  <div class="hint" id="v1Hint"><b>Your Cairn's own door key — not a provider key.</b> It is the password YOUR Cairn asks of apps that use <i>it</i> as their model provider (phone apps pointed at your /v1 door). Locks the OpenAI-compatible /v1 door: phone apps must send <i>Authorization: Bearer &#60;this&#62;</i>. Only the owner's token governs; saving empty shuts the token door (the owner's own session still passes). <span id="v1TokenStatus"></span></div>
   <button class="btn" style="margin-top:10px;margin-right:8px" onclick="doLogout()">Log out</button>
   <button class="btn" style="margin-top:10px;background:var(--accent2)" onclick="doLogoutAll()">Log out all devices</button>
   <div class="status" id="sessStatus"></div>
@@ -14995,6 +14998,26 @@ async function saveToolsCard() {
     setStatus('toolsStatus', 'warn', '✗ Save failed (network)');
   }
 }
+// Structural pass 2026-09-28: persona saves itself (partial POST - the server
+// handler is per-key, same pattern as the tools card). The Model card's Save
+// still sends custom_instructions too; both paths write the same value.
+async function savePersonaCard() {
+  try {
+    const r = await fetch('api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ custom_instructions: document.getElementById('custom_instructions').value })
+    });
+    if (r.ok) {
+      setStatus('personaStatus', 'ok', '✓ Persona saved - applies from the next message.');
+    } else {
+      const d = await r.json().catch(() => ({}));
+      setStatus('personaStatus', 'warn', '✗ ' + (d.error || ('Save failed (HTTP ' + r.status + ')')));
+    }
+  } catch (e) {
+    setStatus('personaStatus', 'warn', '✗ Save failed (network)');
+  }
+}
 
 // S4f7: full account export (.cairn) + import (Cairn/Agora, ChatGPT, Claude).
 async function exportAll() {
@@ -15533,6 +15556,12 @@ async function loadSession() {
     const m = await r.json();
     if (m.authenticated) {
       document.getElementById('whoami').textContent = m.username + (m.role === 'admin' || m.role === 'owner' ? ' (' + m.role + ')' : '');
+      // v1 door token is owner-only server-side (403 on save) - hide the row so nobody trips the trap.
+      if (m.role !== 'owner') {
+        const vr = document.getElementById('v1Row'), vh = document.getElementById('v1Hint');
+        if (vr) vr.style.display = 'none';
+        if (vh) vh.style.display = 'none';
+      }
     }
   } catch (e) {}
 }
