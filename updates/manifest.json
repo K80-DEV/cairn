@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-27T18:34:40Z",
-  "version": "0.6x",
+  "released_utc": "2026-09-28T16:30:28Z",
+  "version": "0.6y",
   "min_allowed_version": "0.6",
-  "nonce": 15,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6x/",
+  "nonce": 16,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6y/",
   "files": [
     {
       "path": "marahome.py",
-      "sha256": "4eaa0f9f4da38039c3ce32092ba84efed77c9eed0bc33d7e9085cfac0a7d26ab",
-      "bytes": 1180897
+      "sha256": "6e77fea5fa6c37ffbe66fe2a63cf4c4bab7318e04323c014c9858c6b9db647af",
+      "bytes": 1192730
     }
   ],
-  "notes": "v0.6x // BASALT // GHOSTLIGHT (ALPHA): a usability and feature pass, phone-first. Settings gained a slide-over section drawer and a persistent compact header holding the menu, Back to chat, and Help. A new Skills surface manages per-resident instruction files with fail-closed selection. The Connectors card now configures Nextcloud, Google, Microsoft 365, GitHub, Home Assistant, and OPNsense from Settings with write-only secret fields. Model selection gained saved shortcuts, one-tap chips, and type-to-find across the full provider catalog in every model picker, with search served from a bounded server-side cache instead of shipping whole catalogs to the browser. Four new themes (miku, cyberpunk, dendra, moon) join the roster and the theme setting now accepts a closed set only. The mobile pass fixed narrow attachment bubbles, soft-keyboard chat clipping, wrapping flex rows, themed textareas and file buttons, and a phone-clean shares and setup wizard; keyboard focus is visible on every wizard step. Invites render human-readable meta and clear their code on delete. The response banner no longer discloses stack versions. Exports use private temps, sweep orphans at boot, chunk large queries, stream attachments, and honor an explicit size ceiling. Help and settings copy now match shipped behavior, including honest cookie and transport text. Evidence: 68-check regression bed green on these exact bytes, JS syntax gate 13 blocks, GUI pass at phone and desk widths with zero page errors, manifest round-trip through the shipped validator with teeth-tested negative controls. ALPHA build: automatic update from older builds is not supported. If you run an earlier build, please update manually (download and swap) after taking a backup. Alpha: further hardening is in progress; expect continued fixes before 0.7. Nonce 15.",
-  "sig": "JvD2Z1PYrBJBIEVBMjyndE3zNy/FTCvaORsLWh3WaawKqKJTRRoOtXUENigU487qbvqpVYPF79ZnMDa3MVeuAA=="
+  "notes": "v0.6y // v1 HELP + REGISTRY BRANDING + WIZARD EXIT (ALPHA): a new help/v1 topic explains the OpenAI-compatible /v1 door end to end with a setup walkthrough; the Session-card hint links to it and a stale 401 pointer (Settings > Model became Session) is fixed. UI branding now follows the registry: the chat tab title, sidebar brand, placeholder, settings header, and PWA manifest take the signed-in agent's name from the API, while sessionless surfaces (login, signup, shares, first boot) show C.A.I.R.N. instead of a borrowed persona; wizard and glossary copy address your new agent generically. The setup wizard's 'already initialized' 403 is no longer a dead end: it explains that an earlier submit most likely succeeded and links the login page, the network-error message carries the same pointer, and the CLI-facing JSON repeats it. One help example IP was genericized to an RFC 5737 documentation address. Evidence: count==1 anchored patches, py_compile, scratch-boot e2e (owner setup, settings, help, manifest, authed redirects, wizard replay through the 403 path), node --check on every served script block, F29 R6 release scan clean on the ship candidate. ALPHA build: automatic update from older builds is not supported. If you run an earlier build, please update manually (download and swap) after taking a backup. Nonce 16.",
+  "sig": "X8MaAYO9bte7QtlSjMwuYgWCVQVdzv9U+hzSV082NAm0uVplznkQrBfxijpdMBzfoWiLu5FyFYoUN8esCpYQDg=="
 }

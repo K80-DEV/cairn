@@ -15,7 +15,7 @@ attested by the signed manifest that shipped with it
 (`updates/manifest.json` at that tag):
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.6x/updates/0.6x/marahome.py
+curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.6y/updates/0.6y/marahome.py
 sha256sum marahome.py
 # expected: 4eaa0f9f4da38039c3ce32092ba84efed77c9eed0bc33d7e9085cfac0a7d26ab (1180897 bytes)
 ```
