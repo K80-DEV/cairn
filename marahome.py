@@ -8264,7 +8264,7 @@ HELP_CSS = """<style>
 [data-theme="paper"]  { --bg:#f6f1e7; --surface:#fffdf8; --border:#d8cdb8; --text:#2b2620; --dim:#7a6f60; --accent:#b5482e; --accent2:#b5482e; --glow:rgba(181,72,46,0.06); --glow2:rgba(181,72,46,0.03); --user:#e8dcc4; --assistant:#ece4d2; --tool:#e4dcc9; }
 [data-theme="goblin"] { --bg:#101710; --surface:#1a241a; --border:#2f4a2f; --text:#dce8dc; --dim:#8aa08a; --accent:#7ac74f; --accent2:#7ac74f; --glow:rgba(122,199,79,0.07); --glow2:rgba(122,199,79,0.04); --user:#2c4a2c; --assistant:#1f331f; --tool:#243024; }
 [data-theme="oled"]   { --bg:#000000; --surface:#0a0a0a; --border:#1e1e1e; --text:#e6e6e6; --dim:#6e6e6e; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.05); --glow2:rgba(255,45,149,0.04); --user:#241019; --assistant:#0a0a0a; --tool:#101010; }
-[data-theme="miku"] { --bg:#071013; --surface:#0e1c20; --border:#1f4a49; --text:#e2f6f4; --dim:#7fa8a6; --accent:#22e8c5; --accent2:#ff7ebc; --glow:rgba(34,232,197,0.08); --glow2:rgba(255,126,188,0.05); --user:#123c3a; --assistant:#0d1e23; --tool:#0f2429; }
+[data-theme="miku"] { --bg:#070c16; --surface:#111a29; --border:#2e6488; --text:#eaf2fb; --dim:#8ea3bd; --accent:#43cfe8; --accent2:#f4477c; --glow:rgba(67,207,232,0.10); --glow2:rgba(244,71,124,0.05); --user:#143248; --assistant:#0f1725; --tool:#14263c; }
 [data-theme="cyberpunk"] { --bg:#120a04; --surface:#1f1208; --border:#4a2a10; --text:#ffe8d1; --dim:#b08a68; --accent:#ff6a1a; --accent2:#ff9e3d; --glow:rgba(255,106,26,0.08); --glow2:rgba(255,158,61,0.05); --user:#5a2c10; --assistant:#2b1a0d; --tool:#241609; }
 [data-theme="dendra"] { --bg:#0d0714; --surface:#170d24; --border:#33204d; --text:#ece4f7; --dim:#9c8ab8; --accent:#b967ff; --accent2:#ff4fd8; --glow:rgba(185,103,255,0.08); --glow2:rgba(255,79,216,0.05); --user:#3a1f5c; --assistant:#1c1230; --tool:#251638; }
 [data-theme="moon"] { --bg:#efeef6; --surface:#fbfafe; --border:#cfcbe0; --text:#2a2440; --dim:#6f688a; --accent:#6a4fd8; --accent2:#a855c8; --glow:rgba(106,79,216,0.06); --glow2:rgba(168,85,200,0.03); --user:#ddd8ef; --assistant:#e4e1f0; --tool:#dcd7ec; }
@@ -8894,7 +8894,7 @@ function $(i){return document.getElementById(i)}
 function step(n){[1,2,3,"35",4].forEach(function(k){$("s"+k).className="card"+(k===n?"":" hidden");$("st"+k).className=(k===n?"on":"")});}
 $("ack").addEventListener("change",function(){$("b1").disabled=!this.checked});
 $("b1").onclick=function(){step(2)};
-$("prov").addEventListener("change",function(){$("customwrap").className=(this.value==="custom")?"":"hidden"});
+$("prov").addEventListener("change",function(){$("customwrap").className=(this.value==="custom"||this.value==="ollama")?"":"hidden"});
 function post(u,obj){return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify(obj)}).then(function(r){return r.json().then(function(j){return {code:r.status,j:j}}).catch(function(){return {code:r.status,j:{}}})})}
 function setgs(pairs){var b={};pairs.forEach(function(p){b[p[0]]=p[1]});return b}
 $("b2").onclick=function(){
@@ -8914,10 +8914,10 @@ function modelDone(ok,msg){var e=$("e3");e.className="err"+(ok?" ok":"");e.textC
 function saveModel(){
   var e=$("e3");e.className="err";e.textContent="";
   var prov=$("prov").value,key=$("mkey").value;
-  if(prov==="custom"&&!key.trim())key="none";
+  if((prov==="custom"||prov==="ollama")&&!key.trim())key="none";
   if(!key.trim()){modelDone(false,"A key is required for this provider. Skip if you are not sure yet - nothing breaks.");return}
   var pairs=[["model_provider",prov],["model_key",key]];
-  if(prov==="custom")pairs.push(["model_custom",$("cbase").value.trim()]);
+  if(prov==="custom"||prov==="ollama")pairs.push(["model_custom",$("cbase").value.trim()]);
   if($("mid").value.trim())pairs.push(["model",$("mid").value.trim()]);
   $("b3").disabled=true;
   post("/api/settings",setgs(pairs)).then(function(r){
@@ -10690,6 +10690,7 @@ MODEL_PROVIDERS = (
     ("groq", "Groq", "https://api.groq.com/openai/v1", False),
     ("mistral", "Mistral", "https://api.mistral.ai/v1", False),
     ("together", "Together", "https://api.together.xyz/v1", False),
+    ("ollama", "Ollama (local)", "http://127.0.0.1:11434/v1", False),
     ("custom", "Custom", "", False),
 )
 MODEL_PROVIDER_IDS = tuple(p[0] for p in MODEL_PROVIDERS)
@@ -11282,30 +11283,38 @@ def model_config(username, override=None):
             _f21_model = _f21_m.strip()[:200]
     meta = [p for p in MODEL_PROVIDERS if p[0] == prov][0]
     name, base, native = meta[1], meta[2], meta[3]
-    if prov == "custom":
+    if prov in ("custom", "ollama"):
+        # Ollama (local): Custom's sibling with a working default base, so a
+        # same-box Ollama needs zero typing; an edited Base URL (LAN model
+        # box) overrides. Custom keeps its "you must paste a URL" rule.
         raw = (get_setting("model_custom", "", username) or "").strip()
-        base = ""
+        parsed = ""
         if raw:
             if raw.startswith("{"):
                 try:
-                    base = str(json.loads(raw).get("base_url") or "").strip()
+                    parsed = str(json.loads(raw).get("base_url") or "").strip()
                 except Exception:
-                    base = ""
+                    parsed = ""
             else:
-                base = raw
+                parsed = raw
+        if prov == "custom":
+            base = parsed
+        elif parsed:
+            base = parsed
         if not base:
             return None, ("Custom model endpoint not configured — open Settings, pick Custom, "
                           "and paste the OpenAI-compatible base URL")
         if username != DAEMON_OWNER:
             # P1-A/Q2 (K80 ruling 2026-09-22): non-owners get public
-            # endpoints only - see _custom_base_blocked.
+            # endpoints only - see _custom_base_blocked. This now covers the
+            # ollama default (loopback) too: the local door stays owner-only.
             _cberr = _custom_base_blocked(base)
             if _cberr:
-                return None, ("Custom model endpoint refused (" + _cberr +
+                return None, (name + " endpoint refused (" + _cberr +
                               "). Non-owner accounts use public endpoints; "
                               "the local-model door belongs to the owner.")
     key = get_setting("model_key_" + prov, "", username) or ""
-    if not key and prov == "custom":
+    if not key and prov in ("custom", "ollama"):
         # F19/QoL (K80 2026-09-22, shipped 0.6g): local OpenAI-compatible
         # servers (Ollama & friends) ignore Authorization, but the whole
         # header pipeline needs a non-empty value. Owner keeps the local
@@ -12490,7 +12499,7 @@ WEB_UI_CHAT = """<!DOCTYPE html>
 [data-theme="paper"]  { --bg:#f6f1e7; --surface:#fffdf8; --border:#d8cdb8; --text:#2b2620; --dim:#7a6f60; --accent:#b5482e; --accent2:#b5482e; --glow:rgba(181,72,46,0.06); --glow2:rgba(181,72,46,0.03); --user:#e8dcc4; --assistant:#ece4d2; --tool:#e4dcc9; }
 [data-theme="goblin"] { --bg:#101710; --surface:#1a241a; --border:#2f4a2f; --text:#dce8dc; --dim:#8aa08a; --accent:#7ac74f; --accent2:#7ac74f; --glow:rgba(122,199,79,0.07); --glow2:rgba(122,199,79,0.04); --user:#2c4a2c; --assistant:#1f331f; --tool:#243024; }
 [data-theme="oled"]   { --bg:#000000; --surface:#0a0a0a; --border:#1e1e1e; --text:#e6e6e6; --dim:#6e6e6e; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.05); --glow2:rgba(255,45,149,0.04); --user:#241019; --assistant:#0a0a0a; --tool:#101010; }
-[data-theme="miku"] { --bg:#071013; --surface:#0e1c20; --border:#1f4a49; --text:#e2f6f4; --dim:#7fa8a6; --accent:#22e8c5; --accent2:#ff7ebc; --glow:rgba(34,232,197,0.08); --glow2:rgba(255,126,188,0.05); --user:#123c3a; --assistant:#0d1e23; --tool:#0f2429; }
+[data-theme="miku"] { --bg:#070c16; --surface:#111a29; --border:#2e6488; --text:#eaf2fb; --dim:#8ea3bd; --accent:#43cfe8; --accent2:#f4477c; --glow:rgba(67,207,232,0.10); --glow2:rgba(244,71,124,0.05); --user:#143248; --assistant:#0f1725; --tool:#14263c; }
 [data-theme="cyberpunk"] { --bg:#120a04; --surface:#1f1208; --border:#4a2a10; --text:#ffe8d1; --dim:#b08a68; --accent:#ff6a1a; --accent2:#ff9e3d; --glow:rgba(255,106,26,0.08); --glow2:rgba(255,158,61,0.05); --user:#5a2c10; --assistant:#2b1a0d; --tool:#241609; }
 [data-theme="dendra"] { --bg:#0d0714; --surface:#170d24; --border:#33204d; --text:#ece4f7; --dim:#9c8ab8; --accent:#b967ff; --accent2:#ff4fd8; --glow:rgba(185,103,255,0.08); --glow2:rgba(255,79,216,0.05); --user:#3a1f5c; --assistant:#1c1230; --tool:#251638; }
 [data-theme="moon"] { --bg:#efeef6; --surface:#fbfafe; --border:#cfcbe0; --text:#2a2440; --dim:#6f688a; --accent:#6a4fd8; --accent2:#a855c8; --glow:rgba(106,79,216,0.06); --glow2:rgba(168,85,200,0.03); --user:#ddd8ef; --assistant:#e4e1f0; --tool:#dcd7ec; }
@@ -13755,7 +13764,7 @@ WEB_UI_SETTINGS = """
 [data-theme="paper"]  { --bg:#f6f1e7; --surface:#fffdf8; --border:#d8cdb8; --text:#2b2620; --dim:#7a6f60; --accent:#b5482e; --accent2:#b5482e; --glow:rgba(181,72,46,0.06); --glow2:rgba(181,72,46,0.03); }
 [data-theme="goblin"] { --bg:#101710; --surface:#1a241a; --border:#2f4a2f; --text:#dce8dc; --dim:#8aa08a; --accent:#7ac74f; --accent2:#7ac74f; --glow:rgba(122,199,79,0.07); --glow2:rgba(122,199,79,0.04); }
 [data-theme="oled"]   { --bg:#000000; --surface:#0a0a0a; --border:#1e1e1e; --text:#e6e6e6; --dim:#6e6e6e; --accent:#00e5ff; --accent2:#ff2d95; --glow:rgba(0,229,255,0.05); --glow2:rgba(255,45,149,0.04); }
-[data-theme="miku"] { --bg:#071013; --surface:#0e1c20; --border:#1f4a49; --text:#e2f6f4; --dim:#7fa8a6; --accent:#22e8c5; --accent2:#ff7ebc; --glow:rgba(34,232,197,0.08); --glow2:rgba(255,126,188,0.05); }
+[data-theme="miku"] { --bg:#070c16; --surface:#111a29; --border:#2e6488; --text:#eaf2fb; --dim:#8ea3bd; --accent:#43cfe8; --accent2:#f4477c; --glow:rgba(67,207,232,0.10); --glow2:rgba(244,71,124,0.05); }
 [data-theme="cyberpunk"] { --bg:#120a04; --surface:#1f1208; --border:#4a2a10; --text:#ffe8d1; --dim:#b08a68; --accent:#ff6a1a; --accent2:#ff9e3d; --glow:rgba(255,106,26,0.08); --glow2:rgba(255,158,61,0.05); }
 [data-theme="dendra"] { --bg:#0d0714; --surface:#170d24; --border:#33204d; --text:#ece4f7; --dim:#9c8ab8; --accent:#b967ff; --accent2:#ff4fd8; --glow:rgba(185,103,255,0.08); --glow2:rgba(255,79,216,0.05); }
 [data-theme="moon"] { --bg:#efeef6; --surface:#fbfafe; --border:#cfcbe0; --text:#2a2440; --dim:#6f688a; --accent:#6a4fd8; --accent2:#a855c8; --glow:rgba(106,79,216,0.06); --glow2:rgba(168,85,200,0.03); }
@@ -13912,10 +13921,12 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
       <option value="groq">Groq</option>
       <option value="mistral">Mistral</option>
       <option value="together">Together</option>
+      <option value="ollama">Ollama (local) — no key needed</option>
       <option value="custom">Custom (OpenAI-compatible URL)</option>
     </select>
   </div>
-  <div class="row" id="modelCustomRow" style="display:none"><label>Base URL</label><input id="model_custom" value="" placeholder="https://localhost:11434/v1" autocomplete="off"></div>
+  <div class="row" id="modelCustomRow" style="display:none"><label>Base URL</label><input id="model_custom" value="" placeholder="http://127.0.0.1:11434/v1" autocomplete="off"></div>
+  <div class="hint" id="ollamaHint" style="display:none"><b>Ollama / LM Studio / llama.cpp — local models, no API key.</b> The Base URL above already points at Ollama on this machine; for a model server on another box use its LAN address, e.g. <i>http://192.168.1.20:11434/v1</i> (the /v1 is not optional), and make it listen on the LAN first — Ollama needs <i>OLLAMA_HOST=0.0.0.0</i>. Prove the wire before saving: from this box run <i>curl http://that-ip:11434/v1/models</i>; JSON back = wired. The API key box can stay empty (or type <i>none</i>; local servers ignore it either way). Then press <b>Load models</b> and pick from what you pulled. This door is owner-only by design — local URLs are refused for other accounts.</div>
   <div class="row"><label>Model</label><input id="model" value="" autocomplete="off" placeholder="type to search ALL provider models - or paste any model id" oninput="modelSearchInput()" onfocus="modelSearchInput()">
   <button class="btn" style="margin-top:0;padding:0 12px" onclick="loadModels()">Load models</button></div>
   <div class="model-drop" id="modelDrop" style="display:none"></div>
@@ -13928,7 +13939,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <div class="row"><label>v1 token</label>
     <input id="v1_token" type="password" autocomplete="off" oninput="v1KeyTouched = true" placeholder="write-only — /v1 bearer token for phone apps">
   </div>
-  <div class="hint">Locks the OpenAI-compatible /v1 door: phone apps must send <i>Authorization: Bearer <this></i>. Only the owner's token governs; saving empty shuts the token door (the owner's own session still passes). <span id="v1TokenStatus"></span></div>
+  <div class="hint"><b>This is not a provider key.</b> It is the password YOUR Cairn asks of apps that use <i>it</i> as their model provider (phone apps pointed at your /v1 door). Nothing above changes. Locks the OpenAI-compatible /v1 door: phone apps must send <i>Authorization: Bearer <this></i>. Only the owner's token governs; saving empty shuts the token door (the owner's own session still passes). <span id="v1TokenStatus"></span></div>
   <div class="row"><label>Context window</label><input id="context_budget" type="number" step="8192" min="1" list="ctxList" placeholder="pick or type any value" style="max-width:180px">
   <datalist id="ctxList"><option value="4096"></option><option value="8192"></option><option value="16384"></option><option value="32768"></option><option value="65536"></option><option value="131072"></option><option value="196608"></option><option value="262144"></option><option value="393216"></option><option value="524288"></option><option value="786432"></option><option value="1048576"></option></datalist></div>
   <div class="hint">No floor, no ceiling — pick a common size or type any value (small local models included). <span id="budgetWarn"></span></div>
@@ -13944,6 +13955,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
       <option value="groq">Groq</option>
       <option value="mistral">Mistral</option>
       <option value="together">Together</option>
+      <option value="ollama">Ollama (local)</option>
       <option value="custom">Custom</option>
     </select>
     <input id="smModel" list="smModelList" placeholder="model id" autocomplete="off" style="max-width:300px;flex:2">
@@ -14105,7 +14117,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     <option value="ember">Ember (dark warm)</option>
     <option value="goblin">Goblin (dark green)</option>
     <option value="oled">OLED (true black)</option>
-    <option value="miku">Miku (teal × pink, dark)</option>
+    <option value="miku">Miku (night shift — cyan × pink)</option>
     <option value="cyberpunk">Cyberpunk Orange (dark)</option>
     <option value="dendra">Dragon's Den (violet, dark)</option>
     <option value="paper">Paper (light)</option>
@@ -15041,7 +15053,8 @@ let v1KeyTouched = false;
 
 function onModelProviderChange() {
   const prov = document.getElementById('model_provider').value;
-  document.getElementById('modelCustomRow').style.display = (prov === 'custom') ? '' : 'none';
+  document.getElementById('modelCustomRow').style.display = (prov === 'custom' || prov === 'ollama') ? '' : 'none';
+  document.getElementById('ollamaHint').style.display = (prov === 'ollama') ? '' : 'none';
   document.getElementById('model_key').value = '';
   modelKeyTouched = false;
 }
