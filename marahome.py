@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mara-home daemon — CAIRN as Mara's Home
+cairn daemon — CAIRN, a home for your resident
 Mara | Auth: K80 | 2026-09-15
 
 Full web GUI + agent loop + tools + streaming chat.
@@ -59,7 +59,30 @@ from queue import Queue
 from html.parser import HTMLParser
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
-BASE = Path(os.environ.get("MARA_HOME", "/var/lib/cairn"))
+BASE = Path(os.environ.get("CAIRN_HOME", os.environ.get("MARA_HOME", "/var/lib/cairn")))
+# R1 GREAT RENAME (0.7a): CAIRN_* env names lead; MARA_* are still read for
+# ONE release as fallbacks (delete at 0.7b). New value wins when both are set.
+# SELF_NAME/SERVICE_UNIT keep operator-facing instructions (usage lines, the
+# staged-import and self-update hints) true on BOTH old-name (marahome.py /
+# marahome.service) and renamed-era (cairn.py / cairn.service) boxes - the
+# live file's own name is the one thing that must never be hardcoded.
+SELF_NAME = os.path.basename(os.path.abspath(__file__))
+SERVICE_UNIT = os.environ.get("CAIRN_UNIT") or (SELF_NAME[:-3] if SELF_NAME.endswith(".py") else "marahome")
+def _default_registry_path():
+    # New default wins; if it is not there yet and the mara-era default file
+    # IS, keep using the old one (one release; the migration script moves it).
+    _new = "/var/lib/cairn/users.db"
+    _old = "/var/lib/mara/users.db"
+    if not os.path.exists(_new) and os.path.exists(_old):
+        return _old
+    return _new
+def _provision_script_path():
+    # Same one-release river: new home first, mara-era path still honored.
+    for _c in ("/etc/cairn/cairn-provision.py", "/etc/cairn/mara-provision.py",
+               "/etc/mara/mara-provision.py"):
+        if os.path.isfile(_c):
+            return _c
+    return "/etc/mara/mara-provision.py"
 IDENTITY = BASE / "identity"
 MEMORY_DIR = IDENTITY / "memory"
 SKILLS_DIR = IDENTITY / "skills"  # B-15: per-principal instruction files (Agora-style skills)
@@ -69,17 +92,17 @@ LOGS = BASE / "logs"
 DB_PATH = STATE / "conversations.db"
 # P3.3 S2: daemon owner - backfill target + owner-scoped reads (/health, /v1, memory)
 # R1 (v0.6n, K80 ruling 2026-09-24 10:00): the instance owner is DERIVED, never baked
-# in. Order: env MARA_OWNER (legacy override; keeps long-lived machines byte-stable) ->
+# in. Order: env CAIRN_OWNER (MARA_OWNER legacy fallback; keeps long-lived machines byte-stable) ->
 # registry owner row (the answer the first-boot wizard already collects) -> neutral
 # "owner" placeholder (pre-wizard only; the wizard promotes the real name on creation).
 # Shipped artifacts carry zero personal defaults.
 def _r1_derive_owner():
-    _env = os.environ.get("MARA_OWNER", "").strip()
+    _env = os.environ.get("CAIRN_OWNER", os.environ.get("MARA_OWNER", "")).strip()
     if _env:
         return _env
     try:
         import sqlite3 as _r1_sq
-        _reg = os.environ.get("MARA_REGISTRY", "/var/lib/mara/users.db")
+        _reg = os.environ.get("CAIRN_REGISTRY", os.environ.get("MARA_REGISTRY", _default_registry_path()))
         with _r1_sq.connect("file:" + _reg + "?mode=ro", uri=True, timeout=2) as _r1db:
             _row = _r1db.execute("SELECT username FROM users WHERE role='owner' "
                                  "AND status='active' ORDER BY created_at LIMIT 1").fetchone()
@@ -174,8 +197,8 @@ def _close_stream_rec(conv_id):
                 pass
 COMPACTION_THRESHOLD = 0.80
 MAX_TOOL_ITERATIONS = 10
-HOST = os.environ.get("MARA_HOST", "127.0.0.1")
-PORT = int(os.environ.get("MARA_PORT", "8470"))
+HOST = os.environ.get("CAIRN_HOST", os.environ.get("MARA_HOST", "127.0.0.1"))
+PORT = int(os.environ.get("CAIRN_PORT", os.environ.get("MARA_PORT", "8470")))
 # P3.3 S3: daemon-level tools kill switch (lite instance runs MARA_TOOLS=off - chat only)
 TOOLS_ENABLED = os.environ.get("MARA_TOOLS", "on").strip().lower() != "off"
 # P3.3 S3p-v2: instance tier (env MARA_TIER, from /etc/mara/agents/<slug>.env).
@@ -183,7 +206,7 @@ TOOLS_ENABLED = os.environ.get("MARA_TOOLS", "on").strip().lower() != "off"
 # user tier: web_search + web_fetch only (filtered below, enforced at dispatch).
 # Unknown tier fails closed to the web-only set. The hand-provisioned owner
 # instance has no env file -> defaults to "owner" (its historical behavior).
-TIER = os.environ.get("MARA_TIER", "owner").strip().lower()
+TIER = os.environ.get("CAIRN_TIER", os.environ.get("MARA_TIER", "owner")).strip().lower()
 TIER_TOOLS = {"owner": None, "admin": None, "user": frozenset(("web_search", "web_fetch", "memory", "recall"))}
 # ─── Uploads & attachments (P3.2) ─────────────────────────────────────────────
 UPLOAD_MAX_BYTES = 15 * 1024 * 1024   # 15 MB per file (decoded)
@@ -313,7 +336,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stderr),
     ],
 )
-log = logging.getLogger("marahome")
+log = logging.getLogger("cairn")
 # R1fix: deferred from the DAEMON_OWNER assignment (log not defined there yet).
 log.info("R1: instance owner resolves to %r", DAEMON_OWNER)
 
@@ -640,6 +663,98 @@ def migrate_memory_namespaces():
             log.info("R7a: migrated %d legacy memory file(s) into memory/%s/", len(moved), DAEMON_OWNER)
     except Exception:
         log.exception("R7a: memory namespace migration failed")
+import struct
+import zlib
+
+# U11 (0.7a): fresh-install static seed (found by the R3 clean-VM rehearsal,
+# K80 favicon report 2026-09-28). Login/chat/manifest link static/color.png;
+# a pristine install has an empty static dir, so beta boxes had no favicon
+# and a blank PWA tile. We embed ZERO blobs: the flat CAIRN emblem (same
+# geometry as the login-page SVG) is synthesized once with stdlib only, and
+# lands ONLY if the operator has no color.png of their own. agent.png stays
+# absent on purpose - the S4f10 avatar path already falls back to color.png.
+def _u11_png_bytes(w, h, px):
+    # minimal 8-bit RGB PNG writer (zlib+struct are stdlib; "no dependencies"
+    # means no NON-stdlib, and zlib is stdlib).
+    rows = b"".join(b"\x00" + px[y * w * 3:(y + 1) * w * 3] for y in range(h))
+    def _ck(t, d):
+        return (struct.pack(">I", len(d)) + t + d
+                + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n"
+            + _ck(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + _ck(b"IDAT", zlib.compress(rows, 6))
+            + _ck(b"IEND", b""))
+
+def _u11_emblem_png(size=192):
+    import math
+    S = 3                                   # supersample factor (AA)
+    N = size * S
+    buf = [0.0] * (N * N)                   # stroke coverage 0..1
+    def stamp(pxx, pyy, rad):
+        x0 = int(max(0.0, pxx - rad - 1)); x1 = int(min(N - 1.0, pxx + rad + 1))
+        y0 = int(max(0.0, pyy - rad - 1)); y1 = int(min(N - 1.0, pyy + rad + 1))
+        for yy in range(y0, y1 + 1):
+            dy = yy - pyy; base = yy * N
+            for xx in range(x0, x1 + 1):
+                dx = xx - pxx
+                d = (dx * dx + dy * dy) ** 0.5
+                if d <= rad:
+                    wv = min(1.0, rad - d + 0.5)
+                    i = base + xx
+                    if wv > buf[i]:
+                        buf[i] = wv
+    U = N / 100.0
+    W = 1.25 * U                            # SVG stroke-width 2.5 / 2
+    for rot in (0, 72, 144, 216, 288):      # five orbit rings
+        ca = math.cos(math.radians(rot)); sa = math.sin(math.radians(rot))
+        a = 36.0 * U; b = 13.0 * U
+        for k in range(720):
+            t = k * math.pi / 360.0
+            ex = a * math.cos(t); ey = b * math.sin(t)
+            stamp(50.0 * U + ex * ca - ey * sa, 50.0 * U + ex * sa + ey * ca, W)
+    for k in range(360):                    # core ring r=11
+        t = k * math.pi / 180.0
+        stamp(50.0 * U + 11.0 * U * math.cos(t), 50.0 * U + 11.0 * U * math.sin(t), W)
+    rad = 4.0 * U                           # filled core r=4
+    for yy in range(int(50.0 * U - rad), int(50.0 * U + rad) + 1):
+        dy = yy - 50.0 * U
+        for xx in range(int(50.0 * U - rad), int(50.0 * U + rad) + 1):
+            dx = xx - 50.0 * U
+            if (dx * dx + dy * dy) ** 0.5 <= rad:
+                buf[yy * N + xx] = 1.0
+    BR, BG, BB = 0x05, 0x07, 0x0D           # #05070d (manifest bg_color)
+    SR, SG, SB = 0xFF, 0x3B, 0x5C           # #ff3b5c (login emblem stroke)
+    px = bytearray()
+    for y in range(size):
+        for x in range(size):
+            cov = 0.0
+            for sy in range(S):
+                row = (y * S + sy) * N + x * S
+                cov += buf[row] + buf[row + 1] + buf[row + 2]
+            cov /= float(S * S)
+            px.append(int(BR + (SR - BR) * cov))
+            px.append(int(BG + (SG - BG) * cov))
+            px.append(int(BB + (SB - BB) * cov))
+    return _u11_png_bytes(size, size, bytes(px))
+
+def _seed_static_assets():
+    # Never touches an operator's file; never fatal at boot.
+    try:
+        p = STATIC_DIR / "color.png"
+        if p.exists():
+            return
+        STATIC_DIR.mkdir(parents=True, exist_ok=True)
+        raw = _u11_emblem_png()
+        tmp = p.with_name("color.png.u11tmp")
+        tmp.write_bytes(raw)
+        os.chmod(str(tmp), 0o644)
+        os.replace(str(tmp), str(p))
+        log.info("U11: fresh install - seeded static/color.png (%d bytes, flat emblem)", len(raw))
+    except Exception as _e:
+        log.warning("U11: static seed skipped (non-fatal): %s", _e)
+
+_seed_static_assets()
+
 migrate_memory_namespaces()
 SYSTEM_PROMPT = load_system_prompt()  # R7a: the DAEMON OWNER's effective prompt
 _owner_md = _user_memory_dir(DAEMON_OWNER)
@@ -1039,6 +1154,9 @@ WEB_UI_AUTH_TMPL = """
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>C.A.I.R.N.</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="static/color.png">
+<link rel="apple-touch-icon" href="static/color.png">
 <style>
 html,body{margin:0;height:100%}
 body{background:#000;color:#e8e8f0;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh}
@@ -2727,7 +2845,7 @@ def web_ui_auth(mode):
 
 
 # --- User registry & sessions (P3.3 S1) ------------------------------------
-REGISTRY_PATH = Path(os.environ.get("MARA_REGISTRY", "/var/lib/mara/users.db"))
+REGISTRY_PATH = Path(os.environ.get("CAIRN_REGISTRY", os.environ.get("MARA_REGISTRY", _default_registry_path())))
 PBKDF2_ITERS = 600000
 SESSION_MAX_AGE = 31536000  # P1-B: absolute session life 365d (idle kill below)
 SESSION_IDLE_MAX = 45 * 86400  # P1-B (K80 ruling 2026-09-22): 45 days idle = dead
@@ -3005,12 +3123,12 @@ def _cli_reset_password(argv):
     # write is safe alongside the running daemon. Prints the temporary
     # password once - it is not stored anywhere in plaintext.
     if "--reset-password" not in argv:
-        print("usage: marahome.py --reset-password <username>", file=sys.stderr)
+        print("usage: " + SELF_NAME + " --reset-password <username>", file=sys.stderr)
         return 2
     _i = argv.index("--reset-password")
     name = argv[_i + 1] if _i + 1 < len(argv) else ""
     if not name or name.startswith("-"):
-        print("usage: marahome.py --reset-password <username>", file=sys.stderr)
+        print("usage: " + SELF_NAME + " --reset-password <username>", file=sys.stderr)
         return 2
     u = registry_get_user(name)
     if not u:
@@ -3039,9 +3157,9 @@ def rotate_user_id(username):
 
 def _session_cookie(tok, secure=True):
     # R4: secure flag follows what the BROWSER sees (see _cookie_secure), not a constant.
-    return "msession=%s; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=%d" % (tok, " Secure;" if secure else " ", SESSION_MAX_AGE)
+    return "cairn-session=%s; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=%d" % (tok, " Secure;" if secure else " ", SESSION_MAX_AGE)
 def _clear_cookie(secure=True):
-    return "msession=; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=0" % (" Secure;" if secure else " ")
+    return "cairn-session=; Path=/; HttpOnly;%s SameSite=Lax; Max-Age=0" % (" Secure;" if secure else " ")
 
 
 def get_api_key() -> str | None:
@@ -3463,16 +3581,249 @@ except Exception:
     VAULT_CRYPTO_OK = False
 
 
-def _vault_master_key():
-    # Reads the staged master key. Returns bytes or None. NEVER logs key bytes.
+def _vault_saved_path():
+    # 0.7a ladder: optional single-line pointer file in MARA_HOME. A PATH is
+    # not a secret; the key bytes never live here and are never logged.
     try:
-        with open(VAULT_KEY_PATH, "rb") as f:
-            k = f.read()
+        p = (BASE / "vault-key-path.conf").read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    return k if len(k) == VAULT_KEY_BYTES else None
+    return p or None
+
+def _vault_key_candidates():
+    # 0.7a key ladder (K80 ruling 2026-09-28): env VAULT_KEY_PATH wins when
+    # explicitly set (key-server staging, the F20 smoke harness, systemd
+    # drop-ins), then the saved pointer file, then the canonical /run path,
+    # then the box-generated vault.key in MARA_HOME. Deduped, in order.
+    c = []
+    if "VAULT_KEY_PATH" in os.environ:
+        # U1b ENV-STRICT (0.7a pre-ship): when VAULT_KEY_PATH is set it IS
+        # the ladder - no fallback, fail closed. Operators and harnesses get
+        # exactly the file they named; nothing else can shadow it, and if it
+        # is missing the vault stays sealed instead of silently using another.
+        return [os.environ["VAULT_KEY_PATH"]]
+    sp = _vault_saved_path()
+    if sp:
+        c.append(sp if os.path.isabs(sp) else str(BASE / sp))
+    c.append("/run/cairn-vault.key")
+    c.append(str(BASE / "vault.key"))
+    out = []
+    for p in c:
+        if p not in out:
+            out.append(p)
+    return out
+
+def _vault_master_key():
+    # Reads the staged master key. Returns bytes or None. NEVER logs key bytes.
+    # 0.7a: walks the ladder (U1b: an explicit env VAULT_KEY_PATH is the
+    # whole ladder). Re-read per use = unplugged USB fails closed.
+    for _kp in _vault_key_candidates():
+        try:
+            with open(_kp, "rb") as f:
+                k = f.read()
+        except OSError:
+            continue
+        if len(k) == VAULT_KEY_BYTES:
+            return k
+    return None
 
 
+def _vault_lockbox_state():
+    # 0.7a lockbox: describe vault-key truth for the UI. Paths + booleans +
+    # sizes ONLY - key bytes are never read into a response object.
+    cands = _vault_key_candidates()
+    out = []
+    live = None
+    for p in cands:
+        exists = False
+        valid = False
+        try:
+            exists = os.path.isfile(p)
+            if exists:
+                valid = os.path.getsize(p) == VAULT_KEY_BYTES
+        except OSError:
+            pass
+        if valid and live is None:
+            try:
+                with open(p, "rb") as f:
+                    if len(f.read()) == VAULT_KEY_BYTES:
+                        live = p
+            except OSError:
+                pass
+        out.append({"path": p, "exists": bool(exists), "valid": bool(valid)})
+    scope = None
+    if live is not None:
+        if "VAULT_KEY_PATH" in os.environ:
+            scope = "env"
+        elif live == str(BASE / "vault.key"):
+            scope = "box"
+        elif live == "/run/cairn-vault.key":
+            scope = "run"
+        else:
+            scope = "pointer"
+    return {"ready": live is not None, "scope": scope, "path": live,
+            "candidates": out, "env_strict": "VAULT_KEY_PATH" in os.environ}
+def _lockbox_env_blocked(h):
+    # ENV-STRICT (U1b) honesty: if VAULT_KEY_PATH is set, that path IS the
+    # ladder - a generated file elsewhere would be unreachable. Say so plainly.
+    if "VAULT_KEY_PATH" in os.environ:
+        h._json(409, {"error": "this daemon has VAULT_KEY_PATH set explicitly, and explicit means exact: stage a key AT that path (see the install docs) instead of generating one here"})
+        return True
+    return False
+def _lockbox_owner(h):
+    # Returns the owner row, or None AFTER sending 401/403 (caller early-returns).
+    u = h._auth_user()
+    if not u or u["status"] != "active":
+        h._json(401, {"error": "authentication required"})
+        return None
+    if u["role"] != "owner":
+        h._json(403, {"error": "owner only"})
+        return None
+    return u
+def _lockbox_write_key(path, mode_dir_note=None):
+    # O_EXCL create + 0600 + urandom(4096). Returns None on success or a
+    # (code, message) tuple. Removes partial files on write failure.
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return (409, "a key file already exists there; this step never overwrites a key")
+    except OSError:
+        return (500, "could not create the key file (permissions or path problem); nothing was changed")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(os.urandom(VAULT_KEY_BYTES))
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return (500, "key write failed; the partial file was removed")
+    return None
+def _lockbox_gen_box(h, u):
+    if _lockbox_env_blocked(h):
+        return
+    st = _vault_lockbox_state()
+    if st["ready"]:
+        h._json(409, {"error": "a vault key is already live (scope " + str(st["scope"]) + "); this step never overwrites a key - rotate via the install docs instead"})
+        return
+    p = str(BASE / "vault.key")
+    err = _lockbox_write_key(p)
+    if err is not None:
+        h._json(err[0], {"error": err[1]})
+        return
+    log_event(u["username"], "vault.key_created", scope="box")
+    h._json(200, {"ok": True, "ready": True, "scope": "box", "path": p})
+def _lockbox_gen_usb(h, u):
+    if _lockbox_env_blocked(h):
+        return
+    body = h._json_object_body()
+    if body is None:
+        return
+    d = body.get("dir")
+    if not isinstance(d, str) or not d.strip():
+        h._json(400, {"error": "dir required: absolute path of the mounted USB directory"})
+        return
+    if body.get("confirm2") is not True:
+        h._json(400, {"error": "confirm2 required: you must confirm you have a SECOND stick ready before a key is written - one stick is one accident away from losing everything", "need_second_stick": True})
+        return
+    st = _vault_lockbox_state()
+    if st["ready"]:
+        h._json(409, {"error": "a vault key is already live (scope " + str(st["scope"]) + "); this step never overwrites a key"})
+        return
+    real = os.path.realpath(d)
+    if not os.path.isdir(real):
+        h._json(400, {"error": "that directory does not exist on this machine - mount the stick first and type its exact path"})
+        return
+    base_real = str(BASE.resolve())
+    try:
+        under_base = os.path.commonpath([real, base_real]) == base_real
+    except ValueError:
+        under_base = False
+    if real == base_real or under_base:
+        h._json(400, {"error": "the USB tier must live OUTSIDE the data directory - a copy inside CAIRN_HOME protects nothing the box-key did not already"})
+        return
+    try:
+        same_dev = os.stat(real).st_dev == os.stat(base_real).st_dev
+    except OSError:
+        h._json(400, {"error": "cannot inspect that directory"})
+        return
+    if same_dev:
+        h._json(400, {"error": "that directory sits on the SAME filesystem as the data directory - use the real flash drive mount point, not a folder on this box"})
+        return
+    kp = os.path.join(real, "cairn-vault.key")
+    err = _lockbox_write_key(kp)
+    if err is not None:
+        h._json(err[0], {"error": err[1]})
+        return
+    lines = [
+        "THIS STICK IS YOUR SECRETS.",
+        "",
+        "- CLONE IT NOW to a second stick (copy cairn-vault.key). One stick is one accident from losing everything.",
+        "- While this drive sits in this machine, it is your house key left in the front door.",
+        "- Lose both sticks and the vault contents are gone by design. There is no recovery, not even for the daemon.",
+        "- Rebooting this machine seals the vault until the drive is re-staged here.",
+        "- Unplugging mid-use seals the vault the instant the key is next needed (fail closed).",
+        "",
+        "Path the daemon looks for: " + kp,
+    ]
+    try:
+        with os.fdopen(os.open(os.path.join(real, "READ-ME.txt"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass  # READ-ME is best-effort; the key is what matters and it wrote clean
+    try:
+        (BASE / "vault-key-path.conf").write_text(kp + "\n", encoding="utf-8")
+    except OSError:
+        pass  # key sits at /run default or will be found by check; never fail the gen on the pointer
+    log_event(u["username"], "vault.key_created", scope="usb")
+    h._json(200, {"ok": True, "ready": True, "scope": "usb", "path": kp,
+                  "reminder": "Copy this stick to a SECOND stick now. Lose it and the secrets are gone by design."})
+def _lockbox_check(h, u):
+    # Bring-your-own: prove the file is real, adopt it via the pointer conf.
+    body = h._json_object_body()
+    if body is None:
+        return
+    p = body.get("path")
+    if not isinstance(p, str) or not p.strip():
+        h._json(400, {"error": "path required: absolute path of your staged key file"})
+        return
+    if not os.path.isabs(p):
+        h._json(400, {"error": "path must be absolute"})
+        return
+    real = os.path.realpath(p)
+    try:
+        size = os.path.getsize(real)
+    except OSError:
+        h._json(400, {"ready": False, "error": "no readable file at that path"})
+        return
+    if size != VAULT_KEY_BYTES:
+        h._json(400, {"ready": False, "error": "key file must be exactly " + str(VAULT_KEY_BYTES) + " bytes; found " + str(size)})
+        return
+    try:
+        with open(real, "rb") as f:
+            if len(f.read()) != VAULT_KEY_BYTES:
+                raise OSError
+    except OSError:
+        h._json(400, {"ready": False, "error": "file exists but could not be read fully (permissions?)"})
+        return
+    if "VAULT_KEY_PATH" in os.environ:
+        ep = os.environ["VAULT_KEY_PATH"]
+        if ep and os.path.realpath(ep) == real:
+            log_event(u["username"], "vault.key_adopted", path=real)
+            h._json(200, {"ok": True, "ready": True, "scope": "env", "path": real})
+            return
+        h._json(409, {"error": "this daemon has VAULT_KEY_PATH set explicitly, and explicit means exact: only that path is ever read. Stage your key AT that path, or restart the daemon without the env var to use the pointer ladder"})
+        return
+    try:
+        (BASE / "vault-key-path.conf").write_text(real + "\n", encoding="utf-8")
+    except OSError:
+        h._json(500, {"error": "key checks out but the pointer file could not be written (disk/permissions)"})
+        return
+    log_event(u["username"], "vault.key_adopted", path=real)
+    h._json(200, {"ok": True, "ready": True, "scope": "pointer", "path": real})
+def _lockbox_skip(h, u):
+    log_event(u["username"], "vault.key_skipped")
+    h._json(200, {"ok": True, "note": "vault stays sealed (503) until a key exists; the lockbox step is reachable again at any time"})
 def _vault_derive(master, salt):
     return hashlib.scrypt(master, salt=salt, n=16384, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
 
@@ -4617,7 +4968,7 @@ def _gh_api(tok, path, params=None):
     req.add_header("Authorization", "Bearer " + tok)
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    req.add_header("User-Agent", "marahome-cairn")
+    req.add_header("User-Agent", "cairn-agent")
     try:
         with _cst_opener().open(req, timeout=CST_TIMEOUT) as r:   # P1-G/S + P1-H/V
             raw = _p1h_read(r, _P1H_CONNECTOR_BODY_CAP, "connector")  # P1-H/W
@@ -4774,7 +5125,7 @@ def _ha_api(base, tok, path):
     req = _nc_ur.Request(base + path, method="GET")
     req.add_header("Authorization", "Bearer " + tok)
     req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "marahome-cairn")
+    req.add_header("User-Agent", "cairn-agent")
     try:
         with _cst_opener().open(req, timeout=CST_TIMEOUT) as r:   # P1-G/S + P1-H/V
             raw = _p1h_read(r, _P1H_CONNECTOR_BODY_CAP, "connector")  # P1-H/W
@@ -4881,7 +5232,7 @@ def _opn_api(cfg, secret, path):
     req.add_header("Authorization", "Basic " +
                    base64.b64encode((key + ":" + secret).encode("utf-8")).decode("ascii"))
     req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "marahome-cairn")
+    req.add_header("User-Agent", "cairn-agent")
     try:
         with _cst_opener().open(req, timeout=CST_TIMEOUT) as r:   # P1-G/S + P1-H/V
             raw = _p1h_read(r, _P1H_CONNECTOR_BODY_CAP, "connector")  # P1-H/W
@@ -5020,9 +5371,9 @@ _CS_ENV_RE = r"[A-Z][A-Z0-9_]{0,31}"
 
 def _cs_tmpdir():
     try:
-        return _cs_tf.mkdtemp(prefix="marahome-cs-", dir="/dev/shm")
+        return _cs_tf.mkdtemp(prefix="cairn-cs-", dir="/dev/shm")
     except Exception:
-        return _cs_tf.mkdtemp(prefix="marahome-cs-")
+        return _cs_tf.mkdtemp(prefix="cairn-cs-")
 
 def _cs_render(r):
     out = (r.stdout or "")[:CS_OUT_CAP] if isinstance(r.stdout, str) else ""
@@ -5278,12 +5629,23 @@ def _p1i_file_mode_sweep():
         MEMORY_DIR.chmod(0o700)
     except OSError:
         pass
-    for f in (DB_PATH, REGISTRY_PATH):
-        try:
-            if f.is_file():
-                f.chmod(0o600)
-        except OSError:
-            pass
+    try:
+        if DB_PATH.is_file():
+            DB_PATH.chmod(0o600)
+    except OSError:
+        pass
+    # S3p-v2b / U13 (2026-09-29, Juniper incident on .202): the shared user
+    # registry is group read-write BY DESIGN on multi-agent installs (S3p-v2:
+    # every agent instance opens it for sessions and user scoping). The 0600
+    # stamp here silently killed every agent instance at boot ("unable to open
+    # database file") after any owner-daemon restart. Registry gets 0660: on a
+    # single-user install the group is the daemon user's own private group (no
+    # exposure); on a shared install it keeps the doors open. DB stays 0600.
+    try:
+        if REGISTRY_PATH.is_file():
+            REGISTRY_PATH.chmod(0o660)
+    except OSError:
+        pass
     try:
         for child in UPLOADS_DIR.iterdir():
             try:
@@ -5318,7 +5680,9 @@ _instance_principal_cache = None
 _instance_principal_mtime = None
 def _instance_principal():
     global _instance_principal_cache, _instance_principal_mtime
-    cfg = _p1i_os.path.join(_p1i_os.sep + "etc", "mara", "instance.conf")
+    cfg = _p1i_os.path.join(_p1i_os.sep + "etc", "cairn", "instance.conf")
+    if not _p1i_os.path.exists(cfg):
+        cfg = _p1i_os.path.join(_p1i_os.sep + "etc", "mara", "instance.conf")
     try:
         mtime = _p1i_os.stat(cfg).st_mtime
     except OSError:
@@ -5768,7 +6132,7 @@ def _p1i_stage_sidecar(manifest, owner_name, path, nbytes):
         "parts": len(manifest.get("parts") or []),
         "skipped_files": (manifest.get("skipped_files") or [])[:200],
         "skipped_truncated": len(manifest.get("skipped_files") or []) > 200,
-        "apply": "run: python3 marahome.py --import-staged  (daemon STOPPED first)",
+        "apply": "run: python3 " + SELF_NAME + " --import-staged  (daemon STOPPED first)",
     }, indent=1)
     with open(side, "w", encoding="utf-8") as fh:
         fh.write(body)
@@ -7105,9 +7469,8 @@ def _f22_vkey(s):
     # 0.6u2/0.6j1 correctly sort below 0.6v, while genuinely newer sources
     # (0.6v2, 0.7) are still refused. Missing/junk src_version parses to 0
     # -- still the oldest key, restore still allowed, matching the old
-    # junk -> (0,0,'') posture. Known nit inherited with the parser:
-    # lexicographic suffix compare (u10 < u9) -- tracked centrally so one
-    # fix improves both call sites.
+    # junk -> (0,0,'') posture. Inherited nit (u10 < u9) FIXED at the
+    # source in 0.7a; both call sites get it from _f20_vkey.
     k = _f20_vkey(s)
     return k if k is not None else _f20_vkey("0")
 
@@ -7771,7 +8134,7 @@ def _f22_api_import(h):
     out = dict(ung)
     out["ok"] = True
     out["staged"] = True
-    out["apply"] = ("daemon STOPPED: python3 marahome.py --import-staged"
+    out["apply"] = ("daemon STOPPED: python3 " + SELF_NAME + " --import-staged"
                     "  (or --import-backup <file>)")
     h._json(200, out)
 def _f22_cli_main(argv):
@@ -8160,7 +8523,7 @@ def _logs_file_gate():
     try:
         with _logs_lock:
             if want and _logs_file_handler is None:
-                _logs_file_handler = logging.FileHandler(str(LOGS / "marahome.log"))
+                _logs_file_handler = logging.FileHandler(str(LOGS / "cairn.log"))
                 _logs_file_handler.setFormatter(logging.Formatter(
                     "%(asctime)s %(levelname)s [%(name)s] %(message)s"))
                 log.addHandler(_logs_file_handler)
@@ -8221,7 +8584,7 @@ def _logs_route_download(h):
     lines += [json.dumps({"id": e["id"], "ts": e["ts"], "iso": e["iso"], "level": e["level"],
                           "code": e["code"], "meta": e["meta"]}) for e in ev]
     body = ("\n".join(lines) + "\n").encode("utf-8")
-    fname = "marahome-events-%s-%s.ndjson" % (
+    fname = "cairn-events-%s-%s.ndjson" % (
         re.sub(r"[^a-zA-Z0-9-]", "_", u["username"]),
         time.strftime("%Y%m%d-%H%M%S"))
     h.send_response(200)
@@ -8365,7 +8728,7 @@ HELP_BODIES = {
 "limits": """
 <p>A privacy page that hides no doors is marketing. These are the doors that exist on this instance - all of them.</p>
 <h2>1. Your model provider sees your conversations</h2>
-<div class="card warn"><p>Chat messages, memory context and tool results are sent to <b>your configured model provider</b> (bring-your-own-key) to generate answers. That is what "the model answered" mechanically means. The provider's own retention and privacy policy applies to everything that passes through. This instance does not proxy that traffic through MaraDen, and there is no zero-knowledge trick being claimed here: choose a provider you trust, or run a local model.</p></div>
+<div class="card warn"><p>Chat messages, memory context and tool results are sent to <b>your configured model provider</b> (bring-your-own-key) to generate answers. That is what "the model answered" mechanically means. The provider's own retention and privacy policy applies to everything that passes through. This instance does not proxy that traffic through anyone else, and there is no zero-knowledge trick being claimed here: choose a provider you trust, or run a local model.</p></div>
 <h2>2. Root on the box</h2>
 <p>Conversations and settings live in a local SQLite file. Anyone with root on CAIRN can read them: you, and whoever roots CAIRN. Vault values are the protected exception (sealed, key on another machine). The OS journal also receives the daemon's boot/shutdown diagnostics - root's channel, and it was never yours to toggle.</p>
 <h2>3. Backups</h2>
@@ -8500,12 +8863,12 @@ def _help_page(slug, title, body, u=None):  # F19: u None = anon visitor, build 
     return ('<!DOCTYPE html>\n<html lang="en" data-theme="neon">\n<head>\n<meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width,initial-scale=1">\n'
             '<base href="/mara/">\n<title>' + html_mod.escape(_bn) + ' // Help - ' + html_mod.escape(title) + '</title>\n'
-            '<script>try{document.documentElement.dataset.theme=localStorage.getItem("mara-theme")||"neon";}catch(e){}</script>\n'
+            '<script>try{document.documentElement.dataset.theme=localStorage.getItem("cairn-theme")||"neon";}catch(e){}</script>\n'
             + HELP_CSS + '\n</head>\n<body>\n<div class="wrap">\n'
             '<div class="top"><a class="brand" href="."><b>' + html_mod.escape(_bn) + '</b><span class="slash">//</span>Help</a>'
             '<nav><a href=".">Chat</a><a href="settings">Settings</a><a href="help">Index</a></nav></div>\n'
             + '<h1>' + html_mod.escape(title) + '</h1>\n' + body +
-            '\n<p class="foot">mara-home' + (' v' + VERSION if u else '') + ' // ' + BUILD_SERIES + ' // ' + BUILD_NAME +
+            '\n<p class="foot">cairn' + (' v' + VERSION if u else '') + ' // ' + BUILD_SERIES + ' // ' + BUILD_NAME +
             ' - these pages describe the build you are running.</p>\n</div>\n</body>\n</html>\n')
 
 
@@ -8755,6 +9118,9 @@ def _f19_setup_owner(h):
 # by design). A slice that invents an event code must register it here or the
 # paper trail it promises does not exist.
 LOG_CATALOG["setup.owner_created"] = ("basic", "info", "Owner account created by the first-boot wizard (wizard is now closed)", "role, risk_sha")
+LOG_CATALOG["vault.key_created"] = ("basic", "info", "Vault master key generated by the lockbox step (key bytes are NEVER recorded)", "scope")
+LOG_CATALOG["vault.key_skipped"] = ("basic", "info", "Owner chose lockbox-off at setup; vault stays 503 until a key exists", "-")
+LOG_CATALOG["vault.key_adopted"] = ("basic", "info", "Owner adopted an existing 4096-byte key file via the lockbox check (path recorded, bytes NEVER recorded)", "path")
 
 # ---- F19 public help: two new static topics (generic, no topology) --------
 HELP_INDEX.append(("hardening", "Hardening", "the reference hardening checklist - mirror it, line by line, on your box"))
@@ -8788,6 +9154,27 @@ HELP_BODIES["ha"] = """
 <p>Everything the token can see. A long-lived HA token is a full-read credential - scope it with a dedicated HA user if your HA holds more than the agent should know about. The URL is validated (no internal-address smuggling for non-owner accounts) and redirects are fenced with credential-stripping, same as every other connector.</p>
 """
 
+HELP_INDEX.append(("lockbox", "The Lockbox", "where the vault master key may live: env, pointer, /run, or the box - and what each choice costs"))
+_HELP_TITLE.update({"lockbox": "The Lockbox"})
+HELP_BODIES["lockbox"] = """
+<p>Every secret this agent stores is sealed with one 4096-byte master key. <b>The lockbox is where you decide where that key lives.</b> The page lives at <code>vault-key</code> (owner-only) and stays reachable forever - first-boot wizard or not.</p>
+<h2>The key ladder</h2>
+<p>On every use the daemon walks this list, first readable file wins, and it re-reads the key <b>every single time</b> (that is why an unplugged drive fails closed instead of running on a cached copy):</p>
+<ol>
+<li><b>VAULT_KEY_PATH (environment).</b> When set, it IS the ladder - explicit means exact. No fallback: if the named file is missing the vault stays sealed rather than silently using another key.</li>
+<li><b>The pointer file</b> (<code>vault-key-path.conf</code> beside your data). One line, one path - written when the lockbox page adopts a valid key. A path is not a secret; key bytes never live here and are never logged.</li>
+<li><b><code>/run/cairn-vault.key</code></b> - tmpfs, so the key dies at reboot: the vault comes back sealed until the key is restaged. On a shared box that is a feature.</li>
+<li><b><code>vault.key</code> beside the data</b> (generated on-box). This stops an escaped backup or a stolen database file; it does NOT stop anyone who owns the box. A lock on the drawer, not a safe in the bank.</li>
+</ol>
+<h2>The USB stick option</h2>
+<p>A key on a stick is a house key left in the door while the box runs. Lose the stick, lose the secrets - there is no recovery path, by design, and the wizard says so before you commit. The setup forces a <b>second-stick copy</b> before it will finish; clone it and store the clone somewhere the death of the machine cannot reach. Unplug mid-use and dependent features fail closed until the stick returns; a reboot seals the same way until the stick (or the pointer) is restaged.</p>
+<h2>Bring your own key</h2>
+<pre>head -c 4096 /dev/urandom > /run/cairn-vault.key
+chmod 600 /run/cairn-vault.key</pre>
+<p>Then open the lockbox page and check that path - green means 4096 readable bytes. The page records the path, never the bytes.</p>
+<h2>Skipping is legal</h2>
+<p>Everything except vault-backed secrets keeps working; those return 503 with a pointer back to the lockbox page. Nothing is lost by waiting. See also <a href="vault">The Vault</a> and the Hardening checklist - an off-box key is the single biggest upgrade to the whole design.</p>
+"""
 def _f19_help_md():
     # Single-file CAIRN-HELP.md, generated live from the same topic bodies the
     # Help Center serves, so the download can never drift from the running
@@ -8814,7 +9201,7 @@ WEB_UI_SETUP = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <base href="/">
 <title>C.A.I.R.N. // First Boot</title>
-<script>try{document.documentElement.dataset.theme=localStorage.getItem("mara-theme")||"neon";}catch(e){}</script>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem("cairn-theme")||"neon";}catch(e){}</script>
 <style>
 :root{--bg:#0b0b12;--panel:#15151f;--ink:#e8e8f0;--mut:#8a8a9a;--accent:#ff5c76;--line:#26263a;--ok:#4ade80;--warn:#fbbf24}
 *{box-sizing:border-box}
@@ -8861,7 +9248,8 @@ input[type=checkbox]:focus-visible,input[type=radio]:focus-visible,button:focus-
   <span id="st2">2 &middot; Owner</span>
   <span id="st3">3 &middot; Model</span>
   <span id="st35">4 &middot; Personality</span>
-  <span id="st4">5 &middot; Done</span>
+  <span id="st36">5 &middot; Lockbox</span>
+  <span id="st4">6 &middot; Done</span>
 </div>
 
 <div class="card" id="s1">
@@ -8895,7 +9283,7 @@ var host = (location.hostname || "").toLowerCase();
     <div><label>Username</label><input id="uname" autocomplete="username" maxlength="32"></div>
     <div><label>Your display name (optional)</label><input id="dname" maxlength="64" placeholder="defaults to username"></div>
   </div>
-  <label>Agent name (what you will call your agent)</label><input id="aname" maxlength="32" value="mara">
+  <label>Agent name (what you will call your agent)</label><input id="aname" maxlength="32" value="cairn">
   <label>Password (minimum 14 characters)</label><input id="pw1" type="password" autocomplete="new-password">
   <label>Confirm password</label><input id="pw2" type="password" autocomplete="new-password">
   <p class="note">The agent name also becomes this account's door slug (lowercased, hyphenated). Everything else about account lifecycle - signups, approvals, tiers - lives in Settings after the wizard closes.</p>
@@ -8912,7 +9300,7 @@ var host = (location.hostname || "").toLowerCase();
     <input id="cbase" placeholder="http://127.0.0.1:11434/v1">
     <div class="hintline">Local model on this same machine (e.g. Ollama)? Use its /v1 URL above and type <code>none</code> as the key - local servers ignore it, and the daemon requires a non-empty key.</div>
   </div>
-  <label>Model id</label><input id="mid" placeholder="e.g. Qwen/Qwen3.8-Flash-Next">
+  <label>Model id</label><input id="mid" placeholder="the exact model name your provider uses">
   <label>API key (write-only; sealed on save, never shown again)</label><input id="mkey" type="password" autocomplete="new-password">
   <button id="b3">Save model</button> <button id="s3skip" class="ghost">Skip for now</button>
   <div class="err" id="e3"></div>
@@ -8923,6 +9311,42 @@ var host = (location.hostname || "").toLowerCase();
   <div id="walk"><p class="note">Loading tiers&hellip;</p></div>
   <button id="b35">Finish &rarr;</button>
   <div class="err" id="e35"></div>
+</div>
+<div class="card hidden" id="s36">
+  <p style="margin-top:0">One last decision with real teeth: the <b>vault key</b>. Every secret this agent stores is sealed with one 4096-byte master key. None of this is one-time - the lockbox page at vault-key stays reachable forever, and Settings still works tomorrow.</p>
+  <div class="hintline" id="lbstate">Reading vault state...</div>
+  <div id="lbopts">
+  <p style="margin-top:16px"><b>Option 1 - Generate on this box.</b> A random 4096-byte key is written into the data directory (permissions 0600) and stays on this machine.</p>
+  <div class="note">Realistic warning: this key sits right beside the data it protects. It stops an escaped backup or a stolen database file. It does NOT stop anyone who owns this box. Think lock on the drawer, not safe in the bank.</div>
+  <button id="gbox36">Generate on box</button>
+  <p style="margin-top:20px"><b>Option 2 - Generate onto a USB stick.</b> The key lives on a flash drive instead of this machine. Read every line before choosing it:</p>
+  <ul class="note" style="margin:6px 0 0 20px">
+  <li>While this drive sits in this machine, it is a house key left in the front door.</li>
+  <li>Lose the stick and the secrets are gone. There is no recovery by design - not even for the daemon.</li>
+  <li>Before a key is written you must confirm a SECOND stick is ready to clone onto. One stick is one accident away from losing everything.</li>
+  <li>Rebooting this machine seals the vault until the drive is re-staged here.</li>
+  <li>Unplugging mid-use seals the vault the instant the key is next needed (fail closed).</li>
+  </ul>
+  <label>Mount point of the stick</label><input id="usbdir36" placeholder="e.g. /media/usb" autocomplete="off">
+  <button id="gusb36">Generate onto USB</button>
+  <div id="usbcfm36" class="hidden">
+  <div class="note"><b>Second stick check:</b> the key is about to be written. Do you have another USB stick ready right now to receive an immediate clone? If not, stop here and get one first.</div>
+  <button id="gusb362">Yes, second stick ready - write the key</button>
+  </div>
+  <div id="lbclone" class="hidden">
+  <div class="note"><b>CLONE IT NOW.</b> Copy cairn-vault.key from this stick onto your second stick before anything else. One stick is one accident away from losing everything.</div>
+  <button id="lbgo">Cloned - finish setup</button>
+  </div>
+  <p style="margin-top:20px"><b>Option 3 - Bring your own key.</b> Stage 4096 random bytes on this machine, then point the daemon at the file:</p>
+  <div class="risk">head -c 4096 /dev/urandom > /run/cairn-vault.key
+chmod 600 /run/cairn-vault.key</div>
+  <div class="note">/run is tmpfs: after a reboot the file is gone and the vault stays sealed until you stage it again. Any stable absolute path works; the file must be exactly 4096 bytes.</div>
+  <label>Path to check</label><input id="bypopath36" value="/run/cairn-vault.key" autocomplete="off">
+  <button id="gchk36">Check this path</button>
+  </div>
+  <p style="margin-top:20px"><b>Not now.</b> The vault stays sealed: chat, files, and sessions keep working; only vault-backed secrets return 503 with a pointer to the lockbox page at vault-key.</p>
+  <button id="skip36" class="ghost">Not now - enter chat</button>
+  <div class="err" id="e36"></div>
 </div>
 <div class="card hidden" id="s4">
   <p style="margin-top:0" class="ok"><b>The wizard is closed.</b> The owner exists, the door is welded, and your session is live.</p>
@@ -8937,7 +9361,7 @@ var host = (location.hostname || "").toLowerCase();
 (function(){
 var RISK_SHA="__RISK_SHA__",owner=null;
 function $(i){return document.getElementById(i)}
-function step(n){[1,2,3,"35",4].forEach(function(k){$("s"+k).className="card"+(k===n?"":" hidden");$("st"+k).className=(k===n?"on":"")});}
+function step(n){[1,2,3,"35","36",4].forEach(function(k){$("s"+k).className="card"+(k===n?"":" hidden");$("st"+k).className=(k===n?"on":"")});}
 $("ack").addEventListener("change",function(){$("b1").disabled=!this.checked});
 $("b1").onclick=function(){step(2)};
 $("prov").addEventListener("change",function(){$("customwrap").className=(this.value==="custom"||this.value==="ollama")?"":"hidden"});
@@ -9020,7 +9444,66 @@ function walkInit(){
     c.innerHTML='<p class="note">Could not load the tiers. No problem - everything is editable in Settings &rsaquo; Identity.</p>';
   });
 }
-$("b35").onclick=function(){step(4)};
+var key36=false;
+function lbmsg(ok,msg){var e=$("e36");e.className="err"+(ok?" ok":"");e.textContent=msg||"";}
+$("b35").onclick=function(){
+  fetch("api/vault-key/status",{credentials:"same-origin"}).then(function(r){
+    if(r.status!==200){throw new Error("HTTP "+r.status)}
+    return r.json();
+  }).then(function(d){
+    step("36");
+    if(d.ready){
+      key36=true;
+      $("lbstate").className="err ok";
+      $("lbstate").textContent="VAULT KEY LIVE (scope "+String(d.scope)+"). Nothing left to decide here.";
+      $("lbopts").className="hidden";
+      $("skip36").textContent="Continue to finish";
+    }else if(d.env_strict){
+      $("lbstate").textContent="VAULT SEALED - and this daemon runs with VAULT_KEY_PATH set: explicit means exact, so generating a key here stays refused. Stage the key at that exact path (install docs), or enter chat and handle it later.";
+    }else{
+      $("lbstate").textContent="VAULT SEALED - vault-backed secrets return 503 until a key exists. Pick an option below, or enter chat now; the lockbox page at vault-key stays reachable forever.";
+    }
+  }).catch(function(){
+    step("36");
+    $("lbstate").textContent="Could not read vault state just now - the options below still work, and the exit below always works.";
+  });
+};
+$("gbox36").onclick=function(){
+  post("api/vault-key/gen-box",{}).then(function(r){
+    if(r.code===200&&r.j.ok){key36=true;lbmsg(true,"Key written to the data directory. Lock on the drawer, not safe in the bank - the vault-key page lets you upgrade later.");setTimeout(function(){step(4)},1600);}
+    else{lbmsg(false,"Refused: "+(r.j.error||("HTTP "+r.code)));}
+  }).catch(function(){lbmsg(false,"network error - nothing was written unless the daemon says otherwise.");});
+};
+function usbDone(r){
+  $("usbcfm36").className="hidden";
+  if(r.code===200&&r.j&&r.j.ok){
+    key36=true;
+    $("lbopts").className="hidden";
+    $("lbclone").className="";
+    $("lbstate").className="err ok";
+    $("lbstate").textContent="KEY WRITTEN TO STICK: "+String(r.j.path||"");
+    lbmsg(true,String(r.j.reminder||"Clone this stick to a second one now."));
+  }else{lbmsg(false,"Refused: "+((r.j&&r.j.error)||("HTTP "+r.code)));}
+}
+$("gusb36").onclick=function(){
+  post("api/vault-key/gen-usb",{dir:$("usbdir36").value}).then(function(r){
+    if(r.j&&r.j.need_second_stick){$("usbcfm36").className="";lbmsg(false,"Nothing was written yet. Get the second stick ready, then confirm below.");return}
+    usbDone(r);
+  }).catch(function(){lbmsg(false,"network error");});
+};
+$("gusb362").onclick=function(){
+  post("api/vault-key/gen-usb",{dir:$("usbdir36").value,confirm2:true}).then(usbDone).catch(function(){lbmsg(false,"network error");});
+};
+$("lbgo").onclick=function(){step(4)};
+function byoDone(r){
+  if(r.code===200&&r.j&&r.j.ok){key36=true;lbmsg(true,"Key accepted. The daemon adopted it through the pointer file.");setTimeout(function(){step(4)},1600);}
+  else{lbmsg(false,"Nope: "+((r.j&&r.j.error)||("HTTP "+r.code)));}
+}
+$("gchk36").onclick=function(){post("api/vault-key/check",{path:$("bypopath36").value}).then(byoDone).catch(function(){lbmsg(false,"network error");});};
+$("skip36").onclick=function(){
+  if(key36){step(4);return}
+  post("api/vault-key/skip",{}).then(function(){step(4)}).catch(function(){step(4)});
+};
 $("ver").textContent=document.documentElement.getAttribute("data-v")||"";
 })();
 </script>
@@ -12531,7 +13014,7 @@ WEB_UI_CHAT = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" id="themeColor" content="#05070d">
 <base href="/mara/">
-<script>try{document.documentElement.dataset.theme=localStorage.getItem('mara-theme')||'neon';}catch(e){}</script>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('cairn-theme')||'neon';}catch(e){}</script>
 <title>C.A.I.R.N.</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="static/color.png">
@@ -12580,6 +13063,7 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;bac
 button:not(.btn):not(.btn-small):not(.icon-btn):not(.jumpbtn):not(.pop-item){background:var(--surface);color:var(--accent);border:1px solid var(--border);border-radius:8px;padding:0 12px;min-height:34px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
 #chatModelNote:not([hidden]){display:flex;gap:8px;align-items:center;flex-wrap:wrap;width:100%}
 #chatModelBar select,#chatModelBar input{box-sizing:border-box;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;font-family:inherit;min-width:0;max-width:100%}
+#chatModelLabel{max-width:55%}
 input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px}
@@ -12686,6 +13170,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .chat-col{gap:8px}
 .topbar{gap:2px;padding-left:6px;padding-right:6px}
 #chatModelBar{font-size:11px}
+#chatModelLabel{max-width:100%;flex:1 1 100%}
 }
 @media (min-width:900px){
   .chat{padding:24px 24px 12px}
@@ -12698,7 +13183,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
   <button id="menuBtn" class="icon-btn" aria-label="Conversations">
     <svg viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
   </button>
-  <div class="brand"><img class="logo" src="api/avatar" onerror="this.onerror=null;this.src='static/color.png'" alt=""><span class="brand-name">Mara</span></div>
+  <div class="brand"><img class="logo" src="api/avatar" onerror="this.onerror=null;this.src='static/color.png'" alt=""><span class="brand-name">C.A.I.R.N.</span></div>
   <span id="ctxMeter" class="ctxmeter"></span>
   <button id="exportBtn" class="icon-btn" title="Export conversation" hidden>
     <svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></svg>
@@ -12742,7 +13227,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 <footer class="composer">
   <div id="queueBar" class="queuebar" hidden></div>
   <div id="attachChips" class="attach-chips"></div>
-  <div id="chatModelBar" style="font-size:12px;color:var(--dim);padding:0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%"></span><button id="chatModelEdit" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span><span id="cmHits" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
+  <div id="chatModelBar" style="font-size:12px;color:var(--dim);padding:0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><button id="chatModelEdit" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Change the model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span><span id="cmHits" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
   <div class="composer-col">
     <button id="attachBtn" class="icon-btn" title="Attach files">
       <svg viewBox="0 0 24 24"><path d="M21 12l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8L13 4.5a3.7 3.7 0 0 1 5.2 5.2l-8.2 8.2a1.85 1.85 0 0 1-2.6-2.6L15 7.5"/></svg>
@@ -12752,7 +13237,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
     </button>
     <input type="file" id="filePick" multiple hidden>
     <input type="file" id="camPick" accept="image/*" capture="environment" hidden>
-    <textarea id="msgInput" rows="1" placeholder="Message Mara…" autocomplete="off"></textarea>
+    <textarea id="msgInput" rows="1" placeholder="Message your agent..." autocomplete="off"></textarea>
     <button id="sendBtn" class="send-btn" aria-label="Send">
       <svg class="send-ico" viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>
       <svg class="stop-ico" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
@@ -12777,7 +13262,7 @@ const convList = $('convList'), newChatBtn = $('newChatBtn');
 const chatArea = $('chatArea'), chatCol = $('chatCol'), emptyState = $('emptyState');
 const msgInput = $('msgInput'), sendBtn = $('sendBtn');
 // dynbrand (K80 2026-09-28): the brand is the registry agent_name, not a constant.
-window.AGENT = 'Mara';
+window.AGENT = 'your agent';
 fetch('api/me', {credentials: 'same-origin'}).then(function(r){ return r.json(); }).then(function(j){
   if (j && j.authenticated && j.agent_name) {
     window.AGENT = j.agent_name;
@@ -12926,7 +13411,7 @@ const exportBtn = $('exportBtn'), exportPop = $('exportPop');
 function applyTheme(t) {
   t = t || THEME_DEFAULT;
   document.documentElement.dataset.theme = t;
-  try { localStorage.setItem('mara-theme', t); } catch (e) {}
+  try { localStorage.setItem('cairn-theme', t); } catch (e) {}
   const meta = document.getElementById('themeColor');
   if (meta) {
     const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
@@ -13496,7 +13981,7 @@ function send() {
       });
       if (resp.status === 409) {
         udiv.remove();
-        flashNote((window.AGENT || 'Mara') + ' is still working on the previous message — showing live.');
+        flashNote((window.AGENT || 'your agent') + ' is still working on the previous message — showing live.');
         refreshSendFace();
         streaming = false;
         attachStream(conv);
@@ -13768,7 +14253,7 @@ async function doExport(fmt) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'mara-' + currentConv.slice(0, 8) + (fmt === 'json' ? '.json' : '.md');
+    a.download = 'cairn-' + currentConv.slice(0, 8) + (fmt === 'json' ? '.json' : '.md');
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -13803,6 +14288,190 @@ if ('serviceWorker' in navigator) {
 """
 
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
+WEB_UI_LOCKBOX = """
+<!DOCTYPE html>
+<html lang="en" data-theme="neon">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" id="themeColor" content="#05070d">
+<base href="/mara/">
+<script>try{document.documentElement.dataset.theme=localStorage.getItem("cairn-theme")||"neon";}catch(e){}</script>
+<link rel="apple-touch-icon" href="static/color.png">
+<title>C.A.I.R.N. // Lockbox</title>
+<style>
+:root{--bg:#05070d;--surface:#0b111c;--border:#1c2b45;--text:#dfe9f5;--dim:#5f7896;--accent:#00e5ff;--ok:#3ddc84;--warn:#ffb020;--bad:#ff5c6c;color-scheme:dark}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);padding:16px 16px 48px;min-height:100vh;-webkit-font-smoothing:antialiased}
+.wrap{max-width:720px;margin:0 auto}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.who{display:flex;align-items:center;gap:10px}
+.logo{height:26px;width:26px;border-radius:50%;border:1px solid var(--border)}
+.brand{font-size:15px;letter-spacing:1px}
+.header a{color:var(--dim);text-decoration:none;font-size:14px;padding:10px 12px;border-radius:8px}
+.header a:hover{color:var(--accent);background:var(--surface)}
+h1{font-size:20px;margin-bottom:6px}
+.sub{color:var(--dim);font-size:14px;margin-bottom:14px;line-height:1.5}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:14px}
+.card h2{font-size:16px;margin-bottom:8px}
+.card p{font-size:14px;line-height:1.5;margin-bottom:8px}
+.banner{border-radius:14px;padding:14px 16px;margin-bottom:14px;border:1px solid var(--border);background:var(--surface)}
+.bstat{font-size:15px;letter-spacing:1px;margin-bottom:4px}
+.banner.ok{border-color:var(--ok)}
+.banner.ok .bstat{color:var(--ok)}
+.banner.sealed{border-color:var(--warn)}
+.banner.sealed .bstat{color:var(--warn)}
+.bdetail{font-size:13px;color:var(--dim);line-height:1.5}
+.optdim{opacity:.55}
+.warn{border:1px solid var(--warn);border-radius:10px;padding:10px 12px;margin:8px 0}
+.warn p{font-size:13px;line-height:1.5;margin:0}
+.card ul{margin:8px 0 8px 20px}
+.card li{font-size:13px;margin:4px 0;line-height:1.45}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 12px;overflow-x:auto;font-size:13px;margin:8px 0}
+input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:11px 12px;font-size:15px;margin:8px 0}
+.btn{display:inline-block;min-height:44px;padding:11px 18px;border:1px solid var(--accent);border-radius:10px;background:transparent;color:var(--accent);font-size:14px;cursor:pointer;text-decoration:none;margin:4px 8px 0 0}
+.btn:hover{background:var(--surface)}
+.btn.warnbtn{border-color:var(--warn);color:var(--warn)}
+.msg{font-size:13px;margin-top:8px;line-height:1.5}
+.msg.ok{color:var(--ok)}
+.msg.err{color:var(--bad)}
+.hidden{display:none}
+.footer{text-align:center;margin-top:22px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="header">
+<div class="who"><img class="logo" src="static/color.png" alt=""><span class="brand">C.A.I.R.N. // Lockbox</span></div>
+<a href="">Back to chat</a>
+</div>
+<h1>The master key for the memory vault</h1>
+<div class="sub">Every secret your agent stores is sealed with one 4096-byte master key. This page is where that key comes from. Key bytes never leave the machine and are never shown on this page.</div>
+<div class="banner" id="banner">
+<div class="bstat" id="bstat">CHECKING...</div>
+<div class="bdetail" id="bdetail">Reading vault state.</div>
+</div>
+<div class="banner hidden" id="envnote">
+<div class="bstat">ENV LOCK</div>
+<div class="bdetail">This daemon runs with VAULT_KEY_PATH set in its environment, and explicit means exact: only that path is ever read. Generating a key from this page stays refused until the env var is removed - or you stage your key at exactly that path.</div>
+</div>
+<div class="banner hidden" id="liveopts"><div class="bdetail">While a key is live the two generate options stay parked - the daemon never overwrites a working key, on purpose. "Bring your own key" below still works: checking a valid path re-points the vault at it. The generate options wake up any time the vault is sealed (restore, fresh box).</div></div>
+<div class="card" id="opt1">
+<h2>1. Generate on this box</h2>
+<p>Simplest option. A random 4096-byte key is written into the data directory with strict 0600 permissions and stays on this machine.</p>
+<div class="warn"><p>Realistic warning: this key sits right beside the data it protects. It stops an escaped backup or a stolen database file. It does NOT stop anyone who owns this box. Think lock on the drawer, not safe in the bank.</p></div>
+<button class="btn" id="gbox">Generate on box</button>
+<div class="msg" id="mbox"></div>
+</div>
+<div class="card" id="opt2">
+<h2>2. Generate onto a USB stick</h2>
+<p>Stronger separation: the key lives on a flash drive instead of the machine holding the data. Type the exact mount point of the stick below.</p>
+<ul>
+<li>While this drive sits in this machine, it is a house key left in the front door.</li>
+<li>Lose the stick and the secrets are gone. There is no recovery by design - not even for the daemon.</li>
+<li>Before a key is written you must confirm a SECOND stick is ready to clone onto. One stick is one accident away from losing everything.</li>
+<li>Rebooting this machine seals the vault until the drive is re-staged here.</li>
+<li>Unplugging mid-use seals the vault the instant the key is next needed (fail closed).</li>
+</ul>
+<input id="usbdir" placeholder="mount point, e.g. /media/usb" autocomplete="off">
+<button class="btn" id="gusb">Generate onto USB</button>
+<div class="hidden" id="usbcfm">
+<div class="warn"><p>Second stick check: the key is about to be written. Do you have another USB stick ready right now to receive an immediate clone? If not, stop here and get one first.</p></div>
+<button class="btn warnbtn" id="gusb2">Yes, second stick ready - write the key</button>
+</div>
+<div class="msg" id="musb"></div>
+</div>
+<div class="card">
+<h2>3. Bring your own key</h2>
+<p>Already staged a key, or want to stage one by hand? Generate 4096 bytes of randomness on this machine, then point the daemon at it.</p>
+<pre class="mono">head -c 4096 /dev/urandom > /run/cairn-vault.key
+chmod 600 /run/cairn-vault.key</pre>
+<p>The path above is an example - any stable absolute path works, on any disk the daemon can read. One caveat: /run is tmpfs, so after a reboot the file is gone and the vault stays sealed until you stage the key again. Pick a permanent path if you want it to survive reboots. The file must be exactly 4096 bytes.</p>
+<p>Checking a valid path adopts it through a pointer file (vault-key-path.conf). The pointer is not a secret; the key bytes never move and are never displayed.</p>
+<input id="bypopath" value="/run/cairn-vault.key" autocomplete="off">
+<button class="btn" id="gchk">Check this path</button>
+<div class="msg" id="mbyo"></div>
+</div>
+<div class="card">
+<h2>Not now</h2>
+<p>The vault stays sealed: chat, files, and sessions keep working; only vault-backed secrets return 503. Nothing is lost by waiting, and this page stays reachable at vault-key whenever you are ready.</p>
+<button class="btn warnbtn" id="gskip">Not now, keep going</button>
+<div class="msg" id="mskip"></div>
+</div>
+<div class="card">
+<h2>What the daemon checks</h2>
+<p>First valid key found wins, in this order:</p>
+<ul class="mono" id="ladder"><li>loading...</li></ul>
+</div>
+<div class="footer"><a class="btn" href="">Enter chat</a></div>
+</div>
+<script>
+function $(x){return document.getElementById(x);}
+function api(path,body){
+var opt={};
+if(body){opt.method="POST";opt.headers={"Content-Type":"application/json"};opt.body=JSON.stringify(body);}
+return fetch(path,opt).then(function(r){
+return r.json().then(function(j){return {code:r.status,json:j};},function(){return {code:r.status,json:{error:"server returned an unreadable response"}};});
+},function(){return {code:0,json:{error:"network error - is the daemon running?"}};});
+}
+function say(id,txt,good){var e=$(id);e.textContent=txt;e.className="msg "+(good?"ok":"err");}
+function render(st){
+var b=$("banner");
+if(st.ready){
+b.className="banner ok";
+$("bstat").textContent="VAULT KEY LIVE";
+$("bdetail").textContent="Scope: "+String(st.scope)+". Path: "+String(st.path)+". The vault can open whenever a secret is needed.";
+["opt1","opt2"].forEach(function(k){var e=$(k);if(e){e.className="card optdim";}});
+$("liveopts").className="banner";
+}else{
+b.className="banner sealed";
+$("bstat").textContent="VAULT SEALED";
+$("bdetail").textContent="No working 4096-byte key is live. Everything else keeps working; vault-backed secrets return 503 with a pointer to this page.";
+["opt1","opt2"].forEach(function(k){var e=$(k);if(e){e.className="card";}});
+$("liveopts").className="banner hidden";
+}
+var l=$("ladder");
+while(l.firstChild){l.removeChild(l.firstChild);}
+var cands=st.candidates||[];
+for(var i=0;i<cands.length;i++){
+var c=cands[i];
+var li=document.createElement("li");
+li.textContent=String(c.path)+" - "+(c.valid?"valid, 4096 bytes":(c.exists?"exists but wrong size":"absent"));
+l.appendChild(li);
+}
+$("envnote").className=st.env_strict?"banner sealed":"banner hidden";
+}
+function refresh(){api("api/vault-key/status").then(function(r){if(r.code===200){render(r.json);}});}
+function after(r,id,goodtxt){
+if(r.json&&r.json.ok){say(id,goodtxt,true);}
+else{say(id,(r.json&&r.json.error)?r.json.error:"failed",false);}
+refresh();
+}
+$("gbox").onclick=function(){api("api/vault-key/gen-box",{}).then(function(r){after(r,"mbox","Key written to the data directory. The vault is live on this box.");});};
+$("gusb").onclick=function(){
+api("api/vault-key/gen-usb",{dir:$("usbdir").value}).then(function(r){
+if(r.json&&r.json.need_second_stick){$("usbcfm").className="";say("musb","Nothing was written. Get a second stick ready, then confirm below.",false);return;}
+after(r,"musb","Key written to the stick.");
+});};
+$("gusb2").onclick=function(){
+api("api/vault-key/gen-usb",{dir:$("usbdir").value,confirm2:true}).then(function(r){
+$("usbcfm").className="hidden";
+if(r.json&&r.json.ok){say("musb",String(r.json.reminder||"Key written. Clone this stick to a second one now."),true);}
+else{say("musb",(r.json&&r.json.error)?r.json.error:"failed",false);}
+refresh();
+});};
+$("gchk").onclick=function(){api("api/vault-key/check",{path:$("bypopath").value}).then(function(r){after(r,"mbyo","Key accepted. The daemon adopted it through the pointer file.");});};
+$("gskip").onclick=function(){api("api/vault-key/skip",{}).then(function(r){
+if(r.json&&r.json.ok){say("mskip",String(r.json.note||"Recorded."),true);}
+else{say("mskip","Could not record the choice.",false);}
+});};
+refresh();
+</script>
+</body>
+</html>
+"""
+
 WEB_UI_SETTINGS = """
 <!DOCTYPE html>
 <html lang="en" data-theme="neon">
@@ -13811,7 +14480,7 @@ WEB_UI_SETTINGS = """
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="theme-color" id="themeColor" content="#05070d">
 <base href="/mara/">
-<script>try{document.documentElement.dataset.theme=localStorage.getItem('mara-theme')||'neon';}catch(e){}</script>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('cairn-theme')||'neon';}catch(e){}</script>
 <link rel="apple-touch-icon" href="static/color.png">
 <title>C.A.I.R.N. // Settings</title>
 <style>
@@ -13962,7 +14631,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
 <div class="wrap">
 <div class="sbar">
   <button id="secBtn" aria-label="Settings menu" aria-haspopup="true" aria-controls="secDrawer"><svg viewBox="0 0 24 24" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg></button>
-  <div class="sbar-title">Mara<span class="slash">//</span>Settings</div>
+  <div class="sbar-title">C.A.I.R.N.<span class="slash">//</span>Settings</div>
   <span class="sbar-title" style="margin-left:auto;color:var(--dim);font-weight:400;font-size:12.5px"><a href="." style="color:var(--dim);text-decoration:none">Chat</a></span>
 </div>
 
@@ -14223,7 +14892,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <input id="f22ExpPw2" type="password" placeholder="repeat password" autocomplete="new-password">
   <label><input id="f22ExpUp" type="checkbox" checked> include uploads</label>
   <button id="f22ExpBtn">Export backup</button>
-  <p class="hint">Verify only reads and checks the file &mdash; it touches nothing. Stage verifies a container and saves it (still encrypted) on this box; it changes NOTHING. Applying a backup is a deliberate maintenance step run from a shell with the daemon STOPPED: <code>python3 marahome.py --import-staged</code> (takes a pre-import snapshot first, asks you to type REPLACE). Exports are built as owner-only (0600) temp files and deleted the moment your download finishes; anything a crashed build leaves behind is swept at next boot. Uploading a backup here (Verify / Stage) is browser-capped at 128&nbsp;MB; the Export side is not upload-limited - the archive simply downloads, bounded only by disk.</p>
+  <p class="hint">Verify only reads and checks the file &mdash; it touches nothing. Stage verifies a container and saves it (still encrypted) on this box; it changes NOTHING. Applying a backup is a deliberate maintenance step run from a shell with the daemon STOPPED: <code>python3 """ + SELF_NAME + """ --import-staged</code> (takes a pre-import snapshot first, asks you to type REPLACE). Exports are built as owner-only (0600) temp files and deleted the moment your download finishes; anything a crashed build leaves behind is swept at next boot. Uploading a backup here (Verify / Stage) is browser-capped at 128&nbsp;MB; the Export side is not upload-limited - the archive simply downloads, bounded only by disk.</p>
   <input id="f22ImpFile" type="file">
   <input id="f22ImpPw" type="password" placeholder="backup password" autocomplete="off">
   <button id="f22VerBtn">Verify</button>
@@ -14297,7 +14966,7 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
         var r = await fetch('api/backup/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(base) });
         var j = await r.json();
         if (!r.ok) { msg('restore failed: ' + (j.error || ('HTTP ' + r.status))); return; }
-        msg('STAGED (' + (j.parts ? j.parts.length : '?') + ' parts, created ' + j.created + '). To apply: stop the daemon, then run: python3 marahome.py --import-staged');
+        msg('STAGED (' + (j.parts ? j.parts.length : '?') + ' parts, created ' + j.created + '). To apply: stop the daemon, then run: python3 """ + SELF_NAME + """ --import-staged');
       } catch(e) { msg('restore failed: ' + e); }
     });
   })();
@@ -14608,7 +15277,7 @@ const THEME_DEFAULT = 'neon';
 function applyTheme(t) {
   t = t || THEME_DEFAULT;
   document.documentElement.dataset.theme = t;
-  try { localStorage.setItem('mara-theme', t); } catch (e) {}
+  try { localStorage.setItem('cairn-theme', t); } catch (e) {}
   const meta = document.getElementById('themeColor');
   if (meta) {
     const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
@@ -15315,7 +15984,7 @@ async function saveVaultEntry() {
   try {
     const r = await fetch('api/vault', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name, type: type, value: value }) });
     const d = await r.json();
-    if (!r.ok) { st.textContent = '✗ ' + (d.error || ('seal failed (HTTP ' + r.status + ')')); return; }
+    if (!r.ok) { st.textContent = (r.status === 503 ? '✗ NOT sealed - ' : '✗ ') + (d.error || ('seal failed (HTTP ' + r.status + ')')); return; }
     valueEl.value = '';
     st.textContent = 'Sealed ' + d.name + ' (' + d.bytes + ' bytes, encrypted). It can never be read back - seal again under the same name to rotate.';
     loadVault();
@@ -16325,11 +16994,11 @@ loadSettings(); loadMemory(); loadSkills(); loadSession(); loadApprovals(); load
 </html>
 """
 
-MANIFEST_WEB = """{"id": "/mara/", "name": "Mara", "short_name": "Mara", "description": "Mara's home on the rock - chat, memory, and the whole house's tools.", "start_url": "/mara/", "scope": "/mara/", "display": "standalone", "orientation": "any", "background_color": "#05070d", "theme_color": "#05070d", "icons": [{"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "any"}, {"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"}]}"""
+MANIFEST_WEB = """{"id": "/mara/", "name": "C.A.I.R.N.", "short_name": "C.A.I.R.N.", "description": "Your agent's home - chat, memory, and the whole house's tools.", "start_url": "/mara/", "scope": "/mara/", "display": "standalone", "orientation": "any", "background_color": "#05070d", "theme_color": "#05070d", "icons": [{"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "any"}, {"src": "/mara/static/color.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"}]}"""
 
 SERVICE_WORKER = """/* Mara PWA service worker — app-shell cache, API never cached.
    Mara | Auth: K80 | 2026-09-15 (P3.1) */
-const CACHE = 'mara-shell-v1';
+const CACHE = 'cairn-shell-v1';
 const SHELL = ['./', 'settings', 'static/color.png', 'manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {
@@ -16696,6 +17365,26 @@ class MaraHandler(BaseHTTPRequestHandler):
             if _f20_welcome_gate(self):
                 return
             self._html(200, WEB_UI_CHAT)
+        elif path == "/vault-key":
+            # 0.7a lockbox page. Owner-only: this is where the master key
+            # lives; a resident must never see the plumbing of their own cage.
+            u = self._auth_user()
+            if not u or u["status"] != "active":
+                self._redirect_login()
+                return
+            if u["role"] != "owner":
+                self._json(403, {"error": "owner only"})
+                return
+            self._html(200, WEB_UI_LOCKBOX)
+        elif path == "/api/vault-key/status":
+            u = self._auth_user()
+            if not u or u["status"] != "active":
+                self._json(401, {"error": "authentication required"})
+                return
+            if u["role"] != "owner":
+                self._json(403, {"error": "owner only"})
+                return
+            self._json(200, _vault_lockbox_state())
         elif path == "/settings":
             if not self._auth_user():
                 self._redirect_login()
@@ -17334,7 +18023,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def _auth_user(self):
-        m = re.search(r"(?:^|;\s*)msession=([a-z0-9-]+)", self.headers.get("Cookie", ""))  # P1-C/F10: anchored - a junk cookie whose VALUE contains msession= no longer wins
+        m = re.search(r"(?:^|;\s*)cairn-session=([a-z0-9-]+)", self.headers.get("Cookie", ""))  # P1-C/F10: anchored - a junk cookie whose VALUE contains cairn-session= no longer wins
         if not m:
             return None
         uname = session_user(m.group(1))
@@ -17365,7 +18054,7 @@ class MaraHandler(BaseHTTPRequestHandler):
         if hasattr(self, "_c03_gid"):
             return self._c03_gid
         gid = None
-        m = re.search(r"(?:^|;\s*)msession=([a-z0-9-]+)", self.headers.get("Cookie", ""))
+        m = re.search(r"(?:^|;\s*)cairn-session=([a-z0-9-]+)", self.headers.get("Cookie", ""))
         if m:
             htok = _tok_hash(m.group(1))
             with _reg_db() as db:
@@ -17414,18 +18103,23 @@ class MaraHandler(BaseHTTPRequestHandler):
         return self._guest_can_conv(username, row[1])
 
     def _redirect_login(self):
+        # K80 ruling 2026-09-28 (supersedes the S3 per-door landing): logged-out
+        # users go to the ORIGIN ROOT front desk - "/login", absolute. Doors are
+        # rooms, not desks; the desk has exactly one address. Topology note for
+        # operators: the reverse proxy must therefore proxy /login (and the PWA
+        # plumbing) at the origin root - this is the documented default install.
         self.send_response(302)
-        self.send_header("Location", "login")
+        self.send_header("Location", "/login")
         self.end_headers()
 
     def _door_bounce(self):
         # P3.3 S3: door identity (K80 2026-09-16, refined 08:26). Caddy tags
-        # each door with X-Mara-Slug. Only the door's owner passes; anyone
+        # each door with X-Cairn-Slug (legacy X-Mara-Slug accepted one release). Only the door's owner passes; anyone
         # else - anonymous or logged in as a different user - is 302'd to
         # the door's login page. The login/signup pages and their APIs stay
         # reachable by everyone: that is the landing page. /mara/ is a room;
         # the landing is the login page (K80).
-        door = self.headers.get("X-Mara-Slug")
+        door = self.headers.get("X-Cairn-Slug") or self.headers.get("X-Mara-Slug")
         p = self._clean_route()  # T-A6: exclusions must see the STRIPPED path
         if p in ("/login", "/signup", "/api/login", "/api/signup", "/api/logout"):
             return False
@@ -17498,7 +18192,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._json(503, {"error": "vault crypto library unavailable"})
             return False
         if _vault_master_key() is None:
-            self._json(503, {"error": "vault key not staged (stage the master key file at VAULT_KEY_PATH)"})
+            self._json(503, {"error": "vault key not staged - run the lockbox step to create one, or stage a key file per the install docs"})
             return False
         return True
 
@@ -17785,6 +18479,22 @@ class MaraHandler(BaseHTTPRequestHandler):
             # rate limit, risk-ack SHA check, field rules, and the
             # BEGIN IMMEDIATE zero-registry weld re-check.
             _f19_setup_owner(self)
+            return
+        if path in ("/api/vault-key/gen-box", "/api/vault-key/gen-usb",
+                    "/api/vault-key/check", "/api/vault-key/skip"):
+            # U3b: these shipped in do_GET by mistake; both lockbox JS
+            # callers POST them (they write). GET now 404s, as it should.
+            u = _lockbox_owner(self)
+            if not u:
+                return
+            if path == "/api/vault-key/gen-box":
+                _lockbox_gen_box(self, u)
+            elif path == "/api/vault-key/gen-usb":
+                _lockbox_gen_usb(self, u)
+            elif path == "/api/vault-key/check":
+                _lockbox_check(self, u)
+            else:
+                _lockbox_skip(self, u)
             return
         if path.startswith("/api/update/"):
             # F20: owner-only updater API; per-route checks live in the block.
@@ -18652,7 +19362,7 @@ class MaraHandler(BaseHTTPRequestHandler):
         elif path == "/api/logs/purge":
             _logs_route_purge(self)
         elif path == "/api/logout":
-            m = re.search(r"(?:^|;\s*)msession=([a-z0-9-]+)", self.headers.get("Cookie", ""))  # P1-C/F10: anchored - a junk cookie whose VALUE contains msession= no longer wins
+            m = re.search(r"(?:^|;\s*)cairn-session=([a-z0-9-]+)", self.headers.get("Cookie", ""))  # P1-C/F10: anchored - a junk cookie whose VALUE contains cairn-session= no longer wins
             if m:
                 _lgu = self._auth_user()
                 if _lgu:
@@ -18720,7 +19430,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 # accounts in this one daemon: activate in-daemon, one registry
                 # transaction. Managed hosts keep the script; sudo path below
                 # is untouched for them.
-                if not os.path.isfile("/etc/mara/mara-provision.py"):
+                if not os.path.isfile(_provision_script_path()):
                     registry_set_status(uid, "active", role)
                     log.info("approval: %s approved IN-DAEMON as %s by %s (no host provision script)",
                              target["username"], role, u["username"])
@@ -18738,7 +19448,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     self._json(409, {"error": "registry row has no slug - host provisioning cannot run; account left pending"})
                     return
                 try:
-                    rc = subprocess.run(["sudo", "/etc/mara/mara-provision.py", slug, role], capture_output=True, text=True, timeout=300)
+                    rc = subprocess.run(["sudo", _provision_script_path(), slug, role], capture_output=True, text=True, timeout=300)
                 except subprocess.TimeoutExpired:
                     log.error("approval: provision timed out for %s (%s)", target["username"], slug)
                     self._json(504, {"error": "provisioning timed out; account left pending, retry from the queue"})
@@ -20258,9 +20968,10 @@ class MaraHandler(BaseHTTPRequestHandler):
             out = json.dumps({"conversation": _c_pub, "messages": msgs_exp}, indent=2)
             ct = "application/json"; ext = "json"
         else:
-            lines = ["# " + (c["title"] or "Mara conversation"), "", "Exported " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), ""]
+            _who_a = _registry_agent_name(username) or "Assistant"  # dynbrand: exports carry the agent's real name
+            lines = ["# " + (c["title"] or _who_a + " conversation"), "", "Exported " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), ""]
             for r in rows:
-                who = "Mara" if r["role"] == "assistant" else "You"  # P3.3: per-user display names
+                who = _who_a if r["role"] == "assistant" else "You"  # P3.3: per-user display names
                 lines.append("## " + who); lines.append(""); lines.append(r["content"])
                 atts_exp = []
                 if r["attachments"]:
@@ -20278,7 +20989,7 @@ class MaraHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Disposition", 'attachment; filename="' + _cd_filename("mara-" + conv_id[:8] + "." + ext) + '"')  # P1-E/J
+        self.send_header("Content-Disposition", 'attachment; filename="' + _cd_filename("cairn-" + conv_id[:8] + "." + ext) + '"')  # P1-E/J
         self.end_headers()
         self.wfile.write(body)
 
@@ -20454,7 +21165,7 @@ _F20_PIN_B64 = "YhKNUUe5poamlv0DL7s33+pQVJfzKosG0KcRb/Ljdx8="  # CAIRN master ke
 _F20_SCHEMA = 1
 _F20_MANIFEST_MAX = 262144          # 256 KB manifest cap (canon)
 _F20_TOTAL_MAX = 64 * 1024 * 1024   # 64 MB total payload cap (canon)
-_F20_ALLOW = ("marahome.py",)       # v1 install allowlist - exact paths only
+_F20_ALLOW = ("marahome.py", "cairn.py")       # v1 install allowlist - exact paths only
 _F20_DEFAULT_MANIFEST = "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/manifest.json"  # F25: community update channel (owner may override in Settings)
                               # manifest; the private build ships empty ON PURPOSE
                               # (zero unasked outbound, per honesty page)
@@ -20578,7 +21289,14 @@ def _f20_vkey(s):
     # (pre-release ordering, documented in help). 64-bit version wars deferred.
     parts = [int(x) for x in m.group(1).split(".")]
     parts += [0] * (6 - len(parts))
-    return tuple(parts + [(1 if m.group(2) else 0, m.group(2))])
+    # 0.7a: suffix compares as (letters, digits-as-int), so 0.6u10 sorts
+    # ABOVE 0.6u9 (old lexicographic nit: "u10" < "u9" as strings). Junk
+    # trailing the digits is ignored. Bare < suffixed preserved.
+    suf = m.group(2)
+    sm = _f20_re.match(r"([A-Za-z]*)(\d*)\Z", suf)
+    letters = sm.group(1) if sm else suf
+    digits = int(sm.group(2)) if (sm and sm.group(2)) else 0
+    return tuple(parts + [(1 if suf else 0, letters, digits)])
 
 
 def _f20_guard(url, lan):
@@ -20927,7 +21645,7 @@ def _f20_snapshot(stamp):
     (d / "ROLLBACK.txt").write_text(
         "Manual rollback (code only - databases were not touched by the swap):\n"
         "  cp '" + str(d / "marahome.py") + "' '" + _F20_SRC + "' && "
-        "chown mara:mara '" + _F20_SRC + "' && systemctl restart marahome\n"
+        "chown mara:mara '" + _F20_SRC + "' && systemctl restart ' + SERVICE_UNIT + '\n"
         "\n"
         "V08 (round-8/9): secret settings are REDACTED from settings.json in this\n"
         "snapshot (keys kept, values replaced). Key recovery: the DB copies beside\n"
@@ -21389,9 +22107,9 @@ def _f20_cli_install(force=False):
         print("F20 install: " + err2)
         return 1
     print("F20 install: swap complete (snapshot " + info["snap"] + ")")
-    print("restart now:  sudo systemctl restart marahome")
+    print("restart now:  sudo systemctl restart ' + SERVICE_UNIT + '")
     print("rollback if needed:  cp '" + info["snap"] + "/marahome.py' '" + _F20_SRC +
-          "' && sudo systemctl restart marahome")
+          "' && sudo systemctl restart ' + SERVICE_UNIT + '")
     return 0
 
 
@@ -21948,7 +22666,7 @@ def _v18_transport_stance(bind_host, tls_served):
             "the clear for anyone on the path.%s"
             % (bind_host,
                " Acknowledged via MARA_ALLOW_INSECURE_LAN=1." if acked else
-               " Put TLS in front (/help/tls), bind MARA_HOST=127.0.0.1, or "
+               " Put TLS in front (/help/tls), bind CAIRN_HOST=127.0.0.1, or "
                "set MARA_ALLOW_INSECURE_LAN=1 to run plain-on-LAN knowingly."))
 def _tls_wire(server):
     """H08: TLS wiring with fail-closed semantics. Returns True when TLS will be
@@ -21978,7 +22696,7 @@ def _tls_wire(server):
                     "TLS mode=%s but cert %s could not be loaded (%s: %s) - "
                     "REFUSING to serve plaintext on non-loopback %s:%d. Fix the "
                     "cert, switch TLS mode to proxy, or boot once with "
-                    "MARA_HOST=127.0.0.1 as the maintenance door."
+                    "CAIRN_HOST=127.0.0.1 as the maintenance door."
                     % (_TLS_RUNTIME, _cert, type(_h8e).__name__, _h8e, HOST, PORT))
             log.error("TLS: mode=%s but %s could not be loaded (%s: %s) - PLAIN on LOOPBACK ONLY (maintenance door); fix the cert or switch mode",
                       _TLS_RUNTIME, _cert, type(_h8e).__name__, _h8e)
@@ -21988,7 +22706,7 @@ def _tls_wire(server):
             "TLS mode=%s but no usable cert+key pair exists - REFUSING to serve "
             "plaintext on non-loopback %s:%d. Generate the local CA, save an "
             "existing pair, switch TLS mode to proxy, or boot once with "
-            "MARA_HOST=127.0.0.1 as the maintenance door."
+            "CAIRN_HOST=127.0.0.1 as the maintenance door."
             % (_TLS_RUNTIME, HOST, PORT))
     log.error("TLS: mode=%s but no usable cert+key pair exists - PLAIN on LOOPBACK ONLY (maintenance door); generate the local CA or save an existing pair", _TLS_RUNTIME)
     return False
@@ -22030,7 +22748,7 @@ def main():
     # silently downgrading a formerly-HTTPS address to plaintext. Loopback
     # keeps the maintenance-door degrade. Wiring lives in _tls_wire().
     _tls_wire(server)
-    log.info("mara-home daemon v%s // %s // %s (sha %s) listening on %s:%d (pid %d)",
+    log.info("cairn daemon v%s // %s // %s (sha %s) listening on %s:%d (pid %d)",
              VERSION, BUILD_SERIES, BUILD_NAME, DAEMON_BUILD_SHA[:12], HOST, PORT, os.getpid())
     _v18_warn = _v18_transport_stance(HOST, TLS_SERVED)
     if _v18_warn:
