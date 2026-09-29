@@ -1,17 +1,15 @@
 {
   "schema": 1,
-  "released_utc": "2026-09-28T16:30:28Z",
-  "version": "0.6y",
+  "version": "0.7a",
   "min_allowed_version": "0.6",
-  "nonce": 16,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.6y/",
-  "files": [
-    {
-      "path": "marahome.py",
-      "sha256": "6e77fea5fa6c37ffbe66fe2a63cf4c4bab7318e04323c014c9858c6b9db647af",
-      "bytes": 1192730
-    }
-  ],
-  "notes": "v0.6y // v1 HELP + REGISTRY BRANDING + WIZARD EXIT (ALPHA): a new help/v1 topic explains the OpenAI-compatible /v1 door end to end with a setup walkthrough; the Session-card hint links to it and a stale 401 pointer (Settings > Model became Session) is fixed. UI branding now follows the registry: the chat tab title, sidebar brand, placeholder, settings header, and PWA manifest take the signed-in agent's name from the API, while sessionless surfaces (login, signup, shares, first boot) show C.A.I.R.N. instead of a borrowed persona; wizard and glossary copy address your new agent generically. The setup wizard's 'already initialized' 403 is no longer a dead end: it explains that an earlier submit most likely succeeded and links the login page, the network-error message carries the same pointer, and the CLI-facing JSON repeats it. One help example IP was genericized to an RFC 5737 documentation address. Evidence: count==1 anchored patches, py_compile, scratch-boot e2e (owner setup, settings, help, manifest, authed redirects, wizard replay through the 403 path), node --check on every served script block, F29 R6 release scan clean on the ship candidate. ALPHA build: automatic update from older builds is not supported. If you run an earlier build, please update manually (download and swap) after taking a backup. Nonce 16.",
-  "sig": "X8MaAYO9bte7QtlSjMwuYgWCVQVdzv9U+hzSV082NAm0uVplznkQrBfxijpdMBzfoWiLu5FyFYoUN8esCpYQDg=="
+  "nonce": 17,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/",
+  "files": [],
+  "key_rotation": {
+    "pubkey_b64": "lZDN1wMMPtKas5m5zdTb7YuO44jRrBghuzQUtq0k0P4=",
+    "nonce": 1
+  },
+  "notes": "CAIRN signing-key rotation: the update channel moves from the master ceremony key (a8d666d4) to the release key (d7ea6e53). This manifest carries NO code. Installs require owner confirmation; the previous pin is kept in history. Nonce 17.",
+  "released_utc": "2026-09-29T05:30:30Z",
+  "sig": "b7A3dXJ0xjgARNmQSqmGGCe+LIt+eswOU8cFLhItLsT78/BcxMJeA1XtY4W5RmvrI0b4TCdjw7bpGdDJjkQMDQ=="
 }
