@@ -41,7 +41,7 @@ keeping the lights on.
 
 ```bash
 sudo apt install python3 python3-cryptography tesseract-ocr ffmpeg
-python3 marahome.py           # listens on http://127.0.0.1:8470 (loopback)
+python3 cairn.py           # listens on http://127.0.0.1:8470 (loopback)
 # open http://localhost:8470 on that machine and follow the first-boot wizard
 ```
 

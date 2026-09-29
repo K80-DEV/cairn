@@ -160,7 +160,7 @@ CONTEXT_BUDGET = 262144  # 256K
 # build name HELD for the whole Basalt run (K80 12:34 - one name keeps
 # sanity; builds are distinguished by the version bump + build SHA).
 # FLINT is reserved for 1.0 itself (all caps, per S5a).
-VERSION = "0.6y"
+VERSION = "0.7a"
 BUILD_SERIES = "BASALT"    # 0.X series (S5a+K80 20:51Z: series name ALL CAPS too)
 BUILD_NAME = "GHOSTLIGHT"  # K80 rulings: S4f2 HELD for the whole Basalt run through 1.0;
 # S5a (2026-09-24 14:22 CDT) build names ALL CAPS from v0.6q (0.6n-0.6p shipped artifacts keep
