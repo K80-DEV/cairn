@@ -14,9 +14,9 @@ lives at `updates/<version>/cairn.py` inside its tag, and its bytes are
 attested by the signed manifest that shipped with it
 (`updates/manifest.json` at that tag):
 ```bash
-curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.7b/updates/0.7b/cairn.py
+curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.7c/updates/0.7c/cairn.py
 sha256sum cairn.py
-# expected: d8e6e0aefa445d6f2ea4093b2f9fc3d3aeceaff308acbae3760056d2a97fec24  cairn.py (1234160 bytes)
+# expected: 570f78a334766dada079fc24007730680dc5facee8bdae0a96c710b7978673a6  cairn.py (1234039 bytes)
 ```
 > 0.6x-era tags still ship `marahome.py` — that is the era spelling, not an
 > error. Coming from one of those? You arrive through the ferry in §8.
@@ -51,9 +51,10 @@ python3 cairn.py             # listens on 127.0.0.1:8470 (loopback only)
 > fails on first boot while creating them — point both at writable paths, or
 > run as root (or use the systemd unit in §5, which sets them).
 
-> **Legacy spelling:** `MARA_HOME` / `MARA_REGISTRY` are still read for
-> exactly one release (the `CAIRN_*` name wins when both are set). They go
-> away in 0.7b — set the new spellings now.
+> **Legacy spelling:** the `MARA_*` environment names are gone. 0.7b kept
+> only `MARA_HOME` / `MARA_REGISTRY` / `MARA_HOST` / `MARA_PORT` as
+> one-release fallbacks; **0.7c removed those too.** `CAIRN_*` is the only
+> spelling from here on — if you are still exporting `MARA_*`, switch now.
 
 Prove it is alive before touching a browser:
 ```bash
@@ -226,8 +227,16 @@ downgrades unless overridden from the CLI (`--update-install --force`).
 The renamed era moved: the file (`marahome.py` → `cairn.py`), the environment
 spellings (`MARA_*` → `CAIRN_*`), the state roots (`/var/lib/mara` →
 `/var/lib/cairn`, `/etc/mara` → `/etc/cairn`), and the door header
-(`X-Mara-Slug` → `X-Cairn-Slug`). Old spellings are accepted for exactly one
-release; **0.7b drops them.**
+(`X-Mara-Slug` → `X-Cairn-Slug`). The door header and path ladders went in
+0.7b; the last four `MARA_*` environment fallbacks went in **0.7c — the
+rename era is closed.**
+
+> **Upgrade contract, said plainly:** a 0.7a-or-older build cannot
+> auto-update to 0.7c — its update harness boots the staged file under
+> `MARA_*` names that 0.7c no longer reads, so the smoke-boot fails closed
+> and your live files stay untouched. Upgrade those installs manually with
+> the download in §1, then run the migration below. Builds at 0.7b or newer
+> auto-update normally.
 
 `cairn-migrate.py` ships with the release (download from the release channel or use the copy in `updates/0.7a/`). Run it once, as root:
 ```bash

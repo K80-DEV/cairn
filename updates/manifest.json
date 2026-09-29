@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "version": "0.7b",
+  "version": "0.7c",
   "min_allowed_version": "0.6",
-  "nonce": 19,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.7b/",
+  "nonce": 20,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.7c/",
+  "notes": "CAIRN 0.7c - PRE-RELEASE (alpha). Rename-era cleanup is complete: the last legacy env fallbacks (MARA_HOME, MARA_REGISTRY, MARA_HOST, MARA_PORT) are GONE - CAIRN_* env names are the only spellings, and the update smoke harness now passes CAIRN_* only. Upgrade note: automatic update to 0.7c works from 0.7b or newer (the 0.7b harness speaks both spellings); a pre-0.7b build cannot auto-stage this release - its smoke check fails closed, live files untouched - so upgrade manually per INSTALL.md after taking a backup. This build is ALPHA: auto-update remains owner-confirmed, databases are never auto-restored, and pre-release builds may break. Crossers from 0.6x: run the migration ferry (cairn-migrate.py, --dry-run first) BEFORE updating. Nonce 20.",
+  "released_utc": "2026-09-29T07:39:06Z",
   "files": [
     {
       "path": "cairn.py",
-      "sha256": "d8e6e0aefa445d6f2ea4093b2f9fc3d3aeceaff308acbae3760056d2a97fec24",
-      "bytes": 1234160
+      "sha256": "570f78a334766dada079fc24007730680dc5facee8bdae0a96c710b7978673a6",
+      "bytes": 1234039
     }
   ],
-  "notes": "CAIRN 0.7b - PRE-RELEASE (alpha). Compatibility drop after the 0.7a rename era: legacy MARA_* env spellings removed except the four state-location vars (MARA_HOME, MARA_REGISTRY, MARA_HOST, MARA_PORT) which are still read one more release for update-harness compatibility and go away at 0.7c; the X-Mara-Slug request header is no longer accepted (X-Cairn-Slug only); default-path ladders to /etc/mara and /var/lib/mara are gone. Operators with systemd units must set the CAIRN_* env names (values unchanged). This build is ALPHA: auto-update remains owner-confirmed, databases are never auto-restored, and pre-release builds may break. Crossers from 0.6x: run the migration ferry (cairn-migrate.py, --dry-run first) BEFORE updating. Nonce 19.",
-  "released_utc": "2026-09-29T07:14:31Z",
-  "sig": "goOsfqU3qAyQ8AeJgAGbUf3LaodH6h0lQGhitvqNexzJWRjYldMJ+cGoemJmoggSE0N5KbJYcP0omdAFx7AlCQ=="
+  "sig": "PPx2ZVgq7VtrDzab5/7fjz1G1EL0k1kRWpqQuim6zpkLp+ScD/xpUc1BnncC9e9Gv4ye5ECVyWPBqeeVk5tXDA=="
 }
