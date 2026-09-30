@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "version": "0.7c",
+  "version": "0.7d",
   "min_allowed_version": "0.6",
-  "nonce": 20,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.7c/",
-  "notes": "CAIRN 0.7c - PRE-RELEASE (alpha). Rename-era cleanup is complete: the last legacy env fallbacks (MARA_HOME, MARA_REGISTRY, MARA_HOST, MARA_PORT) are GONE - CAIRN_* env names are the only spellings, and the update smoke harness now passes CAIRN_* only. Upgrade note: automatic update to 0.7c works from 0.7b or newer (the 0.7b harness speaks both spellings); a pre-0.7b build cannot auto-stage this release - its smoke check fails closed, live files untouched - so upgrade manually per INSTALL.md after taking a backup. This build is ALPHA: auto-update remains owner-confirmed, databases are never auto-restored, and pre-release builds may break. Crossers from 0.6x: run the migration ferry (cairn-migrate.py, --dry-run first) BEFORE updating. Nonce 20.",
-  "released_utc": "2026-09-29T07:39:06Z",
+  "nonce": 21,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.7d/",
+  "notes": "CAIRN 0.7d - PRE-RELEASE (alpha). Round-10 audit fixes land as one build: the owner claim is token-free only for a browser DIRECT on the box (proxy/tunnel headers now defeat the loopback exception); header and body reads get a real wall-clock budget (an idle timeout is not a deadline); vault key files are vetted for size, entropy, permissions, and wrong-key (KCV), pointer writes are atomic and O_NOFOLLOW, memory-backed filesystems are refused as key homes; a backup that would silently miss sealed secrets now fails closed (resend with allow_vault_loss to accept); a missing or broken crypto import no longer kills the daemon (the updater fails closed instead). INSTALL S3 now matches how the wizard actually behaves. Upgrade contract unchanged: pre-0.7b builds cannot auto-stage this release (smoke-boot fails closed, live files untouched) - upgrade manually per INSTALL; 0.7b+ auto-update normally. This build is ALPHA: auto-update remains owner-confirmed, databases are never auto-restored, and pre-release builds may break. Crossers from 0.6x: run the migration ferry (cairn-migrate.py, --dry-run first).",
+  "released_utc": "2026-09-30T01:39:32Z",
   "files": [
     {
       "path": "cairn.py",
-      "sha256": "570f78a334766dada079fc24007730680dc5facee8bdae0a96c710b7978673a6",
-      "bytes": 1234039
+      "sha256": "34179f941bd4aebb5dc8a30866c02026fd5f3892a1b38638b8c8e383aee5a715",
+      "bytes": 1249691
     }
   ],
-  "sig": "PPx2ZVgq7VtrDzab5/7fjz1G1EL0k1kRWpqQuim6zpkLp+ScD/xpUc1BnncC9e9Gv4ye5ECVyWPBqeeVk5tXDA=="
+  "sig": "Y6BF1ftCCyFkQXLFknbTpEjdTVYyqDXzMlI9fwWqn7j9GioWnG5mE5VyX7NeqAf6ZaGoz7MhsQzYDymADrDjBg=="
 }
