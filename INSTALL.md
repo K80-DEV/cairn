@@ -14,9 +14,9 @@ lives at `updates/<version>/cairn.py` inside its tag, and its bytes are
 attested by the signed manifest that shipped with it
 (`updates/manifest.json` at that tag):
 ```bash
-curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.7d/updates/0.7d/cairn.py
+curl -fLO https://raw.githubusercontent.com/K80-DEV/cairn/refs/tags/v0.7e/updates/0.7e/cairn.py
 sha256sum cairn.py
-# expected: 34179f941bd4aebb5dc8a30866c02026fd5f3892a1b38638b8c8e383aee5a715  cairn.py (1249691 bytes)
+# expected: 62e25deb8eb1a6c652be6c62fe2946863d24fb73f9b377568e2d9ec8947a4e81  cairn.py (1253875 bytes)
 ```
 > 0.6x-era tags still ship `marahome.py` — that is the era spelling, not an
 > error. Coming from one of those? You arrive through the ferry in §8.
@@ -67,17 +67,17 @@ you will be asked to read and accept what an AI with local tools can do,
 create the owner account, connect a model, and decide where your vault key
 lives (§4 — you can defer, but read it first).
 
-> **Setup token (one time, one use):** the wizard is token-free only when
-> opened **directly on the machine itself** — a loopback connection with no
-> proxy or tunnel headers in sight. Binding to loopback alone is not enough:
-> a reverse proxy (Caddy, any tunnel) also arrives over loopback, so it looks
-> like the machine itself unless the headers say otherwise. If you bind the
-> daemon to a non-loopback address, or reach `/setup` through a proxy, before
-> an owner account exists, the daemon prints a one-use setup token at first
-> boot (`SETUP TOKEN (first boot, one use)` in the console/journal, also kept
-> 0600 at `state/setup-token` — printed once, never repeated) and the wizard
-> demands `/setup?t=<token>` — so whoever is on your LAN cannot claim the box
-> before you do.
+> **Setup token (one time, one use):** claiming the owner account ALWAYS
+> carries the token. A proxy cannot be told apart from an on-box browser at
+> the HTTP layer (a plain `proxy_pass` even rewrites `Host` to the loopback
+> upstream), so "looks local" never mints an owner. Before an owner exists
+> the daemon prints a one-use setup token at first boot (`SETUP TOKEN (first
+> boot, one use)` in the console/journal, also kept 0600 at
+> `state/setup-token` — printed once, never repeated); open the `/setup?t=<token>`
+> link it shows (the wizard carries the token into the claim for you). The
+> wizard page itself may still open without a token when you are direct on
+> the machine — that renders the form only; claiming still needs the token —
+> so whoever is on your LAN cannot claim the box before you do.
 
 State lives under `$CAIRN_HOME/state/` (default `/var/lib/cairn/state/`); the
 account registry is `$CAIRN_REGISTRY` (default `/var/lib/cairn/users.db`). Back it

@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "version": "0.7d",
+  "version": "0.7e",
   "min_allowed_version": "0.6",
-  "nonce": 21,
-  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.7d/",
-  "notes": "CAIRN 0.7d - PRE-RELEASE (alpha). Round-10 audit fixes land as one build: the owner claim is token-free only for a browser DIRECT on the box (proxy/tunnel headers now defeat the loopback exception); header and body reads get a real wall-clock budget (an idle timeout is not a deadline); vault key files are vetted for size, entropy, permissions, and wrong-key (KCV), pointer writes are atomic and O_NOFOLLOW, memory-backed filesystems are refused as key homes; a backup that would silently miss sealed secrets now fails closed (resend with allow_vault_loss to accept); a missing or broken crypto import no longer kills the daemon (the updater fails closed instead). INSTALL S3 now matches how the wizard actually behaves. Upgrade contract unchanged: pre-0.7b builds cannot auto-stage this release (smoke-boot fails closed, live files untouched) - upgrade manually per INSTALL; 0.7b+ auto-update normally. This build is ALPHA: auto-update remains owner-confirmed, databases are never auto-restored, and pre-release builds may break. Crossers from 0.6x: run the migration ferry (cairn-migrate.py, --dry-run first).",
-  "released_utc": "2026-09-30T01:39:32Z",
+  "nonce": 22,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/0.7e/",
+  "notes": "CAIRN 0.7e - PRE-RELEASE (alpha). Round-11 audit fixes land as one build: the first-boot owner claim now ALWAYS carries the setup token (a stock nginx proxy_pass rewrites Host to the loopback upstream, so 'looks direct-local' can never be trusted to mint an owner - the daemon console prints the token on first boot and the /setup?t=<token> link it shows carries it into the claim; the wizard page may still render on-box without it, exposing only the form); the TLS handshake now runs under the wall-clock deadline reaper like header and body reads (an idle timeout is not a deadline); memory and skill stores get a per-account TOTAL ceiling (8 MB / 2 MB) so no resident can fill the disk or inflate every prompt without bound; a closed, expired, or suspended share now answers the login exactly like a wrong password (no status oracle); ssh_run refuses leading-dash users and fences the destination with --; the OAuth redirect URI is computed for real (trailing-slash strip that actually runs, https-only, empty when unconfigured). INSTALL S2 re-pinned to the v0.7e tag. Upgrade contract unchanged: pre-0.7b builds cannot auto-stage this release (smoke-boot fails closed, live files untouched) - upgrade manually per INSTALL; 0.7b+ auto-update normally. This build is ALPHA: auto-update remains owner-confirmed, databases are never auto-restored, and pre-release builds may break. Crossers from 0.6x: run the migration ferry (cairn-migrate.py, --dry-run first). Nonce 22.",
+  "released_utc": "2026-10-02T16:36:13Z",
   "files": [
     {
       "path": "cairn.py",
-      "sha256": "34179f941bd4aebb5dc8a30866c02026fd5f3892a1b38638b8c8e383aee5a715",
-      "bytes": 1249691
+      "sha256": "62e25deb8eb1a6c652be6c62fe2946863d24fb73f9b377568e2d9ec8947a4e81",
+      "bytes": 1253875
     }
   ],
-  "sig": "Y6BF1ftCCyFkQXLFknbTpEjdTVYyqDXzMlI9fwWqn7j9GioWnG5mE5VyX7NeqAf6ZaGoz7MhsQzYDymADrDjBg=="
+  "sig": "rCd9V91TiDN31N2eQCRbNjHvdV3heAfDSGk4ogWSkjlorCl620x074819D7N6tlQftiaujHkFvTJrTvwCHQ0BQ=="
 }
