@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "version": "0.7a",
+  "min_allowed_version": "0.6",
+  "nonce": 17,
+  "base_url": "https://raw.githubusercontent.com/K80-DEV/cairn/main/updates/",
+  "files": [],
+  "key_rotation": {
+    "pubkey_b64": "lZDN1wMMPtKas5m5zdTb7YuO44jRrBghuzQUtq0k0P4=",
+    "nonce": 1
+  },
+  "notes": "CAIRN signing-key rotation: the update channel moves from the master ceremony key (a8d666d4) to the release key (d7ea6e53). This manifest carries NO code. Installs require owner confirmation; the previous pin is kept in history. Nonce 17.",
+  "released_utc": "2026-09-29T05:30:30Z",
+  "sig": "b7A3dXJ0xjgARNmQSqmGGCe+LIt+eswOU8cFLhItLsT78/BcxMJeA1XtY4W5RmvrI0b4TCdjw7bpGdDJjkQMDQ=="
+}

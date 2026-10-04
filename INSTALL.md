@@ -35,6 +35,7 @@ The master signing key fingerprint is the lowercase hex sha256 of the raw
 and older verified the dev-era key `a8d666d4…` — if a 0.7a-or-newer build
 quotes you that older fingerprint, the bytes are stale).
 
+Every freshly-installed box initially verifies against the compiled bootstrap pin - the master fingerprint `a8d666d4…` - because a new box has not yet taken the one-time key bootstrap described in section 7. After that bootstrap (and on every box installed since the 0.7a ceremony) the fingerprint is the release key above.
 Once installed, your own daemon republishes the fingerprint of the key it
 actually uses at `/api/update/status` (`key_fp`, owner-only) - a second look
 at the same fact from inside the box, independent of this repo.
@@ -227,6 +228,43 @@ downgrades unless overridden from the CLI (`--update-install --force`).
 > 0.7a rename leaves you with new bytes under the old name until you run the
 > ferry below — that is by design; the daemon does not rename the floor it is
 > standing on.
+
+## 7a. Brand-new box: the one-time key bootstrap
+A box installed from the current release carries the **bootstrap master pin**
+in its code (that compiled pin is the root of trust for the whole fleet). The
+update *channel*, however, signs with the **release key** minted at the 0.7a
+key ceremony. So a virgin box's first Check reports
+`signature invalid for the pinned key` — expected, not a fault, and it does
+not mean your download is tampered.
+Close the loop once, per box, by applying the master-signed rotation manifest
+through the shipped updater code itself. As the daemon user, from a terminal:
+```
+python3 - <<'EOF'
+import importlib.util, json, sys, urllib.request
+spec = importlib.util.spec_from_file_location("cairn", "/path/to/cairn.py")  # your live file
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+url = ("https://raw.githubusercontent.com/K80-DEV/cairn/main"
+       "/updates/bootstrap/manifest-rotation-nonce17.json")
+err, summ = m._f20_check(force=True, murl=url)   # force skips ONLY the version gate
+print("check:", err or summ)
+if err: sys.exit(1)
+assert summ["kind"] == "rotation" and summ["key_source"] == "pinned"
+man = json.loads(urllib.request.urlopen(url).read().decode())
+err2, res = m._f20_apply_rotation(man, summ)
+print("apply:", err2 or res)
+sys.exit(1 if err2 else 0)
+EOF
+```
+Restart the service afterwards. `--update-check` (or Settings → System) now
+verifies against the release key `d7ea6e53…`, and normal updates work from
+the **next** release onward. Until a newer release exists, Check correctly
+says the channel is not newer than you — that is the version gate doing its
+job, not a key problem.
+Guards, all proven before this document was published: the rotation manifest
+carries no code (`files: []`); the signature and anti-replay gates survive
+`--force`; replaying the rotation after it has been applied is refused; and
+your previous pin is kept in `state/update-pin.json` history. Never hand-edit
+that file — the rotation above is the only supported way the pin moves.
 
 ## 8. Crossing the river (0.6x → 0.7a)
 The renamed era moved: the file (`marahome.py` → `cairn.py`), the environment
