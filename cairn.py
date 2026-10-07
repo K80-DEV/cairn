@@ -233,6 +233,11 @@ UPLOAD_PENDING_SECS = 600   # V15: reserve expires if the file write never lands
 _QUOTA_GLOBAL = "*"         # sentinel user_quota row: instance-wide used_bytes
 TEXT_INLINE_MAX = 64 * 1024           # text files larger than this become tool pointers
 MAX_ATTACH_PER_MSG = 8
+# patch33 (K80 W1 2026-10-06): video frame ingest extracts frames CLIENT-side
+# and ships them as ordinary image uploads - one message can legitimately
+# carry a 24-64 frame set. Chat-send ceiling ONLY: agent reply file sinks
+# (send_file paths) deliberately keep MAX_ATTACH_PER_MSG = 8.
+MAX_ATTACH_PER_MSG_CHAT = 64
 IMAGE_MIME = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 TEXT_MIME = {"application/json", "application/xml", "application/javascript",
              "application/x-yaml", "application/yaml", "application/sql",
@@ -329,6 +334,16 @@ Be concise but preserve enough context that the next assistant can continue natu
 
 COMPACT_KEEP_RECENT = 12
 COMPACT_MAX_TOKENS = 30000
+# PATCH46/U29 (K80 2026-10-07, Agora exam): contextCompactRetainCount rides
+# the settings-import map as "compact_keep_recent". The fold honors it when
+# set; the house default 12 stays for every box that never imported one.
+# Fence 1..200: a 0 or junk value would fold nothing or eat the window.
+def compact_keep_recent_for(username):
+    try:
+        v = int(get_setting("compact_keep_recent", COMPACT_KEEP_RECENT, username))
+    except Exception:
+        return COMPACT_KEEP_RECENT
+    return v if 1 <= v <= 200 else COMPACT_KEEP_RECENT
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 for d in [STATE, SECRETS, LOGS, IDENTITY, MEMORY_DIR, SKILLS_DIR, UPLOADS_DIR, AVATAR_DIR]:
@@ -1042,6 +1057,13 @@ def init_db():
             pending_until REAL
         );
         CREATE INDEX IF NOT EXISTS idx_attachments_conv ON attachments(conv_id);
+        CREATE TABLE IF NOT EXISTS conv_folders (
+            conv_id TEXT NOT NULL,
+            folder TEXT NOT NULL,
+            user_id TEXT,
+            ts REAL NOT NULL,
+            PRIMARY KEY (conv_id, folder)
+        );
         CREATE TABLE IF NOT EXISTS user_quota (
             username TEXT PRIMARY KEY,
             used_bytes INTEGER NOT NULL DEFAULT 0
@@ -1069,6 +1091,25 @@ def init_db():
             created_at REAL
         );
         CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner);
+        CREATE TABLE IF NOT EXISTS prompts (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            name TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created REAL NOT NULL,
+            updated REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS prompts_user ON prompts(username);
+        CREATE TABLE IF NOT EXISTS msg_vec (
+            message_id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL,
+            conv_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            vec BLOB NOT NULL,
+            ts REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS msg_vec_user ON msg_vec(username, model);
         """)
         # One-time P2 migration: compaction tracking column (older DBs lack it)
         cols = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
@@ -1104,6 +1145,13 @@ def init_db():
         if "guest_id" not in ccols:
             if _add_col(db, "conversations", "guest_id", "TEXT"):
                 log.info("DB migration: added conversations.guest_id (C03)")
+        # U3 (patch15, K80 2026-10-04 "everything else needs to be there"):
+        # per-conversation system notes (header menu -> System prompt).
+        # Projection-time only, appended to the system prompt by
+        # build_api_messages. NULL/'' = prompt byte-identical to pre-U3.
+        if "sys_extra" not in ccols:
+            if _add_col(db, "conversations", "sys_extra", "TEXT"):
+                log.info("DB migration: added conversations.sys_extra (U3)")
         # V14 (0.6w): the guest-scoped list filters (user_id, guest_id) then
         # orders by updated_at - give that plan an index instead of a scan.
         # (Coordinates with T-E1's planned conversations(user_id, updated_at).)
@@ -1122,6 +1170,9 @@ def init_db():
         if "pending_until" not in acols:
             if _add_col(db, "attachments", "pending_until", "REAL"):
                 log.info("DB migration: added attachments.pending_until (V15)")
+        if "folder" not in acols:
+            if _add_col(db, "attachments", "folder", "TEXT NOT NULL DEFAULT ''"):
+                log.info("DB migration: added attachments.folder (patch34)")
         scols = {r[1] for r in db.execute("PRAGMA table_info(settings)")}
         if "username" not in scols:
             db.execute("CREATE TABLE IF NOT EXISTS settings_new (username TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY (username, key))")
@@ -3202,7 +3253,7 @@ def messages_token_count(messages: list) -> int:
     return total
 
 # ─── Context Engine (P2: real compaction, verbatim Agora prompt) ─────────────
-# --- S4f9: per-user compaction settings (admin/owner only) ---------------
+# --- S4f9 -> U13: per-user compaction settings (individual level) --------
 # Blank = the house original: the verbatim Agora prompt is a CODE CONSTANT
 # (COMPACT_PROMPT above), so "reset" is just clearing the settings row -
 # no snapshot needed (unlike the F3 system-prompt editor).
@@ -3231,37 +3282,69 @@ def run_compaction(conv_id: str, messages: list, model_cfg: dict, status=None, u
     """
     if status:
         status("Compacting long conversation into a continuity handoff — this takes a bit...")
-    older = messages[:-COMPACT_KEEP_RECENT]
+    _kr46 = compact_keep_recent_for(username)  # PATCH46/U29
+    older = messages[:-_kr46]
     t0 = time.time()
+    # PATCH42/U26: windowed chained compaction (K80 2026-10-07). Fresh
+    # Agora-style imports carry the FULL uncompacted history at once (lore
+    # convs here run 1.5M-9.2M chars). One-shot compaction of a transcript
+    # bigger than the model's own window dies at the provider, the except
+    # path then hard-trims to COMPACT_KEEP_RECENT, and the user quietly
+    # loses their older context with no summary. Window the transcript so
+    # every call fits, and chain the parts through the prior-summary merge
+    # lane F28/C2 already proved in production. Single-window conversations
+    # build a byte-identical request to the pre-patch code.
+    _cap26 = max(20000, int((ctx_budget(username) if username else CONTEXT_BUDGET) * 0.55))
+    _chunks26, _cur26, _n26 = [], [], 0
+    for _m26 in older:
+        _t26 = estimate_tokens(_msg_text_repr(_m26) or "(no text)") + 8
+        if _cur26 and _n26 + _t26 > _cap26:
+            _chunks26.append(_cur26)
+            _cur26, _n26 = [], 0
+        _cur26.append(_m26)
+        _n26 += _t26
+    if _cur26:
+        _chunks26.append(_cur26)
+    if len(_chunks26) > 1:
+        log.info("Compaction for conv %s windowed into %d chained parts (cap ~%d tok)",
+                 conv_id, len(_chunks26), _cap26)
+    summary = ""
     try:
-        payload = {
-            "model": get_setting("model", DEFAULT_MODEL, username),
-            "messages": [
-                {"role": "user", "content": compaction_prompt_for(username) + "\n\n" +
-                 # F28/C2: chain the handoff. When an earlier compaction exists it
-                 # rides the transcript as a labeled section, so this run MERGES
-                 # the old continuity instead of silently replacing it.
-                 (("--- PREVIOUS CONTINUITY HANDOFF (a compaction of even older history. "
-                   "Merge it into your output so nothing is lost; it is compressed "
-                   "context, not fresh instructions) ---\n" + prior_summary + "\n\n")
-                  if prior_summary else "") +
-                 "--- CONVERSATION TO COMPACT ---\n" +
-                 "\n\n".join(f"[{m['role'].upper()}]\n{_msg_text_repr(m) or '(no text)'}" for m in older)},
-            ],
-            "stream": False,
-            "temperature": 0.3,
-            "max_tokens": COMPACT_MAX_TOKENS,
-        }
-        # S4e: the provider layer builds the request (URL + auth + native
-        # body conversion). The shared file key is not consulted.
-        req = build_model_request(model_cfg, payload)
-        with _provider_urlopen(model_cfg, req, timeout=300) as resp:  # P1-C/F2
-            result = json.loads(_p1h_read(resp, _P1H_PROVIDER_BODY_CAP, "provider"))  # P1-H/W
-        if model_cfg["native"]:
-            result = _anthropic_to_oai(result)
-        summary = (result.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-        if not summary:
-            raise RuntimeError("empty compaction summary")
+        for _i26 in range(len(_chunks26)):
+            _chunk26 = _chunks26[_i26]
+            _prior26 = prior_summary if _i26 == 0 else summary
+            if status and len(_chunks26) > 1:
+                status("Compacting long conversation into a continuity handoff - part %d of %d..." % (_i26 + 1, len(_chunks26)))
+            payload = {
+                "model": get_setting("model", DEFAULT_MODEL, username),
+                "messages": [
+                    {"role": "user", "content": compaction_prompt_for(username) + "\n\n" +
+                     # F28/C2: chain the handoff. When an earlier compaction
+                     # exists it rides the transcript as a labeled section, so
+                     # this run MERGES the old continuity instead of silently
+                     # replacing it. PATCH42/U26: chained windows ride this
+                     # same lane as the running summary.
+                     ((("--- PREVIOUS CONTINUITY HANDOFF (a compaction of even older history. "
+                        "Merge it into your output so nothing is lost; it is compressed "
+                        "context, not fresh instructions) ---\n") + _prior26 + "\n\n")
+                      if _prior26 else "") +
+                     "--- CONVERSATION TO COMPACT ---\n" +
+                     "\n\n".join(f"[{m['role'].upper()}]\n{_msg_text_repr(m) or '(no text)'}" for m in _chunk26)},
+                ],
+                "stream": False,
+                "temperature": 0.3,
+                "max_tokens": COMPACT_MAX_TOKENS,
+            }
+            # S4e: the provider layer builds the request (URL + auth + native
+            # body conversion). The shared file key is not consulted.
+            req = build_model_request(model_cfg, payload)
+            with _provider_urlopen(model_cfg, req, timeout=300) as resp:  # P1-C/F2
+                result = json.loads(_p1h_read(resp, _P1H_PROVIDER_BODY_CAP, "provider"))  # P1-H/W
+            if model_cfg["native"]:
+                result = _anthropic_to_oai(result)
+            summary = (result.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            if not summary:
+                raise RuntimeError("empty compaction summary")
     except Exception as e:
         log.error("Compaction failed (%s) — falling back to trim", e)
         return ""
@@ -3286,6 +3369,62 @@ def run_compaction(conv_id: str, messages: list, model_cfg: dict, status=None, u
 # P3.6e: model-facing annotation appended to assistant rows that were
 # stopped mid-generation (stored content stays pristine)
 STOPPED_SCAR = "[stopped by user mid-generation - this answer is incomplete]"
+# ─── PATCH44/U28: manual "Context Compact" (Katy 2026-10-07: "I need to be
+# able to initiate a compaction as well.") — POST /api/compact folds THIS
+# conversation on a daemon thread; /api/ctx carries the job so the badge
+# shows it and a reloaded tab re-attaches. A manual fold NEVER trims: if the
+# model call fails the rows stay exactly where they were (the hard-trim
+# fallback belongs to the turn path, not here). Marking rides
+# run_compaction's single end transaction, so a restart mid-fold is safe.
+_U28_JOBS = {}
+_U28_LOCK = _p1b_threading.Lock()
+def _u28_compact_worker(conv_id, username, job):
+    try:
+        cfg, err = model_config(username, override=_f21_conv_override(conv_id))
+        if cfg is None:
+            job["state"] = "failed"; job["detail"] = err or "no model key configured"
+            return
+        with sqlite3.connect(DB_PATH) as db:
+            _row = db.execute("SELECT summary FROM compactions WHERE conv_id=? ORDER BY ts DESC LIMIT 1",
+                              (conv_id,)).fetchone()
+            db.row_factory = sqlite3.Row
+            _rows = db.execute(
+                "SELECT id, role, content, attachments, stopped FROM messages WHERE conv_id=? "
+                "AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",
+                (conv_id,)).fetchall()
+        # Same row shape build_api_messages builds (STOPPED_SCAR + attachment
+        # parts), so the manual fold sees exactly what a real turn would see.
+        msgs = []
+        for h in _rows:
+            content = h["content"]
+            msg = {"role": h["role"], "content": content, "_mid": h["id"]}
+            if h["role"] == "assistant" and h["stopped"]:
+                msg["content"] = content + "\n\n" + STOPPED_SCAR
+            att_json = h["attachments"]
+            if h["role"] == "user" and att_json:
+                parts, text_repr = expand_attachment_parts(conv_id, att_json, content)
+                if parts is not None:
+                    msg["content"] = parts
+                    if isinstance(parts, list):
+                        msg["_text"] = text_repr
+            msgs.append(msg)
+        _kr46 = compact_keep_recent_for(username)  # PATCH46/U29
+        if len(msgs) <= _kr46:
+            job["state"] = "failed"; job["detail"] = "nothing to fold yet - this chat already fits its window"
+            return
+        job["detail"] = "folding %d rows..." % (len(msgs) - _kr46)
+        summary = run_compaction(conv_id, msgs, cfg, status=lambda m: job.update(detail=str(m)),
+                                 username=username, prior_summary=(_row[0] if _row and _row[0] else ""))
+        if summary:
+            job["state"] = "done"; job["detail"] = "handoff saved (" + str(len(summary)) + " chars)"
+            log.info("U28: manual compaction landed for conv %s", conv_id)
+        else:
+            job["state"] = "failed"; job["detail"] = "the model returned no handoff - history untouched"
+    except Exception as e:
+        log.exception("U28: manual compaction crashed for conv %s", conv_id)
+        job["state"] = "failed"; job["detail"] = "error: " + str(e)[:200]
+    finally:
+        job["ts"] = time.time()
 
 # ─── S4f: per-user persona layer (custom instructions now; memory files in S4f2) ─
 USER_PERSONA_CAP = 32768  # 32KB model-facing budget for the persona block (S4 spec)
@@ -3308,7 +3447,23 @@ def _user_persona_block(username):
     if not _share_tier_projected(username, "project_tier2"):
         return ""
     parts = []
-    ci = get_setting("custom_instructions", "", username) or ""
+    # U9 (patch17): named prompt library. An active prompts row wins over the
+    # inline custom_instructions textarea; blank setting or missing row falls
+    # back to it - principals who never touch the library keep a
+    # byte-identical prompt (preserve the monster).
+    ci = ""
+    _apid = (get_setting("active_prompt", "", username) or "").strip()
+    if _apid:
+        try:
+            with sqlite3.connect(DB_PATH) as db:
+                _prow = db.execute("SELECT body FROM prompts WHERE id=? AND username=?",
+                                   (_apid, username)).fetchone()
+            if _prow and _prow[0]:
+                ci = _prow[0]
+        except Exception:
+            ci = ""
+    if not ci:
+        ci = get_setting("custom_instructions", "", username) or ""
     if ci:
         parts.append(ci[:USER_PERSONA_CAP])
     if not parts:
@@ -3384,7 +3539,14 @@ def effective_tool_names(username=None):
             return frozenset()
     # F17: modality-off media tools are removed from the offered set too
     # (remove-only; the tool function re-checks mode at call time anyway).
-    return _tool_base_set() - frozenset(_tools_disabled_list(username)) - frozenset(_f17_unconfigured(username))
+    _f17off14 = _tool_base_set() - frozenset(_tools_disabled_list(username)) - frozenset(_f17_unconfigured(username))
+    # U14 (patch22): MCP tools are ADDITIVE BY PERSONAL OPT-IN, not tier
+    # grants: they come from this principal's own server defs, the role
+    # fence lives in _mcp_servers_for (call-time re-check), and the union
+    # only happens for non-share principals (the share branch returned
+    # above). The disabled-list can never name them; the settings card is
+    # the off switch. This is the one place MCP enters the tool universe.
+    return _f17off14 | _mcp_tool_names(username)
 
 
 def allow_tools_for(u):
@@ -3435,6 +3597,12 @@ def build_api_messages(conv_id: str, history_rows: list, model_cfg: dict, status
     with sqlite3.connect(DB_PATH) as db:
         row = db.execute("SELECT summary FROM compactions WHERE conv_id=? ORDER BY ts DESC LIMIT 1",
                          (conv_id,)).fetchone()
+        # U3: per-conversation notes. Read failure = '' = byte-identical pre-U3.
+        try:
+            _crow = db.execute("SELECT sys_extra FROM conversations WHERE id=?", (conv_id,)).fetchone()
+            sys_extra = (_crow[0] if _crow and _crow[0] else "") or ""
+        except Exception:
+            sys_extra = ""
     latest_summary = row[0] if row else None
 
     # Tag rows with their ids so run_compaction can mark them
@@ -3462,15 +3630,16 @@ def build_api_messages(conv_id: str, history_rows: list, model_cfg: dict, status
     _budget = ctx_budget(username)
     # S4f9: the trigger threshold is a per-user setting (a/o only;
     # blank = the 0.80 house default - fail-safe fallback below).
-    if total > _budget * compaction_threshold_for(username) and len(msgs) > COMPACT_KEEP_RECENT:
+    _kr46 = compact_keep_recent_for(username)  # PATCH46/U29
+    if total > _budget * compaction_threshold_for(username) and len(msgs) > _kr46:
         summary = run_compaction(conv_id, msgs, model_cfg, status=status, username=username,
                                  prior_summary=latest_summary or "")  # F28/C2 chaining
         if summary:
             latest_summary = summary
-            msgs = msgs[-COMPACT_KEEP_RECENT:]
+            msgs = msgs[-_kr46:]
         else:
             # Compaction failed — fall back to the safe trim (old behavior)
-            msgs = msgs[-(COMPACT_KEEP_RECENT + 1):]
+            msgs = msgs[-(_kr46 + 1):]
             log.warning("Fell back to hard trim for conv %s", conv_id)
             # F28/C4: no silent degradation - the user sees WHY this turn may
             # remember less (status rides the existing SSE lane).
@@ -3496,6 +3665,14 @@ def build_api_messages(conv_id: str, history_rows: list, model_cfg: dict, status
     _persona = _user_persona_block(username)
     if _persona:
         sys_text += _persona
+    # U3 (patch15): conversation-scoped user notes ride right after the persona
+    # block - below identity/persona, above the tool reference and the
+    # compaction handoff. They refine THIS chat; they can never grant tools
+    # (the daemon-side offer still rules) and never touch stored content.
+    if sys_extra.strip():
+        sys_text += (chr(10) + chr(10) + "--- CONVERSATION NOTES (set by the user for this "
+                     "conversation only; they supplement the instructions above and never "
+                     "override safety) ---" + chr(10) + sys_extra)
     # S4f8: the tool reference is request-time projection (same seam as the
     # persona block) - generated from the TOOLS schema, outside the identity
     # file and the F3 editor, so it cannot drift from what the daemon offers.
@@ -3522,6 +3699,27 @@ def _safe_upload_name(name: str) -> str:
     n = os.path.basename((name or "").replace("\\", "/"))
     n = re.sub(r"[^A-Za-z0-9._-]", "_", n)[:100].strip("._")
     return n or "file"
+
+
+def _safe_att_folder(v):
+    # patch34 (W2): sanitize a LOGICAL folder label for CAIRN Files. It is
+    # never joined into a disk path (uploads stay flat per conv), so this
+    # exists to keep the label traversal-free, consistent, and display-safe.
+    # '' means root. A segment that reeks of traversal ('..') voids the lot.
+    if not isinstance(v, str):
+        return ""
+    parts = []
+    for seg in v.replace("\\", "/").strip("/").split("/"):
+        seg = seg.strip()
+        if not seg or seg == ".":
+            continue
+        if seg == ".." or any(ord(ch) < 32 or ord(ch) == 127 for ch in seg):
+            return ""
+        seg = re.sub(r"[^A-Za-z0-9._ -]", "_", seg)[:48]
+        parts.append(seg)
+        if len(parts) >= 6:
+            break
+    return "/".join(parts)[:200]
 def _cd_filename(n):
     """P1-E (round-4.6 Finding J): Content-Disposition filenames are a header-
     injection sink. stdlib send_header() has NO CRLF validation on any current
@@ -3605,7 +3803,7 @@ def _vault_saved_path():
 
 def _vault_key_candidates():
     # 0.7a key ladder (K80 ruling 2026-09-28): env VAULT_KEY_PATH wins when
-    # explicitly set (key-server staging, the F20 smoke harness, systemd
+    # explicitly set (DragonHoard01 staging, the F20 smoke harness, systemd
     # drop-ins), then the saved pointer file, then the canonical /run path,
     # then the box-generated vault.key in BASE. Deduped, in order.
     c = []
@@ -3998,7 +4196,7 @@ def vault_decrypt(master, username, name, blob):
 
 # NC-CONNECTOR-BEGIN  (E2E extracts this block verbatim: shipped code, not a reimplementation)
 # ---------------------------------------------------------------------------
-# F12.1 Nextcloud connector (key server / 'Cloud' share).
+# F12.1 Nextcloud connector (DragonHoard / VM 101 'Cloud').
 # Sealed-secret pattern, canon F12.1: the app password lives ONLY in the vault
 # (entry 'nextcloud-apppw'). vault_use() decrypts in-process, hands the
 # plaintext to use_fn, and a leak guard refuses to return any use_fn result
@@ -7217,7 +7415,7 @@ def _f18_task_turn(t):
             db.row_factory = sqlite3.Row
             history = db.execute(
                 "SELECT id, role, content, attachments, stopped FROM messages "
-                "WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL ORDER BY ts",  # F28/C1
+                "WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",  # F28/C1
                 (conv_id,)).fetchall()
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
             db.commit()
@@ -8444,6 +8642,19 @@ def _f16_clean(raw):
     return s[:F16_MAXLEN].strip(_F16_TRIM)
 
 
+# U12 (patch20, K80 ask 2026-10-05): title prompt customization (Agora
+# TitleGen parity). Blank = house default below; clearing the setting is the
+# reset (same shape as S4f9 compaction). Output still passes through
+# _f16_clean, so a wild prompt can only produce a wild title, not a crash.
+F16_TITLE_PROMPT_DEFAULT = ("Write a title for this conversation: 2-6 words, "
+                            "no quotes, no trailing punctuation, no preamble. "
+                            "Respond with only the title.")
+def title_prompt_for(username):
+    if not username:
+        return F16_TITLE_PROMPT_DEFAULT
+    p = get_setting("title_prompt", "", username)
+    p = p.strip() if isinstance(p, str) else ""
+    return (p or "")[:2000] or F16_TITLE_PROMPT_DEFAULT
 def _f16_title(cfg, user_text, asst_text):
     """One capped completion -> clean title, or "" (never raises).
     cfg is the user's own model_config(); keys never leave this call."""
@@ -8455,9 +8666,7 @@ def _f16_title(cfg, user_text, asst_text):
             "max_tokens": F16_MAX_TOKENS,
             "messages": [
                 {"role": "system",
-                 "content": ("Write a title for this conversation: 2-6 words, "
-                             "no quotes, no trailing punctuation, no preamble. "
-                             "Respond with only the title.")},
+                 "content": title_prompt_for(cfg.get("username"))},
                 {"role": "user",
                  "content": ("USER: " + str(user_text or "")[:500]
                              + "\nASSISTANT: " + str(asst_text or "")[:500])},
@@ -9739,6 +9948,13 @@ EXPORT_SECRET_NAMES = ("v1_token", "opnsense_key")
 EXPORT_MAX_BYTES = 512 * 1024 * 1024  # V20/T-B21 (0.6x): hard cap for ONE export archive
 IMPORT_MAX_BYTES = 64 * 1024 * 1024   # decoded archive cap (K80's real .agora = 38 MB)
 IMPORT_BODY_MAX = 90 * 1024 * 1024    # hard JSON body cap (64 MB decodes to ~86 MB b64)
+# PATCH28/U19: raw streaming door ceilings. K80's real .agora WITH MEDIA is
+# 634 MB on the wire: conversations.json alone declares 761 MB uncompressed,
+# 512 members, 431 MB of it photo/video media. The declared-size caps below
+# guard THIS door only; the JSON door keeps its old 64/400 pair untouched.
+IMPORT_RAW_MAX = 4 * 1024 * 1024 * 1024        # raw body upload ceiling
+IMPORT_RAW_MEMBER_MAX = 1024 * 1024 * 1024     # declared size of ONE member
+IMPORT_RAW_TOTAL_MAX = 3 * 1024 * 1024 * 1024  # declared expansion, all members
 
 def _json_span(s, i):
     """S4f7: s[i] is '{' or '['; return index of its matching close.
@@ -10051,7 +10267,13 @@ def _build_cairn_export(username):
                 "modelName": None,
                 "toolCallJson": m.get("tool_calls") or None,
                 "attachmentMeta": json.dumps({"items": items}, ensure_ascii=False) if items else None,
-                "runId": run_id, "runSequence": seq, "consumedAtPass": None,
+                # PATCH38/U23: Agora run-relative semantics. A user row opens
+                # a run, so it must carry runSequence 0; otherwise the importer
+                # fidelity skip (role==user and seq>0 and no media) discards
+                # genuine CAIRN user turns on a .cairn round-trip.
+                "runId": run_id,
+                "runSequence": 0 if m["role"] == "user" else seq,
+                "consumedAtPass": None,
             })
             stats["messages"] += 1
             seq += 1
@@ -10095,11 +10317,384 @@ def _build_cairn_export(username):
         raise RuntimeError("export too large (%d bytes; cap %d)" % (_sz, EXPORT_MAX_BYTES))
     return tmp, stats, fname
 
-def _import_cairn_archive(zf, username, restore, restore_identity=False):
+_AGORA_Btypes = ("tool", "thought", "answer", "error", "transcription")
+def _agora_fidelity(m, role):
+    # U20 (patch29): translate one Agora v4 message into CAIRN-native parts.
+    # Returns (skip_row, tool_calls_json, reasoning, extra_text).
+    # - skip_row: USER rows with runSequence>0 are agent-loop machinery
+    #   (tool stuffing / result echoes), NOT human turns - UNLESS the row
+    #   carries attachments (a real mid-run attach). Verified against the
+    #   real 634MB export: 2,385 seq0 USER rows (zero JSON), 19,306 seq>0
+    #   (17,821 JSON + 1,485 echoes like "Appended to active memory.").
+    # - tool_calls: Agora blocks {type:tool, toolName, toolArgs, toolResult,
+    #   toolProgress} -> CAIRN client chips {name, arguments, result, s};
+    #   s = thinking-session index (patch16 cards). CAIRN-exported archives
+    #   already hold chip shape -> pass through UNCHANGED (round-trip safe).
+    # - reasoning: Agora thought blocks -> patch16 _rsep-joined timeline.
+    # - extra: error/transcription blocks fold into visible, FTS-searchable text.
+    if role == "user" and (m.get("runSequence") or 0) > 0:
+        if not m.get("attachmentMeta") and not m.get("images"):
+            return True, None, None, ""
+    tc_raw = m.get("toolCallJson")
+    reason = m.get("thoughts")
+    extra = ""
+    tc_out = tc_raw
+    if tc_raw:
+        blocks = None
+        try:
+            j = json.loads(tc_raw)
+            if isinstance(j, list) and j and all(isinstance(b, dict) for b in j):
+                if any(b.get("type") in _AGORA_Btypes for b in j):
+                    blocks = j
+        except Exception:
+            blocks = None
+        if blocks is not None:
+            tools = []
+            thoughts = []
+            for b in blocks:
+                bt = b.get("type")
+                if bt == "tool":
+                    tools.append({"name": str(b.get("toolName") or "tool"),
+                                  "arguments": str(b.get("toolArgs") or ""),
+                                  "result": str(b.get("toolResult") or b.get("toolProgress") or ""),
+                                  "s": max(len(thoughts) - 1, 0)})
+                elif bt == "thought":
+                    thoughts.append(str(b.get("content") or ""))
+                elif bt == "error":
+                    extra += ("\n" if extra else "") + "\u26a0 " + str(b.get("content") or "")
+                elif bt == "transcription":
+                    extra += ("\n" if extra else "") + "[transcription] " + str(b.get("content") or "")
+            tc_out = json.dumps(tools) if tools else None
+            if thoughts:
+                _rj = chr(10) + chr(10) + chr(8280) * 3 + chr(10) + chr(10)
+                reason = _rj.join(t for t in thoughts if t.strip()) or None
+    return False, tc_out, reason, extra
+
+# ─── U21 (patch36, K80 2026-10-07 "make the GUI as identical as possible,
+# including secrets import"): the perfect-mirror extras behind the EXISTING
+# S4f7 doors. Design rules, learned the hard way on the CLI mirror chain:
+# - chats/memory/settings were native already; what the door could NOT carry
+#   was skills (skill_db/ walked past the memory_db-only loop), the prompts
+#   library (only sps[0] ever landed — and sps[0] is NOT the active prompt in
+#   a real export), Agora-NAMED settings (the safe-allowlist compares CAIRN
+#   names, so an .agora settings.json matched nothing), and api_keys.json
+#   (locked out by the S4f7 contract).
+# - Secrets ride their OWN flag, principal-only, sealed with the box's own
+#   CV1 vault machinery. Existing model keys and seals are NEVER clobbered;
+#   a differing imported key is sealed aside for comparison instead.
+# - Reports carry names, lengths, and 8-hex fingerprints. Never values.
+_IMP21_S_MAP = {  # agora_key -> (cairn_key, transform-or-None)  (S4f8 port)
+    "contextCompactPrompt":           ("compaction_prompt", None),
+    "contextCompactRetainCount":      ("compact_keep_recent", None),
+    "contextCompactThresholdPercent": ("compaction_threshold", "_pct"),
+    "contextTokenBudget":             ("context_budget", None),
+    "titleGenerationPrompt":          ("title_prompt", None),
+    "defaultMaxTokens":               ("max_tokens", None),
+    "defaultTemperature":             ("temperature", None),
+    "defaultTopP":                    ("top_p", None),
+    "webSearchProvider":              ("search_provider", None),
+    "webSearchNumResults":            ("search_n", None),
+}
+def _imp21_pct(v):
+    return ("%g" % (float(v) / 100.0))
+def _imp21_items_of(p, key):
+    v = p.get(key) or []
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            v = [v]
+    if isinstance(v, dict):
+        v = [v]
+    return v
+def _imp21_flat_item(it):
+    if isinstance(it, str):
+        return it
+    if isinstance(it, dict):
+        for k in ("text", "content", "body", "value", "prompt", "message"):
+            v = it.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return json.dumps(it, ensure_ascii=False, indent=1)
+    return str(it)
+def _imp21_active_id(zf):
+    try:
+        if "settings.json" not in zf.namelist():
+            return ""
+        st = json.loads(zf.read("settings.json"))
+        if isinstance(st, list):
+            st = st[0] if st else {}
+        if not isinstance(st, dict):
+            return ""
+        return str(st.get("activeSystemPromptId") or "")
+    except Exception:
+        return ""
+def _imp21_identity_extras(zf, username, stats):
+    """restore_identity branch: skills + selection + prompts library + active."""
+    st = {"skills_written": 0, "skills_identical": 0, "skills_conflict_kept": 0,
+          "skills_refused": 0, "skills_selection": "n/a",
+          "prompts": [], "active_prompt": "untouched"}
+    try:
+        names = zf.namelist()
+        skill_entries = [n for n in names
+                         if n.startswith("memories/skill_db/") and n.endswith(".md")
+                         and "/" in n[len("memories/skill_db/"):]]
+        skill_entries = [n for n in names
+                         if n.startswith("memories/skill_db/") and n.endswith(".md")]
+        for n in skill_entries:
+            base = n.rsplit("/", 1)[-1]
+            p = _skill_file_path(base, username)
+            if p is None:
+                st["skills_refused"] += 1
+                continue
+            data = zf.read(n)
+            if p.exists():
+                try:
+                    same = (p.read_bytes() == data)
+                except Exception:
+                    same = False
+                if same:
+                    st["skills_identical"] += 1
+                else:
+                    st["skills_conflict_kept"] += 1   # never clobber a live skill
+                continue
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.parent.chmod(0o700)
+                tmp = p.with_suffix(".md.tmp")
+                tmp.write_bytes(data)
+                tmp.chmod(0o600)
+                tmp.replace(p)
+                st["skills_written"] += 1
+            except OSError:
+                st["skills_refused"] += 1
+        if skill_entries:
+            if _skills_selected(username) is None:   # no explicit choice recorded
+                alln = sorted(n.rsplit("/", 1)[-1] for n in skill_entries)
+                st["skills_selection"] = ("write:%d" % len(alln)) if _skills_set_selected(username, alln) else "FAILED"
+            else:
+                st["skills_selection"] = "exists-kept"
+        if "system_prompts.json" in names:
+            sps = json.loads(zf.read("system_prompts.json"))
+            if isinstance(sps, dict):
+                sps = [sps]
+            now = time.time()
+            with sqlite3.connect(DB_PATH) as db:
+                for p21 in sps:
+                    if not isinstance(p21, dict):
+                        continue
+                    pid = str(p21.get("id") or "").strip()
+                    nm = str(p21.get("title") or "untitled")[:120]
+                    if not pid:
+                        st["prompts"].append({"name": nm, "state": "no-id-skip"})
+                        continue
+                    if db.execute("SELECT 1 FROM prompts WHERE id=?", (pid,)).fetchone():
+                        st["prompts"].append({"id": pid[:8], "name": nm, "state": "exists-skip"})
+                    else:
+                        parts = []
+                        for sec, key in (("SYSTEM", "systemItems"), ("USER", "userItems"),
+                                         ("ASSISTANT", "assistantItems")):
+                            txt = "\n\n".join(_imp21_flat_item(i) for i in _imp21_items_of(p21, key) if i)
+                            if txt.strip():
+                                parts.append("=== %s ===\n%s" % (sec, txt))
+                        body = "\n\n".join(parts)
+                        if not body.strip():
+                            st["prompts"].append({"id": pid[:8], "name": nm, "state": "empty-skip"})
+                            continue
+                        db.execute("INSERT OR IGNORE INTO prompts (id,username,name,body,created,updated)"
+                                   " VALUES (?,?,?,?,?,?)", (pid, username, nm, body, now, now))
+                        st["prompts"].append({"id": pid[:8], "name": nm, "state": "insert", "chars": len(body)})
+            aid = _imp21_active_id(zf)
+            if aid:
+                try:
+                    with sqlite3.connect(DB_PATH) as db:
+                        hit = db.execute("SELECT 1 FROM prompts WHERE id=? AND username=?", (aid, username)).fetchone()
+                    if hit and (get_setting("active_prompt", "", username) or "").strip():
+                        st["active_prompt"] = "exists-keep:" + (get_setting("active_prompt", "", username) or "")[:8]
+                    elif hit:
+                        set_setting("active_prompt", aid, username)
+                        st["active_prompt"] = "set:" + aid[:8]
+                    else:
+                        st["active_prompt"] = "active-id-not-in-library"
+                except sqlite3.Error:
+                    st["active_prompt"] = "db-error"
+    except Exception:
+        log.exception("U21: identity extras failed")
+        st["error"] = "see log"
+    stats["u21"] = st
+def _imp21_settings_translate(zf, username, stats):
+    """restore branch: Agora-NAMED settings keys translated into the allowlist.
+    (The native settings restore compares raw archive keys against CAIRN names,
+    so a real .agora settings.json matched nothing before U21.) Keep-existing:
+    a translated key that CAIRN already holds is never overwritten; the live
+    value wins and the archive value ships in the report (truncated)."""
+    st = []
+    try:
+        if "settings.json" not in zf.namelist():
+            stats["u21_settings_translated"] = st
+            return
+        s2 = json.loads(zf.read("settings.json"))
+        if isinstance(s2, list):
+            s2 = s2[0] if s2 else {}
+        if not isinstance(s2, dict):
+            stats["u21_settings_translated"] = st
+            return
+        changed = []
+        for ak, (ck, tx) in _IMP21_S_MAP.items():
+            if ak not in s2 or s2[ak] is None or ck not in _CAIRN_SAFE_SETTINGS:
+                continue
+            raw = s2[ak]
+            try:
+                val = _imp21_pct(raw) if tx == "_pct" else (raw if isinstance(raw, str) else str(raw))
+            except (TypeError, ValueError):
+                continue
+            if not val.strip():
+                continue
+            cur = (get_setting(ck, "", username) or "").strip()
+            if not cur:
+                set_setting(ck, val, username)
+                st.append({"agora": ak, "cairn": ck, "state": "port", "value": val[:60]})
+                changed.append(ck)
+            elif cur == val.strip():
+                st.append({"agora": ak, "cairn": ck, "state": "already-equal"})
+            else:
+                st.append({"agora": ak, "cairn": ck, "state": "keep-existing",
+                           "cairn_val": cur[:40], "agora_val": val[:40]})
+        if changed:
+            log.warning("U21 import by %s TRANSLATED-RESTORED SETTINGS KEYS: %s", username, ", ".join(sorted(changed)))
+    except Exception:
+        log.exception("U21: settings translation failed")
+    stats["u21_settings_translated"] = st
+def _imp21_secrets(zf, username, stats):
+    """import_secrets door (U21, K80 ruling 2026-10-07): api_keys.json ->
+    model_key_<prov> settings rows + CV1 vault seals. NEVER clobbers a live
+    key or seal; values never appear in stats, responses, or logs. Names and
+    fingerprints match the proven CLI chain for cross-audit."""
+    st = {"api_keys": "no-api_keys-entry-in-zip", "keys": [], "sealed": 0, "master": "n/a"}
+    stats["u21_secrets"] = st
+    try:
+        if "api_keys.json" not in zf.namelist():
+            return
+        ak = json.loads(zf.read("api_keys.json"))
+        if not isinstance(ak, dict):
+            st["api_keys"] = "unexpected-shape"
+            return
+        st["api_keys"] = "imported"
+        try:
+            master = _vault_master_key()
+        except Exception:
+            master = None
+        st["master"] = "present" if master else "unavailable-deferred"
+        def _fp21(v):
+            import hashlib as _hl
+            return _hl.sha256((v or "").encode("utf-8", "replace")).hexdigest()[:8]
+        def seal(name, value):
+            vb = str(value).encode("utf-8")
+            try:
+                with sqlite3.connect(DB_PATH) as db:
+                    if db.execute("SELECT 1 FROM vault WHERE username=? AND name=?", (username, name)).fetchone():
+                        st["keys"].append({"name": name, "state": "vault-exists-skip"})
+                        return
+                    if master is None:
+                        st["keys"].append({"name": name, "state": "DEFERRED-no-vault-key", "fp": _fp21(vb.decode("utf-8", "replace"))})
+                        return
+                    blob = vault_encrypt(master, username, name, vb)
+                    if vault_decrypt(master, username, name, blob) != vb:
+                        st["keys"].append({"name": name, "state": "ROUNDTRIP-FAIL-skipped"})
+                        return
+                    db.execute("INSERT INTO vault (username,name,vtype,blob,bytes,updated) VALUES (?,?,?,?,?,?)",
+                               (username, name, "secret", blob, len(vb), time.time()))
+                    db.commit()
+                st["keys"].append({"name": name, "state": "sealed+verified", "bytes": len(vb), "fp": _fp21(vb.decode("utf-8", "replace"))})
+                st["sealed"] += 1
+            except Exception:
+                log.exception("U21: vault seal failed for %s", name)
+                st["keys"].append({"name": name, "state": "error"})
+        for e in (ak.get("apiKeys") or []):
+            if not isinstance(e, dict) or not e.get("key"):
+                continue
+            prov = str(e.get("provider") or "provider").lower()
+            keyname = "model_key_" + re.sub(r"[^a-z0-9]+", "_", prov)
+            v = str(e["key"]).strip()
+            cur = (get_setting(keyname, "", username) or "").strip()
+            if cur and cur == v:
+                st["keys"].append({"name": keyname, "state": "already-set-identical", "fp": _fp21(v)})
+            elif cur:
+                st["keys"].append({"name": keyname, "state": "keep-existing-never-clobber",
+                                   "cur_len": len(cur), "agora_len": len(v)})
+                seal("agora-import-" + re.sub(r"[^a-z0-9]+", "_", prov) + "-key", v)
+            else:
+                set_setting(keyname, v, username)
+                st["keys"].append({"name": keyname, "state": "port-to-settings-row", "len": len(v), "fp": _fp21(v)})
+        for eid, val in (ak.get("embeddingApiKeys") or {}).items():
+            if val:
+                seal("agora-import-embed-" + str(eid)[:8], val)
+        devnames = {}
+        try:
+            s2 = json.loads(zf.read("settings.json"))
+            if isinstance(s2, list):
+                s2 = s2[0] if s2 else {}
+            for d in (s2.get("shellDevices") or []):
+                if isinstance(d, dict) and d.get("id"):
+                    devnames[d["id"]] = d.get("name") or str(d["id"])[:8]
+        except Exception:
+            pass
+        for did, cfg in (ak.get("shellDevices") or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+            dn = re.sub(r"[^A-Za-z0-9._-]+", "-", str(devnames.get(did, did)))[:48].strip("-")
+            for fld in ("sshPassword", "apiKey", "token"):
+                val = cfg.get(fld)
+                if val:
+                    seal("agora-import-dev-%s-%s" % (dn, fld.lower()), val)
+        if st["sealed"]:
+            log.warning("U21 import by %s sealed %d vault entries from archive (values never logged)", username, st["sealed"])
+    except Exception:
+        log.exception("U21: secrets import failed")
+        st["api_keys"] = "error-see-log"
+
+# PATCH40/U24: run-order restamp. Agora merged answer rows carry the turn's
+# START timestamp; per-tool card rows carry later ones. CAIRN has no run
+# column and renders ORDER BY ts, so imported merged answers landed ABOVE
+# their own cards. This restamps merged rows (assistant, tool_calls set,
+# non-empty text) to just after the last STRUCTURAL row (user row or pure
+# card row) of their turn -- turn boundaries are user rows, row order is the
+# import's ts-sorted insert order. CAIRN-native single-row turns never
+# qualify (their own ts is the structural max, so `ts < maxts` is false) and
+# re-runs are no-ops. Companion standalone: /root/ops-backup/p40-restamp.py
+_P40_SQL = (
+    "WITH ord AS ("
+    "  SELECT rowid AS rid, conv_id, ts, role, tool_calls, content,"
+    "         SUM(CASE WHEN role='user' THEN 1 ELSE 0 END)"
+    "           OVER (PARTITION BY conv_id ORDER BY rowid) AS turn"
+    "  FROM messages),"
+    " win AS (SELECT conv_id, turn, MAX(ts) AS maxts FROM ord"
+    "       WHERE role='user' OR (tool_calls IS NOT NULL"
+    "         AND (content IS NULL OR trim(content)=''))"
+    "       GROUP BY conv_id, turn),"
+    " cand AS ("
+    "  SELECT o.rid AS rid, o.conv_id AS conv_id, o.ts AS oldts, w.maxts AS maxts,"
+    "         ROW_NUMBER() OVER (PARTITION BY o.conv_id, o.turn ORDER BY o.rid) AS k"
+    "  FROM ord o JOIN win w ON w.conv_id=o.conv_id AND w.turn=o.turn"
+    "  WHERE o.role='assistant' AND o.tool_calls IS NOT NULL"
+    "    AND o.content IS NOT NULL AND trim(o.content) <> '' AND o.ts < w.maxts)"
+    " SELECT rid, conv_id, oldts, maxts, k FROM cand"
+)
+
+
+def _p40_run_order_fix(db, stats):
+    n = 0
+    for _rid, _conv, _oldts, _maxts, _k in db.execute(_P40_SQL).fetchall():
+        db.execute("UPDATE messages SET ts=? WHERE rowid=?", (_maxts + _k * 0.001, _rid))
+        n += 1
+    stats["run_order_fixed"] = n
+
+
+def _import_cairn_archive(zf, username, restore, restore_identity=False, import_secrets=False):
     """S4f7: import a .cairn/.agora archive (manifest v1..4) into username's account.
     Returns (stats, restored). Conversation ids are always new UUIDs (re-import
     = explicit duplicate); FTS stays in sync via the F6 triggers."""
-    stats = {"conversations": 0, "messages": 0, "attachments": 0}
+    stats = {"conversations": 0, "messages": 0, "attachments": 0, "mech_skipped": 0}
     names = set(zf.namelist())
     raw = zf.read("conversations.json").decode("utf-8", "replace")
     conv_ids = {}
@@ -10163,6 +10758,25 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
             for m in clist:
                 role = "user" if m.get("participant") == "USER" else "assistant"
                 content = m.get("text") or ""
+                # U20 (patch29): Agora fidelity transform (see _agora_fidelity).
+                _u20_skip, _u20_tc, _u20_reason, _u20_extra = _agora_fidelity(m, role)
+                if _u20_skip:
+                    stats["mech_skipped"] += 1
+                    continue
+                if _u20_extra:
+                    content = (content + "\n\n" + _u20_extra).strip() if content else _u20_extra
+
+                # U20 (patch29b): attachment-carrying USER rows whose text is
+                # a bare JSON object with a 'type' key are Agora tool-argument
+                # echoes, not human turns - blank the text, keep the attach.
+                if role == "user" and content.lstrip().startswith("{"):
+                    try:
+                        _u20b = json.loads(content)
+                    except Exception:
+                        _u20b = None
+                    if (isinstance(_u20b, dict) and "type" in _u20b
+                            and (m.get("attachmentMeta") or m.get("images"))):
+                        content = ""
                 items = []
                 am = m.get("attachmentMeta")
                 if am:
@@ -10196,11 +10810,60 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
                     if kind not in ("image", "video", "file", "pdf"):
                         kind = "file"
                     _mitems.append((_ent, stored, name, it.get("mime_type"), len(data), kind))
-                mplans.append((role, content, m, _mitems))
+                # U22 (patch37, K80 2026-10-07 "keep going lol"): .agora media
+                # parity. CLI mirror chain (agora_media.py) landed 527 rows from
+                # the Oct-5 export; this door landed 252. Classifier-proven: the
+                # fidelity skip kills NO media rows; 204 images ride 7 gallery
+                # msgs whose attachmentMeta carries no image items (img_queue
+                # never drained), and 71 file items carry inline text_content
+                # rather than zip entries. Drain + inline now close the gap.
+                # .cairn round-trips are immune: export emits images[] == the
+                # cairn_entry paths, and every queue entry already attached in
+                # THIS message is skipped below; .cairn items carry no
+                # text_content key at all.
+                import mimetypes as _p37_mt  # stdlib-local; top import block untouched
+                _p37_used = set(_x[0] for _x in _mitems)
+                for _p37e in img_queue:
+                    if _p37e in _p37_used:
+                        continue
+                    if _p37e not in _entry_bytes:
+                        _entry_bytes[_p37e] = zf.read(_p37e)
+                    _p37b = _entry_bytes[_p37e]
+                    # A5: charge per REFERENCE (row ledger), like the native path.
+                    _conv_total += len(_p37b)
+                    if _p37e not in _conv_files:
+                        _p37n = _safe_upload_name(_p37e.rsplit("/", 1)[-1])
+                        _conv_files[_p37e] = (_p37e, uuid.uuid4().hex[:8] + "_" + _p37n, _p37n)
+                    _ent, stored, name = _conv_files[_p37e]
+                    _mitems.append((_ent, stored, name,
+                                    _p37_mt.guess_type(name)[0] or "application/octet-stream",
+                                    len(_p37b), "image"))
+                for _p37i, _p37it in enumerate(items):
+                    if not isinstance(_p37it, dict) or _p37it.get("type") != "file":
+                        continue
+                    if _p37it.get("cairn_entry") in names:
+                        continue  # native .cairn ref already attached by the items path; inline is fallback, never a duplicate
+                    _p37t = _p37it.get("text_content")
+                    if not isinstance(_p37t, str) or not _p37t:
+                        continue
+                    _p37b = _p37t.encode("utf-8")
+                    _p37n = _safe_upload_name(str(
+                        _p37it.get("file_name")
+                        or ("attachment_%s.txt" % str(m.get("id") or "file")[:8])))
+                    _p37k = "inline:%s:%d" % (m.get("id"), _p37i)
+                    _entry_bytes[_p37k] = _p37b
+                    _conv_total += len(_p37b)
+                    _conv_files[_p37k] = (_p37k, uuid.uuid4().hex[:8] + "_" + _p37n, _p37n)
+                    _ent, stored, name = _conv_files[_p37k]
+                    _p37m = _p37it.get("mime_type") or _p37_mt.guess_type(_p37n)[0] or "application/octet-stream"
+                    if _p37m == "image/svg+xml":
+                        _p37m = "application/octet-stream"  # mirror cairn upload downgrade
+                    _mitems.append((_ent, stored, name, _p37m, len(_p37b), "file"))
+                mplans.append((role, content, m, _mitems, _u20_tc, _u20_reason))
             _quota_reserve(_db, username, _conv_total)   # rides the single archive txn
             _db.execute("INSERT INTO conversations (id, title, created_at, updated_at, user_id) VALUES (?,?,?,?,?)",
                         (new_cid, title, first_ts, last_ts, username))
-            for (role, content, m, _mitems) in mplans:
+            for (role, content, m, _mitems, _u20_tc, _u20_reason) in mplans:
                 att_list = []
                 for (_ent, stored, name, mime, size, kind) in _mitems:
                     if stored not in [a["stored_name"] for a in att_list]:
@@ -10218,11 +10881,11 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
                     stats["attachments"] += 1
                 _db.execute("INSERT INTO messages (id, conv_id, role, content, tool_calls, ts, attachments, reasoning, stopped) VALUES (?,?,?,?,?,?,?,?,?)",
                            (str(uuid.uuid4()), new_cid, role,
-                            content if content else "(attachment)",
-                            m.get("toolCallJson"),
+                            content or ("(attachment)" if _mitems else ""),
+                            _u20_tc,
                             (m.get("timestamp") or now * 1000) / 1000.0,
                             json.dumps(att_list) if att_list else None,
-                            m.get("thoughts"),
+                            _u20_reason,
                             1 if m.get("status") == "STOPPED" else 0))
                 stats["messages"] += 1
             for k2 in comp_list:
@@ -10231,6 +10894,7 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
                                (str(uuid.uuid4()), new_cid, str(k2.get("summary") or ""),
                                 int(k2.get("msg_count") or 0), float(k2.get("ts") or now)))
             stats["conversations"] += 1
+        _p40_run_order_fix(_db, stats)   # PATCH40/U24: answers after their cards
         _db.commit()   # A5/V10: ONE publish - all conversations or none
     except BaseException:
         try:
@@ -10296,7 +10960,18 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
             try:
                 sps = json.loads(zf.read("system_prompts.json"))
                 if isinstance(sps, list) and sps:
-                    texts = [str(it.get("value")) for it in (sps[0].get("systemItems") or [])
+                    # U21 fix: honor the archive's OWN active pointer. In a real
+                    # export sps[0] is the OLDER library entry (this box's sps[0]
+                    # was Mara v1.1 while the active prompt was Mara1.2) — the
+                    # old code woke the wrong instance.
+                    _pick21 = sps[0]
+                    _aid21 = _imp21_active_id(zf)
+                    if _aid21:
+                        for _p21 in sps:
+                            if isinstance(_p21, dict) and str(_p21.get("id") or "") == _aid21:
+                                _pick21 = _p21
+                                break
+                    texts = [str(it.get("value")) for it in (_pick21.get("systemItems") or [])
                              if isinstance(it, dict) and it.get("type") == "CUSTOM" and it.get("value")]
                     new_sp = "\n\n".join(texts)
                     if new_sp:
@@ -10339,6 +11014,15 @@ def _import_cairn_archive(zf, username, restore, restore_identity=False):
                     username, ", ".join(sorted(_changed_keys)))
     stats["settings_keys_changed"] = sorted(_changed_keys)
     stats["identity_restored"] = _identity_written
+    # U21 (patch36): perfect-mirror extras behind the SAME gates (handler 403s
+    # any of these flags for non-principals). Order: identity -> settings
+    # translation -> secrets.
+    if restore_identity:
+        _imp21_identity_extras(zf, username, stats)
+    if restore:
+        _imp21_settings_translate(zf, username, stats)
+    if import_secrets:
+        _imp21_secrets(zf, username, stats)
     return stats, restored
 
 def _import_chatgpt(convs, username):
@@ -11246,8 +11930,163 @@ def _share_memory_tool(args, action, name, username, conv_id):
 # structurally impossible (S3n design line, same class as memory).
 RECALL_DEFAULT_LIMIT = 8
 RECALL_MAX_LIMIT = 20
+# ── U11 (patch19, K80 ask 2026-10-05): semantic conversation search ──
+# Embeddings-backed recall (Agora Conversation Search parity). Vector cache
+# lives in msg_vec (normalized float32, one row per message per model). The
+# embedding call reuses the user's provider creds (base + key from
+# model_config) against OpenAI-shape /embeddings - a provider without an
+# embeddings endpoint just fails, and every failure path falls back to the
+# keyword FTS recall below. Keyword stays the default; OFF until a model id
+# is set. Nothing here runs unless conv_search=semantic AND embed_model.
+EMBED_TOPUP_BATCH = 24        # lazy inline top-up cap per recall call
+EMBED_BTN_BATCH = 240         # per-click bulk build cap from the settings card
+EMBED_HTTP_CHUNK = 16         # texts per /embeddings request
+def _embed_conf(username):
+    m = (get_setting("embed_model", "", username) or "").strip()
+    if not m or len(m) > 200:
+        return None
+    cfg, err = model_config(username)
+    if not cfg:
+        return None
+    return {"base": cfg["base"], "key": cfg["key"], "model": m,
+            "native": bool(cfg.get("native"))}
+EMB_MIN_DIM = 8   # sanity floor: a "vector" smaller than this is a bad response
+def _embed_norm(v):
+    import math
+    s = 0.0
+    for x in v:
+        s += x * x
+    if s <= 0.0:
+        return None
+    k = 1.0 / math.sqrt(s)
+    return [x * k for x in v]
+def _embed_post(conf, texts):
+    payload = json.dumps({"model": conf["model"], "input": texts}).encode("utf-8")
+    req = urllib.request.Request(conf["base"] + "/embeddings", data=payload,
+                                 headers=model_headers({"native": conf["native"], "key": conf["key"]}),
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("embeddings response had no data list")
+    out = []
+    for it in rows:
+        vec = it.get("embedding") if isinstance(it, dict) else None
+        if not isinstance(vec, list) or len(vec) < EMB_MIN_DIM:
+            raise ValueError("embedding row missing or too small")
+        out.append([float(x) for x in vec])
+    if len(out) != len(texts):
+        raise ValueError("embeddings count mismatch")
+    return out
+def _embed_texts(conf, texts):
+    out = []
+    for i in range(0, len(texts), EMBED_HTTP_CHUNK):
+        batch = texts[i:i + EMBED_HTTP_CHUNK]
+        batch = [t if (t or "").strip() else " " for t in batch]
+        out.extend(_embed_post(conf, batch))
+    return out
+def _vec_pack(v):
+    return struct.pack("<%df" % len(v), *v)
+def _vec_unpack(b):
+    return list(struct.unpack("<%df" % (len(b) // 4), bytes(b)))
+def _vec_pending(username, conf, cap):
+    # Oldest un-embedded messages first; cache fills from the beginning.
+    with sqlite3.connect(DB_PATH) as db:
+        rows = db.execute(
+            "SELECT m.id, m.conv_id, m.role, m.ts, m.content FROM messages m "
+            "JOIN conversations c ON c.id = m.conv_id "
+            "WHERE c.user_id = ? AND m.role IN ('user','assistant') "
+            "AND length(trim(m.content)) > 0 "
+            "AND m.id NOT IN (SELECT message_id FROM msg_vec WHERE username=? AND model=?) "
+            "ORDER BY m.ts ASC LIMIT ?",
+            (username, username, conf["model"], cap)).fetchall()
+    rows = [(a, b, e) for (a, b, c_, d, e) in rows if (e or "").strip()][:cap]
+    if not rows:
+        return 0
+    try:
+        vecs = _embed_texts(conf, [(e or "").strip()[:4000] for (a, b, c_, d, e) in rows])
+    except Exception as e:
+        log.info("U11: %s top-up embed failed: %.140s", username, str(e))
+        return -1
+    now = time.time()
+    with sqlite3.connect(DB_PATH) as db:
+        for (mid, cid, cbody), vec in zip(rows, vecs):
+            nv = _embed_norm(vec)
+            if nv is None:
+                continue
+            db.execute("INSERT OR REPLACE INTO msg_vec (message_id, username, conv_id, "
+                       "model, dim, vec, ts) VALUES (?,?,?,?,?,?,?)",
+                       (mid, username, cid, conf["model"], len(nv), _vec_pack(nv), now))
+        db.commit()
+    return len(rows)
+def _semantic_recall(username, q, limit, conv_id=None):
+    # Returns None to signal "fall back to keyword", a list (possibly empty)
+    # of formatted lines when semantic answered. Guest/visit scoping mirrors
+    # the keyword path exactly (fail closed, server-side).
+    conf = _embed_conf(username)
+    if not conf:
+        return None
+    _gf11 = ""
+    _ga11 = ()
+    if _is_share_principal(username) and not _share_history_allowed(username):
+        with sqlite3.connect(DB_PATH) as db:
+            crow = db.execute("SELECT guest_id FROM conversations WHERE id=?",
+                              (conv_id or "",)).fetchone()
+        _gf11 = " AND c.guest_id = ? "
+        _ga11 = (crow[0] if crow and crow[0] is not None else "__sealed__",)
+    try:
+        top = _vec_pending(username, conf, EMBED_TOPUP_BATCH)
+        if top < 0:
+            return None
+        if top > 0:
+            # freshly embedded rows are in the cache; nothing more to do
+            pass
+        qv = _embed_norm(_embed_post(conf, [q[:2000]])[0])
+        if qv is None:
+            return None
+        want = min(limit * 4, 400)
+        with sqlite3.connect(DB_PATH) as db:
+            rows = db.execute(
+                "SELECT v.message_id, v.vec, c.title, m.role, m.ts, m.compacted_at, m.content "
+                "FROM msg_vec v JOIN messages m ON m.id = v.message_id "
+                "JOIN conversations c ON c.id = v.conv_id "
+                "WHERE v.username=? AND v.model=?" + _gf11,
+                (username, conf["model"]) + _ga11).fetchall()
+    except Exception as e:
+        log.info("U11: %s semantic recall failed: %.140s", username, str(e))
+        return None
+    try:
+        minv = float(get_setting("conv_sim_min", "0.50", username) or 0.50)
+    except (TypeError, ValueError):
+        minv = 0.50
+    scored = []
+    for (mid, vb, title, role, ts, compacted, content) in rows:
+        v = _vec_unpack(vb)
+        if len(v) != len(qv):
+            continue
+        d = 0.0
+        for a, b in zip(v, qv):
+            d += a * b
+        if d >= minv:
+            scored.append((d, mid, title, role, ts, compacted, content))
+    scored.sort(key=lambda t: -t[0])
+    scored = scored[:want]
+    lines = []
+    total = 0
+    for i, (d, mid, title, role, ts, compacted, content) in enumerate(scored[:limit], 1):
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "?"
+        mark = " (older - compacted)" if compacted else ""
+        snippet = re.sub(r"\s+", " ", (content or "").strip())[:280]
+        line = "%d. [%s] %r (%s)%s sim=%.2f - %s" % (
+            i, when, (title or "New chat")[:60], role, mark, d, snippet)
+        lines.append(line)
+        total += len(line)
+        if total > 6000:
+            lines.append("(results truncated at 6000 chars - refine the query)")
+            break
+    return lines
 
-def _tool_recall(args: dict, username=None, conv_id=None) -> str:
     if not username:
         return "Error: no user context for recall."
     q = (args.get("query") or "").strip()
@@ -11257,6 +12096,18 @@ def _tool_recall(args: dict, username=None, conv_id=None) -> str:
         limit = _p1i_bint(args.get("limit"), 1, RECALL_MAX_LIMIT, RECALL_DEFAULT_LIMIT)
     except (TypeError, ValueError):
         limit = RECALL_DEFAULT_LIMIT
+    # U11: semantic-first when the user opted in; every failure path returns
+    # None and falls through to the keyword FTS path below, untouched.
+    if (get_setting("conv_search", "keyword", username) or "keyword") == "semantic" \
+            and not _is_share_principal(username):
+        _sl11 = _semantic_recall(username, q, limit, conv_id=conv_id)
+        if _sl11 is not None:
+            if not _sl11:
+                return ("No semantic matches for %r in your embedded "
+                        "conversations (lower the threshold or build more of "
+                        "the cache in Settings)." % q)
+            return ("Recall (semantic): %d match(es) for %r "
+                    "(closest first):" % (len(_sl11), q)) + chr(10) + chr(10).join(_sl11)
     _gf03 = ""
     _ga03 = ()
     if _is_share_principal(username) and not _share_history_allowed(username):
@@ -11300,6 +12151,296 @@ def _tool_recall(args: dict, username=None, conv_id=None) -> str:
     return chr(10).join(lines)
 
 
+# ---------------------------------------------------------------------------
+# U14 (patch22): MCP client integration - Model Context Protocol servers on
+# the stdio transport (newline-delimited JSON-RPC 2.0), npx/uvx style.
+# K80 GO 2026-10-05: per-user server definitions, owner/admin gated.
+#
+# Trust story, plainly: an MCP server is a program this box RUNS with CAIRN's
+# own permissions. Defining one is a deliberate act, fenced twice on purpose
+# - the settings save checks the role and _mcp_servers_for() re-checks it on
+# every call (the F17 media-tool double-check pattern). Share principals
+# never get MCP tools: the share branch of effective_tool_names returns long
+# before the union, and _share_safe_set() would drop the names anyway.
+#
+# Silent-fail contract (mirrors F16): a dead, slow, silent, or rude server
+# produces a clean error string or an empty tool list - never a wedged turn,
+# never an orphan process (watchdog kill), never a stack trace to the user.
+# v1 is stdio only; HTTP/SSE transports are deliberately out of scope.
+# ---------------------------------------------------------------------------
+MCP_SETTING_CAP = 6000
+MCP_MAX_SERVERS = 8
+MCP_TIMEOUT_INIT = 25.0
+MCP_TIMEOUT_CALL = 120.0
+MCP_RESULT_CAP = 40000
+MCP_CACHE_TTL = 300.0
+_MCP_TOOL_CACHE = {}
+_MCP_NAME_MAP = {}
+def _mcp_ok_name(nm):
+    if not nm or len(nm) > 32 or "__" in nm:
+        return False
+    if not (("a" <= nm[0] <= "z") or ("0" <= nm[0] <= "9")):
+        return False
+    for ch in nm[1:]:
+        if not (("a" <= ch <= "z") or ("0" <= ch <= "9") or ch == "_" or ch == "-"):
+            return False
+    return True
+def _mcp_valid_servers(raw):
+    """Parse + validate the mcp_servers JSON. Returns (servers, "") or
+    (None, error). Each server: name/command/args/env, all sanitized."""
+    if raw is None:
+        return [], ""
+    if isinstance(raw, list):
+        try:
+            raw = json.dumps(raw)
+        except Exception:
+            return None, "mcp_servers is not valid JSON"
+    raw = str(raw)
+    if len(raw) > MCP_SETTING_CAP:
+        return None, "mcp_servers is too large (max %d characters)" % MCP_SETTING_CAP
+    if not raw.strip():
+        return [], ""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, "mcp_servers is not valid JSON"
+    if not isinstance(data, list):
+        return None, "mcp_servers must be a JSON array of server objects"
+    if len(data) > MCP_MAX_SERVERS:
+        return None, "too many servers (max %d)" % MCP_MAX_SERVERS
+    out = []
+    seen = set()
+    for it in data:
+        if not isinstance(it, dict):
+            return None, "each server must be an object"
+        nm = str(it.get("name") or "").strip().lower()
+        if not _mcp_ok_name(nm):
+            return None, "bad server name (need 1-32 chars, a-z 0-9 _ -, no double underscore)"
+        if nm in seen:
+            return None, "duplicate server name " + nm
+        seen.add(nm)
+        cm = str(it.get("command") or "").strip()
+        if not cm or len(cm) > 300 or any(ord(ch) < 32 or ord(ch) == 127 for ch in cm):
+            return None, "server " + nm + " needs a plain command (flags belong in args)"
+        aa = it.get("args")
+        if aa is None:
+            aa = []
+        if not isinstance(aa, list):
+            return None, "server " + nm + " args must be a list"
+        al = []
+        for x in aa[:48]:
+            xs = str(x)[:400]
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in xs):
+                return None, "server " + nm + " has a control character in args"
+            al.append(xs)
+        ee = it.get("env")
+        if ee is None:
+            ee = {}
+        if not isinstance(ee, dict):
+            return None, "server " + nm + " env must be an object"
+        el = {}
+        for k, v in list(ee.items())[:24]:
+            ks = str(k)[:100]
+            vs = str(v)[:1000]
+            if ks and not any(ord(ch) < 32 or ord(ch) == 127 for ch in ks + vs):
+                el[ks] = vs
+        out.append({"name": nm, "command": cm, "args": al, "env": el})
+    return out, ""
+def _mcp_servers_for(username):
+    """Validated server defs for this principal. Fail-closed everywhere:
+    share principals, missing/inactive account, non-staff role, or
+    malformed JSON all mean zero servers. The role check lives HERE on
+    purpose (call time), not only in the settings save."""
+    try:
+        if not username or _is_share_principal(username):
+            return []
+        with _reg_db() as db:
+            row = db.execute("SELECT role, status FROM users WHERE username=?",
+                             (username,)).fetchone()
+        if row is None or (row["status"] or "") != "active" or (row["role"] or "") not in ("owner", "admin"):
+            return []
+        servers, _err = _mcp_valid_servers(get_setting("mcp_servers", "", username))
+        return servers or []
+    except Exception:
+        return []
+def _mcp_send(proc, obj):
+    proc.stdin.write((json.dumps(obj) + chr(10)).encode("utf-8", "replace"))
+    proc.stdin.flush()
+def _mcp_rpc_read(proc, deadline, want_id):
+    """Read newline-delimited JSON-RPC until the response carrying
+    want_id. Server-initiated requests/notifications are ignored (v1
+    answers none of them)."""
+    import time as _time
+    while True:
+        if _time.monotonic() > deadline:
+            raise RuntimeError("timed out waiting for the server response")
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError("server closed the pipe")
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(msg, dict) and msg.get("id") == want_id and ("result" in msg or "error" in msg):
+            return msg
+def _mcp_session(defn, call_timeout, work):
+    """Spawn defn, run the MCP initialize handshake, hand (proc, deadline)
+    to work(), and ALWAYS kill the process - plus a watchdog timer, because
+    readline blocks and a silent server must never hold a turn open.
+    Success -> (value, ""); any failure -> (None, clean error string)."""
+    import os as _os
+    import subprocess
+    import threading
+    import time as _time
+    proc = None
+    _wd = None
+    try:
+        env = dict(_os.environ)
+        env.update(defn.get("env") or {})
+        proc = subprocess.Popen([defn["command"]] + list(defn.get("args") or []),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=env, cwd=str(Path.home()))
+        _wd = threading.Timer(MCP_TIMEOUT_INIT + call_timeout + 5.0, proc.kill)
+        _wd.daemon = True
+        _wd.start()
+        deadline = _time.monotonic() + MCP_TIMEOUT_INIT
+        _mcp_send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                    "clientInfo": {"name": "cairn", "version": "0.7"}}})
+        hello = _mcp_rpc_read(proc, deadline, 1)
+        if "error" in hello:
+            return None, "initialize rejected by server"
+        _mcp_send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+        val = work(proc, _time.monotonic() + call_timeout)
+        return val, ""
+    except Exception as e:
+        return None, (str(e)[:200] or type(e).__name__)
+    finally:
+        try:
+            if _wd:
+                _wd.cancel()
+        except Exception:
+            pass
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            # patch22b (smoke-test finding): kill() alone leaves the child
+            # unreaped and the pipes open. In a script that is invisible; in
+            # a daemon running for weeks it is a zombie + fd leak, one pair
+            # per MCP call. Reap and close, quietly.
+            for _fh in (proc.stdin, proc.stdout):
+                try:
+                    if _fh:
+                        _fh.close()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+def _mcp_list_work(proc, deadline):
+    _mcp_send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    r = _mcp_rpc_read(proc, deadline, 2)
+    if "error" in r:
+        raise RuntimeError("tools/list rejected by server")
+    res = r.get("result")
+    tl = res.get("tools") if isinstance(res, dict) else None
+    return tl if isinstance(tl, list) else []
+def _mcp_tools_cached(username, force=False):
+    """[(server, offered_tool, description, schema)] with a TTL cache so
+    the offer path does not respawn every server on every model
+    round-trip. Servers that errored shorten the TTL (retry sooner); a
+    broken server is simply absent from the list, never fatal."""
+    import time as _time
+    now = _time.monotonic()
+    hit = _MCP_TOOL_CACHE.get(username)
+    if hit and not force and (now - hit[0]) < hit[2]:
+        return hit[1]
+    out = []
+    bad = 0
+    for defn in _mcp_servers_for(username):
+        tools, err = _mcp_session(defn, MCP_TIMEOUT_INIT, _mcp_list_work)
+        if err:
+            bad += 1
+            continue
+        for t in tools[:48]:
+            if not isinstance(t, dict):
+                continue
+            tn = str(t.get("name") or "").strip()[:64]
+            if not tn or tn.startswith("mcp__") or any(ord(ch) < 32 or ord(ch) == 127 for ch in tn):
+                continue
+            offered = tn.replace("__", "_")
+            _MCP_NAME_MAP[(defn["name"], offered)] = tn
+            sch = t.get("inputSchema")
+            if not isinstance(sch, dict):
+                sch = {"type": "object", "properties": {}}
+            out.append((defn["name"], offered, str(t.get("description") or "")[:500], sch))
+    ttl = MCP_CACHE_TTL if bad == 0 else min(MCP_CACHE_TTL, 60.0)
+    _MCP_TOOL_CACHE[username] = (now, out, ttl)
+    return out
+def _mcp_tool_name(srv, tool):
+    return "mcp__" + srv + "__" + tool
+def _mcp_tool_names(username):
+    try:
+        return frozenset(_mcp_tool_name(s, t) for (s, t, d, sc) in _mcp_tools_cached(username))
+    except Exception:
+        return frozenset()
+def _mcp_offer(username):
+    """OpenAI-shape tool dicts for this principal's MCP tools (empty on any
+    failure - an unreachable server never blocks a turn)."""
+    try:
+        out = []
+        for (s, t, d, sc) in _mcp_tools_cached(username):
+            out.append({"type": "function", "function": {
+                "name": _mcp_tool_name(s, t),
+                "description": d or ("MCP tool " + t + " on server " + s),
+                "parameters": sc}})
+        return out
+    except Exception:
+        return []
+def _mcp_execute(name, args, username):
+    parts = str(name or "").split("__")
+    if len(parts) != 3 or parts[0] != "mcp" or not parts[1] or not parts[2]:
+        return "Error: malformed mcp tool name"
+    srv = parts[1]
+    tool = parts[2]
+    defn = None
+    for d in _mcp_servers_for(username):
+        if d["name"] == srv:
+            defn = d
+            break
+    if defn is None:
+        return "Error: no mcp server '" + srv + "' configured for this account (defs are re-checked at call time)"
+    real = _MCP_NAME_MAP.get((srv, tool), tool)
+    def call_work(proc, deadline):
+        _mcp_send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": real,
+                                    "arguments": args if isinstance(args, dict) else {}}})
+        r = _mcp_rpc_read(proc, deadline, 2)
+        if "error" in r:
+            e = r.get("error")
+            em = e.get("message") if isinstance(e, dict) else e
+            return "MCP tool error: " + str(em)[:300]
+        res = r.get("result")
+        res = res if isinstance(res, dict) else {}
+        bits = []
+        for b in res.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text":
+                bits.append(str(b.get("text") or ""))
+        txt = (chr(10).join(bits)).strip()
+        if res.get("isError"):
+            return "MCP tool reported failure: " + (txt[:300] or "no detail")
+        return txt[:MCP_RESULT_CAP] if txt else "(mcp call completed with no text content)"
+    out, err = _mcp_session(defn, MCP_TIMEOUT_CALL, call_work)
+    if err:
+        _MCP_TOOL_CACHE.pop(username, None)
+        return "Error: mcp server '" + srv + "' " + err
+    return out
 def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=None) -> str:
     """Execute a tool and return the result as a string."""
     # P1-A/L7: the honesty page promises tool ARGUMENTS are never logged -
@@ -11356,6 +12497,10 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
             return execute_f15_tool(name, args, username, conv_id=conv_id, files_sink=files_sink)
         elif name in ("generate_image", "generate_speech"):
             return execute_f17_tool(name, args, username, conv_id=conv_id, files_sink=files_sink)
+        elif name.startswith("mcp__"):
+            # U14 (patch22): MCP call. Every failure inside returns a clean
+            # string - the turn survives a dead or rude server.
+            return _mcp_execute(name, args, username)
         else:
             return f"Error: unknown tool '{name}'"
     except Exception as e:
@@ -11891,7 +13036,10 @@ def _f17_post_opener():
 # privileged is simply NOT on this list: model_key_*, search_key_*,
 # model_key_media, v1_token, oauth_redirect_base, opnsense_key.
 _CAIRN_SAFE_SETTINGS = frozenset({
+    "active_prompt",
     "audiogen_mode", "audiogen_model", "audiogen_voice",
+    "embed_model", "conv_search", "conv_sim_min",
+    "mcp_servers",
     "compaction_prompt", "compaction_threshold", "context_budget",
     "custom_instructions", "google_client_id",
     "imagegen_cf_account", "imagegen_kind", "imagegen_mode",
@@ -11899,7 +13047,7 @@ _CAIRN_SAFE_SETTINGS = frozenset({
     "max_tokens", "mediagen_max_mb", "model", "model_params",
     "ms_client_id", "nc_url", "nc_user",
     "search_n", "search_provider", "temperature", "theme",
-    "timezone", "title_gen", "tool_notes", "tools_disabled", "top_p",
+    "timezone", "title_gen", "title_prompt", "tool_notes", "tools_disabled", "top_p",
 })
 # P1-D/B1 (round-3 audit): DESTINATION keys are OFF this list - ha_url,
 # opnsense_url, model_custom, model_provider, imagegen_base, audiogen_base,
@@ -12934,6 +14082,25 @@ def _tool_web_fetch(args: dict, username=None) -> str:
 
 # ─── Agent Loop (with tool calling, live streaming, visible reasoning) ───────
 _SSE_LOCK = Lock()
+# P26: SSE comment heartbeat (2026-10-05). First-token silence on a cold
+# provider (local prefill = up to minutes of dead air) let mobile/browser
+# clients abandon /api/chat before any data arrived. Comment lines are
+# invisible to every SSE parser in the house (client recon 2026-10-05: a
+# line starting with ':' falls through the dispatcher untouched) and to any
+# spec-compliant EventSource. Comments are connection bytes ONLY: never
+# recorded, never replayed on re-attach. H12 honored: the pinger touches no
+# global lock - only its own connection's write lock.
+SSE_PING_SECONDS = 12.0
+
+
+def _p26_pinger(wfile, wlock, stop):
+    while not stop.wait(SSE_PING_SECONDS):
+        try:
+            with wlock:
+                wfile.write(b": ping" + chr(10).encode() * 2)
+                wfile.flush()
+        except Exception:
+            return  # connection gone; the owning handler will notice too
 
 def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, username=None, allow_tools=True, tool_names=frozenset(), conv_id=None, files_sink=None):
     """
@@ -13013,6 +14180,14 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
         final_text = ""
         reasoning_acc = []
         tool_log = []
+        # patch16 (K80 2026-10-04): thinking-timeline parity. _rsep marks a
+        # reasoning-session boundary in the stored column (appended after each
+        # tool round); tseq numbers tool_log entries with the session that
+        # preceded them. The client splits on _rsep to render one thinking
+        # card per session, interleaved with tool rows - in stream order AND
+        # on reload. Legacy rows carry no marker and render the old way.
+        tseq = 0
+        _rsep = chr(10) + chr(10) + chr(8280) * 3 + chr(10) + chr(10)
         resp_ref = {}
         # P1-G/T (round-5 audit Finding T): provider-stream byte budgets.
         # timeout=300 is a PER-READ socket timeout, not a total - a provider
@@ -13070,6 +14245,12 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
                     # real principal. It is only ever in tool_names for a live,
                     # present share clone (see _share_effective_tools).
                     offered = offered + [SHARE_ASK_SCHEMA]
+                # U14 (patch22): this principal's MCP tools ride the same
+                # offered payload. tool_names already contains them (see
+                # effective_tool_names) so the dispatch guard agrees; the
+                # defs are re-validated at call time either way.
+                if tool_names is not None and username:
+                    offered = offered + _mcp_offer(username)
                 if offered:
                     payload["tools"] = offered
                     payload["tool_choice"] = "auto"
@@ -13083,6 +14264,7 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
             tool_calls_acc = {}  # index → {id, name, arguments}
             _p1g_argb = {}  # P1-G/T: per-tool-call argument bytes
             _p1g_tc = [0]   # P1-H/U: per-STREAM distinct tool-call count
+            _p1g_tsent = {}  # iter4: last preview length emitted per tool-call idx (tool_args stream)
             finish_reason = None
 
             with _provider_urlopen(model_cfg, req, timeout=300) as resp:  # P1-C/F2
@@ -13146,6 +14328,14 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
                                 if _p1g_argb[idx] > 2097152:
                                     raise RuntimeError("provider tool-call arguments exceeded the 2 MB byte budget (P1-G/T)")
                                 tool_calls_acc[idx]["arguments"] += tc["function"]["arguments"]
+                                # iter4 (Agora parity): stream an arg preview while args grow.
+                                # Same allow_tools gate as final execution; preview is capped
+                                # exactly like the final tool_call payload so no extra bytes leak.
+                                if allow_tools and tool_calls_acc[idx]["name"]:
+                                    _ta_prev = tool_calls_acc[idx]["arguments"][:4000]
+                                    if len(_ta_prev) - _p1g_tsent.get(idx, 0) >= 64:
+                                        _p1g_tsent[idx] = len(_ta_prev)
+                                        send_event("tool_args", {"idx": idx, "name": tool_calls_acc[idx]["name"], "arguments": _ta_prev})
 
             if cancel is not None and cancel.is_set():
                 send_event("stopped", {})
@@ -13193,12 +14383,12 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
                         result = "DENIED: tool not available on this instance (tier restriction or disabled by your principal)"
                         log.warning("  Tool %s denied (tier filter or disabled)", tc["name"])
                         log_event(username, "tool.call.denied", tool=tc["name"], iteration=iteration)
-                        tool_log.append({"name": tc["name"], "arguments": tc["arguments"][:500], "result": result})
+                        tool_log.append({"name": tc["name"], "arguments": tc["arguments"][:4000], "result": result, "s": tseq})
                         send_event("tool_result", {"name": tc["name"], "result": result})
                         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
                         continue
                     # Notify client of tool call
-                    send_event("tool_call", {"name": tc["name"], "arguments": tc["arguments"][:500]})
+                    send_event("tool_call", {"idx": idx, "name": tc["name"], "arguments": tc["arguments"][:4000]})
                     log.info("  Tool: %s", tc["name"])
                     _f4_t0 = time.time()
                     _f24_pre = len(files_sink) if files_sink is not None else 0
@@ -13211,7 +14401,7 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
                         _r10_args = None
                     if not isinstance(_r10_args, dict):
                         result = "Error: the arguments for this call were not a valid JSON object - resend the call with well-formed JSON arguments."
-                        tool_log.append({"name": tc["name"], "arguments": tc["arguments"][:500], "result": result})
+                        tool_log.append({"name": tc["name"], "arguments": tc["arguments"][:4000], "result": result, "s": tseq})
                         send_event("tool_result", {"name": tc["name"], "result": result})
                         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
                         continue
@@ -13227,7 +14417,7 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
                               result_bytes=len(result.encode("utf-8", "replace")),
                               iteration=iteration)
                     cap = 8000 if tc["name"] == "read_file" else 2000
-                    tool_log.append({"name": tc["name"], "arguments": tc["arguments"][:500], "result": result[:cap]})
+                    tool_log.append({"name": tc["name"], "arguments": tc["arguments"][:4000], "result": result[:cap], "s": tseq})
                     # Notify client of tool result
                     _f24_payload = {"name": tc["name"], "result": result[:cap]}
                     if tc["name"] == "send_file" and files_sink is not None and len(files_sink) > _f24_pre:
@@ -13243,6 +14433,12 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
                     })
 
                 final_text = "".join(full_content)
+                # patch16: this round ended in tool calls; close its thinking
+                # session so the stored column carries the boundary. Skip when
+                # no reasoning exists at all (thinking off / none streamed).
+                if reasoning_acc:
+                    reasoning_acc.append(_rsep)
+                tseq += 1
                 continue  # Next iteration: send tool results back to model
 
             # No tool calls — this is the final response (already streamed live)
@@ -13352,30 +14548,126 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .jumpbtn{position:sticky;bottom:10px;margin-top:6px;margin-left:auto;width:38px;height:38px;border-radius:50%;border:1px solid var(--border);background:var(--surface);color:var(--accent);font-size:17px;cursor:pointer;z-index:2;box-shadow:0 2px 10px rgba(0,0,0,0.35)}
 .jumpbtn[hidden]{display:none}
 .ctxmeter{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;color:var(--dim);margin-left:10px;white-space:nowrap}
+.convpill{display:none;flex-direction:column;align-items:flex-start;gap:1px;margin-left:10px;max-width:min(56vw,340px);padding:4px 14px;border-radius:16px;border:1px solid var(--border);background:var(--bg);font-size:12px;overflow:hidden}
+.convpill.show{display:inline-flex}
+.convpill .cpt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;color:var(--text);font-weight:700;font-size:13px}
+.convpill .ctxmeter{margin-left:0;opacity:.8}
 .queuebar{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;color:var(--accent);background:var(--surface);border:1px dashed var(--border);border-radius:10px;cursor:pointer}
 .queuebar[hidden]{display:none}
 .chat-col{width:100%;max-width:820px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
 .msg{max-width:88%;padding:10px 14px;border-radius:14px;line-height:1.55;font-size:15px;white-space:pre-wrap;word-wrap:break-word;animation:msgin .18s ease}
+/* U18 markdown in chat bubbles (renderer builds these nodes only) */
+.msg h1,.msg h2,.msg h3,.msg h4,.msg h5,.msg h6{margin:.55em 0 .35em;line-height:1.3;font-weight:700}
+.msg h1{font-size:1.35em}
+.msg h2{font-size:1.25em}
+.msg h3{font-size:1.15em}
+.msg h4,.msg h5,.msg h6{font-size:1.05em}
+.msg .md-p{margin:.3em 0}
+.msg code{background:rgba(127,127,127,.18);padding:1px 5px;border-radius:5px;font-size:.92em}
+.msg pre{margin:.45em 0;padding:9px 11px;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.08);border-radius:9px;overflow-x:auto;white-space:pre;font-size:.9em;line-height:1.45}
+.msg pre code{background:none;padding:0;border-radius:0;font-size:1em}
+.msg blockquote{margin:.4em 0;padding:.1em .8em;border-left:3px solid rgba(127,127,127,.5);opacity:.92}
+.msg ul,.msg ol{margin:.35em 0;padding-left:1.5em}
+.msg li{margin:.15em 0}
+.msg hr{border:0;border-top:1px solid rgba(255,255,255,.15);margin:.6em 0}
+.msg a{color:var(--accent);text-decoration:underline}
 @keyframes msgin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .msg.user{align-self:flex-end;background:var(--user);border-bottom-right-radius:4px}
 .msg.assistant{align-self:flex-start;display:flex;gap:10px;align-items:flex-start;background:var(--assistant);border:1px solid var(--border);border-bottom-left-radius:4px;max-width:94%}
 .msg-avatar{width:30px;height:30px;border-radius:50%;flex:none;border:1px solid var(--border)}
 .msg-avwrap{flex:1 1 auto;min-width:0;overflow-wrap:break-word}
-.thoughts{margin:0 0 8px;border:1px dashed var(--border);border-radius:10px;padding:4px 10px}
-.thoughts summary{cursor:pointer;font-size:11px;color:var(--dim);letter-spacing:1px;text-transform:uppercase;user-select:none;list-style:none;display:flex;gap:6px;align-items:center;min-height:30px}
+.thoughts{margin:0 0 8px;border:1px solid var(--border);border-radius:12px;padding:9px 13px;background:var(--surface)}
+.thoughts summary{cursor:pointer;font-size:12.5px;font-weight:600;color:var(--text);user-select:none;list-style:none;display:flex;gap:8px;align-items:center;min-height:30px;position:relative;padding-right:18px}
+.thoughts summary::after{content:'\\203A';position:absolute;right:2px;top:50%;transform:translateY(-50%) rotate(90deg);transition:transform .15s;color:var(--dim)}
+.thoughts[open] summary::after{transform:rotate(270deg)}
 .thoughts summary::-webkit-details-marker{display:none}
 .thoughts-body{font-size:12.5px;color:var(--dim);white-space:pre-wrap;word-wrap:break-word;max-height:280px;overflow-y:auto;margin-top:4px;line-height:1.5}
-.toolrow{align-self:flex-start;display:flex;flex-direction:column;gap:6px;max-width:94%}
+.toolrow{align-self:stretch;display:flex;flex-direction:column;gap:6px;max-width:94%}.ctxout{opacity:.40;transition:opacity .3s}
+.thinkcard{align-self:stretch;max-width:94%;border:1px solid var(--border);border-radius:12px;padding:9px 13px;background:var(--surface);display:flex;gap:9px;align-items:center;cursor:pointer;min-height:30px;box-sizing:border-box}
+.thinkcard .tlogo{flex:none;width:16px;height:16px;display:inline-flex}
+.thinkcard .tcname{font-size:12.5px;font-weight:600;color:var(--text);white-space:nowrap}
+.thinkcard .tcpv{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.tooldet summary{position:relative;padding-right:18px}
+.tooldet summary::after{content:'\\203A';position:absolute;right:2px;top:50%;transform:translateY(-50%) rotate(90deg);transition:transform .15s;color:var(--dim)}
+.tooldet[open] summary::after{transform:rotate(270deg)}
 .toolchip{display:inline-flex;align-items:center;gap:8px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--dim);background:var(--tool);border:1px solid var(--border);border-radius:10px;padding:7px 12px;min-height:34px;width:fit-content}
 .toolchip .tg{color:var(--accent2)}
 .toolchip .tname{color:var(--accent)}
-.toolchip.running::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1s infinite}
+.toolchip{width:100%;justify-content:flex-start;gap:10px;background:var(--surface);border-radius:12px;padding:9px 13px;font-family:inherit}
+.toolchip.running::after{display:none}
+.toolchip .tlabel{font-family:inherit;font-size:12.5px;font-weight:600;color:var(--text);letter-spacing:.2px;flex:none}
+.toolchip .tprev{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;color:var(--dim);opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;text-align:left}
+.toolchip .tstat{font-size:11px;color:var(--dim);white-space:nowrap;flex:none}
+.toolchip.file{border-left:3px solid var(--accent);background:var(--tool)}
+.toolchip.connector{border-left:3px solid var(--accent2);background:var(--tool)}
+.toolchip.tool{border-left:3px solid var(--dim);background:var(--tool)}
+.toolchip.memory{border-left:3px solid #f5b942;background:var(--tool)}
+.toolchip.running::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent);animation:pulse 1s infinite;color:var(--accent)}
 @keyframes pulse{0%,100%{opacity:0.25}50%{opacity:1}}
 .tooldet summary{cursor:pointer;font-size:11px;color:var(--dim);list-style:none;user-select:none;min-height:24px}
 .tooldet summary::-webkit-details-marker{display:none}
+.toolchip{cursor:pointer}
+.toolchip.running{cursor:default}
+.toolchip.running .tlabel,.toolchip.running .tg{opacity:.75}
+.tsheet-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:95;display:none;align-items:flex-end;justify-content:center}
+.tsheet-bg.on{display:flex;animation:bgin .18s ease}
+.tsheet-bg.closing{animation:bgoout .2s ease forwards}
+.tsheet-bg.closing .tsheet{animation:sheetout .2s cubic-bezier(.4,0,1,1) forwards}
+@keyframes bgin{from{opacity:0}to{opacity:1}}
+@keyframes bgoout{from{opacity:1}to{opacity:0}}
+@keyframes sheetup{from{transform:translateY(55vh)}to{transform:translateY(0)}}
+@keyframes sheetout{from{transform:translateY(0)}to{transform:translateY(55vh)}}
+@keyframes sheetpop{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+@keyframes tblink{0%,49%{opacity:.7}50%,100%{opacity:0}}
+.thinkcard.live .tcpv::after{content:'▍';margin-left:2px;color:var(--accent);animation:tblink 1s steps(2,start) infinite}
+.tsheet{width:100%;max-width:720px;max-height:92vh;overflow-y:auto;overscroll-behavior:contain;background:var(--surface);border:1px solid var(--border);border-radius:18px 18px 0 0;padding:10px 18px calc(24px + env(safe-area-inset-bottom));box-sizing:border-box;animation:sheetup .3s cubic-bezier(.22,.9,.28,1)}
+.tsheet .grip{display:block;width:44px;height:5px;border-radius:3px;background:var(--dim);opacity:.6;margin:2px auto 12px;touch-action:none}
+.tsheet-title{font-size:21px;font-weight:700;color:var(--text);margin-bottom:4px}
+.tslab{font-size:12px;font-weight:700;color:var(--dim);margin:16px 0 6px}
+.tchip{display:inline-block;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;background:var(--tool);border:1px solid var(--border);border-radius:8px;padding:2px 10px;margin:0 6px 4px 0;color:var(--text)}
+.tval{font-size:13.5px;color:var(--text);white-space:pre-wrap;word-break:break-word;margin:0 0 10px}
+.tstat-chip{background:var(--accent2);border-color:var(--accent2);color:#fff}
+.tout{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;background:var(--tool);border:1px solid var(--border);border-radius:12px;padding:12px;white-space:pre-wrap;word-break:break-word;max-height:50vh;overflow:auto}
+.tstatrow{margin-bottom:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+@media (min-width:720px){.tsheet-bg{align-items:center}.tsheet{border-radius:18px;animation:sheetpop .22s ease}}
+.tsheet-title{border-bottom:1px solid var(--border);padding-bottom:10px}
+#msgResults{padding:0 0 6px}
+.sr-h{color:var(--dim);font-size:11px;padding:10px 14px 4px;text-transform:uppercase;letter-spacing:.05em}
+.sr-item{padding:9px 14px;border-bottom:1px solid var(--border);cursor:pointer}
+.sr-item:active{background:rgba(128,128,128,.12)}
+.sr-t{font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sr-s{font-size:12px;color:var(--dim);line-height:1.45;margin-top:2px;word-break:break-word}
+.sr-s b{color:var(--text);font-weight:600}
+.cfCrumb{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin:2px 0 10px;font-size:13px}
+.cfCrumb button{background:none;border:none;color:var(--accent);font-size:13px;padding:2px 4px;cursor:pointer}
+.cfCrumb .cfSep{color:var(--dim)}
+.cfBar{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center}
+.cfBar input{flex:1;min-width:120px}
+.cfRow{display:flex;align-items:center;gap:10px;padding:11px 6px;border-bottom:1px solid var(--border);cursor:pointer;font-size:15px;color:var(--text)}
+.cfRow:active{background:rgba(128,128,128,.12)}
+.cfRow .cfNm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cfRow .cfSz{color:var(--dim);font-size:12px;white-space:nowrap}
+.cfDel{background:none;border:none;color:var(--dim);font-size:15px;padding:4px 8px;cursor:pointer}
+.cfEmpty{color:var(--dim);font-size:14px;padding:14px 2px}
+.cfIco{width:20px;text-align:center;flex:none}
+.tprose{font-size:14px;line-height:1.6;color:var(--text);white-space:pre-wrap;word-wrap:break-word;margin-top:12px}
+.toolchip{display:grid;grid-template-columns:auto 1fr auto;grid-template-rows:auto auto;align-items:center;column-gap:10px;row-gap:2px;padding:10px 30px 10px 13px;position:relative}
+.toolchip .tg{grid-column:1;grid-row:1 / 3;align-self:center;font-size:15px}
+.toolchip .tlabel{grid-column:2;grid-row:1;font-size:13px}
+.toolchip .tstat{grid-column:2;grid-row:2;white-space:normal;flex:1;text-align:left}
+.toolchip .tstat.run::after{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-left:6px;vertical-align:1px;animation:pulse 1s infinite}
+.toolchip::after{content:'›';position:absolute;right:11px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:16px;line-height:1}
+.thoughts{display:grid;grid-template-columns:auto 1fr;column-gap:9px;row-gap:2px;align-items:center;cursor:pointer;padding:10px 30px 10px 13px;position:relative}
+.thoughts .tlogo{grid-column:1;grid-row:1 / 3;align-self:center;width:16px;height:16px}
+.thoughts .tlogo svg{width:100%;height:100%}
+.thoughts .tlabel{grid-column:2;grid-row:1;font-size:13px;font-weight:600;color:var(--text)}
+.thoughts .tprev{grid-column:2;grid-row:2;font-family:inherit;font-size:12px;color:var(--dim)}
+.thoughts::after{content:'›';position:absolute;right:11px;top:50%;transform:translateY(-50%);color:var(--dim);font-size:16px;line-height:1}
 .toolres{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;color:var(--dim);background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin-top:4px;line-height:1.5}
-.thinking{align-self:flex-start;display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--dim);padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:14px}
-.thinking .dots{display:inline-flex;gap:3px}
+.thinking{align-self:stretch;max-width:94%;display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--dim);padding:9px 13px;background:var(--surface);border:1px solid var(--border);border-radius:12px}
+.thinking .tlogo{width:18px;height:18px;flex:none;display:inline-flex;color:var(--accent2);animation:pulse 1.6s infinite}
+.thinking .tlogo svg,.thoughts summary .tlogo svg{width:100%;height:100%}
+.thoughts summary .tlogo{width:16px;height:16px;flex:none;display:inline-flex;color:var(--accent2)}
 .thinking .dots i{width:5px;height:5px;border-radius:50%;background:var(--accent);animation:blink 1.2s infinite}
 .thinking .dots i:nth-child(2){animation-delay:0.2s}
 .thinking .dots i:nth-child(3){animation-delay:0.4s}
@@ -13390,8 +14682,16 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .chip:hover{color:var(--accent);border-color:var(--accent)}
 /* ── composer ────────────────────────────── */
 .composer{background:var(--surface);border-top:1px solid var(--border);padding:8px 10px calc(8px + env(safe-area-inset-bottom));z-index:20;position:relative}
-.composer-col{max-width:820px;margin:0 auto;display:flex;align-items:flex-end;gap:8px}
-#msgInput{flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:16px;padding:11px 15px;font-size:16px;font-family:inherit;line-height:1.4;resize:none;max-height:140px;min-height:44px;transition:border-color .15s,box-shadow .15s}
+.composer-col{max-width:820px;margin:0 auto;display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px}
+.composer.grabbable{padding-top:14px}
+.composer.grabbable::before{content:'';position:absolute;top:4px;left:50%;transform:translateX(-50%);width:44px;height:5px;border-radius:3px;background:var(--dim);opacity:.5;pointer-events:none}
+.composer.expanded{position:fixed;inset:0;z-index:96;padding-top:calc(14px + env(safe-area-inset-top));display:flex;flex-direction:column;animation:expin .22s cubic-bezier(.22,.9,.28,1)}
+.composer.expanded .composer-col{flex:1;align-items:stretch;min-height:0}
+.composer.expanded #msgInput{flex:1;max-height:none;height:auto;min-height:60px}
+@keyframes expin{from{transform:translateY(30%)}to{transform:translateY(0)}}
+#cmpExpand svg{transition:transform .2s ease}
+.composer.expanded #cmpExpand svg{transform:rotate(180deg)}
+#msgInput{flex:1 1 100%;order:-1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:16px;padding:11px 15px;font-size:16px;font-family:inherit;line-height:1.4;resize:none;max-height:140px;min-height:44px;transition:border-color .15s,box-shadow .15s}
 #msgInput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--glow)}
 #msgInput::placeholder{color:var(--dim)}
 .send-btn{width:44px;height:44px;flex:none;border-radius:50%;background:var(--accent);color:var(--bg);border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:filter .15s,transform .05s,box-shadow .15s}
@@ -13423,11 +14723,28 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .atchip.uploading{opacity:0.65}
 .atchip.uploading::after{content:"↑";color:var(--accent);font-size:13px;flex:none}
 .flashnote{max-width:820px;margin:0 auto 8px;font-size:12px;color:var(--accent2)}
+.vrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0;font-size:13px}
+.vrowlabel{display:inline-flex;gap:5px;align-items:center;cursor:pointer}
+.vrowlabel[hidden]{display:none}
+.vest{font-size:12px;color:var(--dim);margin-top:4px}
+.vprog{font-size:12px;color:var(--accent2);margin-top:6px}
+.vbtns{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
 .msg-atts{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .msg-att{display:inline-flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:4px 8px;font-size:12px;color:var(--dim);text-decoration:none;max-width:210px}
 .msg-att img{height:56px;max-width:90px;object-fit:cover;border-radius:8px;border:1px solid var(--border)}
 .msg-att .an{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* ── export popover ──────────────────────── */
+.cpop{position:absolute;bottom:calc(100% + 8px);background:var(--surface);border:1px solid var(--border);border-radius:12px;z-index:60;box-shadow:0 8px 32px rgba(0,0,0,0.45);padding:6px;min-width:230px;max-width:calc(100vw - 24px);max-height:46vh;overflow:auto}
+.cpop-item{display:flex;align-items:center;gap:10px;width:100%;padding:9px 14px;background:none;border:none;color:var(--text);font-size:14px;text-align:left;cursor:pointer;border-radius:9px;min-height:40px;font-family:inherit;transition:background .15s,color .15s}
+.cpop-item:hover{background:var(--bg)}
+.cpop-item svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none;color:var(--dim)}
+.cpop-item.on{color:var(--accent)}
+.cpop-item.on svg{color:var(--accent)}
+.cpop-item .cpsub{color:var(--dim);font-size:11px;margin-left:auto;padding-left:14px;flex:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45%}
+.cpop-head{color:var(--dim);font-size:11px;padding:6px 14px 4px;letter-spacing:.08em;text-transform:uppercase}
+.qsw{margin-left:auto;flex:none;min-width:30px;text-align:center;font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--border);color:var(--dim)}
+.cpop-item.on .qsw{color:var(--accent);border-color:var(--accent)}
+#chatModelLabel{cursor:pointer;border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:4px 12px}
 .pop{position:fixed;top:calc(56px + env(safe-area-inset-top));right:10px;background:var(--surface);border:1px solid var(--border);border-radius:12px;z-index:50;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.45)}
 .pop-item{display:block;width:100%;padding:0 18px;background:none;border:none;color:var(--text);font-size:14px;text-align:left;cursor:pointer;min-height:44px;transition:background .15s,color .15s}
 .pop-item:hover{background:var(--bg);color:var(--accent)}
@@ -13438,7 +14755,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .chat-col{gap:8px}
 .topbar{gap:2px;padding-left:6px;padding-right:6px}
 #chatModelBar{font-size:11px}
-#chatModelLabel{max-width:100%;flex:1 1 100%}
+#chatModelLabel{max-width:min(50vw,240px);flex:0 1 auto}
 }
 @media (min-width:900px){
   .chat{padding:24px 24px 12px}
@@ -13452,9 +14769,9 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
     <svg viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
   </button>
   <div class="brand"><img class="logo" src="api/avatar" onerror="this.onerror=null;this.src='static/color.png'" alt=""><span class="brand-name">C.A.I.R.N.</span></div>
-  <span id="ctxMeter" class="ctxmeter"></span>
-  <button id="exportBtn" class="icon-btn" title="Export conversation" hidden>
-    <svg viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></svg>
+  <span id="convPill" class="convpill" title="current conversation"><span class="cpt" id="convPillTitle">New chat</span><span id="ctxMeter" class="ctxmeter"></span></span>
+  <button id="exportBtn" class="icon-btn" title="Conversation menu" hidden>
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
   </button>
   <a href="shares" class="icon-btn" aria-label="Shares" title="Shares — invite a guest to talk to a copy of your agent">
     <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12h8M12 8v8"/></svg>
@@ -13473,7 +14790,14 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
     <h2>Conversations</h2>
     <button id="newChatBtn" class="btn-small">+ New chat</button>
   </div>
+  <div style="padding:0 14px 10px">
+    <input id="convFilter" placeholder="Search conversations..." autocomplete="off" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;padding:9px 12px;outline:none">
+  </div>
   <div id="convList" class="conv-list"></div>
+  <div id="msgResults" style="display:none"></div>
+  <div style="padding:10px 14px 14px;border-top:1px solid var(--border)">
+    <a href="settings" class="btn-small" style="display:block;width:100%;box-sizing:border-box;text-align:center;text-decoration:none;line-height:38px">Settings</a>
+  </div>
 </aside>
 
 <main id="chatArea" class="chat">
@@ -13495,17 +14819,41 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 <footer class="composer">
   <div id="queueBar" class="queuebar" hidden></div>
   <div id="attachChips" class="attach-chips"></div>
-  <div id="chatModelBar" style="font-size:12px;color:var(--dim);padding:0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><button id="chatModelEdit" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Change the model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span><span id="cmHits" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
+  <div id="mediaPop" class="cpop" hidden style="left:10px">
+    <button id="mpCam" class="cpop-item"><svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>Camera</button>
+    <button id="mpPhotos" class="cpop-item"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>Photos</button>
+    <button id="mpVideos" class="cpop-item"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M22 8l-6 4 6 4z"/></svg>Videos</button>
+    <button id="mpFiles" class="cpop-item"><svg viewBox="0 0 24 24"><path d="M21 12l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8L13 4.5a3.7 3.7 0 0 1 5.2 5.2l-8.2 8.2a1.85 1.85 0 0 1-2.6-2.6L15 7.5"/></svg>Files</button>
+    <button id="mpCairn" class="cpop-item"><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>Chat files</button>
+  </div>
+  <div id="modelPop" class="cpop" hidden style="left:10px">
+    <div class="cpop-head">saved models</div>
+    <div id="mpList"></div>
+  </div>
+  <div id="qsPop" class="cpop" hidden style="left:52px">
+    <div class="cpop-head">quick settings</div>
+    <!-- U-PARK (K80 2026-10-04): Thinking toggle hidden pending a semantics
+         discussion (hide vs. actually suppress reasoning). Server off_think
+         path stays in the daemon, dormant: no client ever sends off_think. -->
+    <button id="qsWeb" class="cpop-item"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>Web Search<span class="qsw">on</span></button>
+    <button id="qsShell" class="cpop-item"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg>Shell<span class="qsw">on</span></button>
+    <button id="qsCompact" class="cpop-item" title="fold this chat's older history into a continuity handoff, now"><svg viewBox="0 0 24 24"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg>Context Compact</button>
+    <div class="cpop-head">switching one off restricts your next messages - it never grants</div>
+  </div>
   <div class="composer-col">
-    <button id="attachBtn" class="icon-btn" title="Attach files">
-      <svg viewBox="0 0 24 24"><path d="M21 12l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8L13 4.5a3.7 3.7 0 0 1 5.2 5.2l-8.2 8.2a1.85 1.85 0 0 1-2.6-2.6L15 7.5"/></svg>
+    <button id="attachBtn" class="icon-btn" title="Attach">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
     </button>
-    <button id="camBtn" class="icon-btn" title="Take a photo">
-      <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+    <button id="qsBtn" class="icon-btn" title="Quick settings for this chat">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
     </button>
+    <div id="chatModelBar" style="flex:1;min-width:0;font-size:12px;color:var(--dim);display:flex;gap:6px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><button id="chatModelEdit" class="btn" style="padding:0 9px;height:24px;font-size:11px;border-radius:999px;background:transparent;color:var(--dim);border:1px solid var(--border)" title="Change the model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span><span id="cmHits" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
     <input type="file" id="filePick" multiple hidden>
     <input type="file" id="camPick" accept="image/*" capture="environment" hidden>
     <textarea id="msgInput" rows="1" placeholder="Message your agent..." autocomplete="off"></textarea>
+    <button id="cmpExpand" class="icon-btn" title="Expand composer" aria-label="Expand composer">
+      <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
     <button id="sendBtn" class="send-btn" aria-label="Send">
       <svg class="send-ico" viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>
       <svg class="stop-ico" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
@@ -13514,10 +14862,27 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 </footer>
 
 <div id="exportPop" class="pop" hidden>
+  <button id="cmSearch" class="pop-item">Search in conversation</button>
+  <button id="cmSys" class="pop-item">System prompt (this chat)</button>
+  <button id="cmFork" class="pop-item">Fork conversation</button>
+  <a href="shares" class="pop-item" style="display:block;line-height:44px;text-decoration:none">Share (guest access)</a>
+  <div class="cpop-head" style="padding:6px 18px">export</div>
   <button id="mdBtn" class="pop-item">Markdown (.md)</button>
   <button id="jsonBtn" class="pop-item">JSON (.json)</button>
 </div>
-
+<div id="convSearch" class="pop" hidden style="width:min(340px,90vw)">
+  <input id="csQ" placeholder="Search this conversation..." autocomplete="off" style="width:100%;box-sizing:border-box;background:none;border:none;border-bottom:1px solid var(--border);color:var(--text);font-size:14px;padding:12px 14px;outline:none">
+  <div id="csMsg" style="padding:8px 14px;font-size:12px;color:var(--dim)" hidden></div>
+  <div id="csRes" style="max-height:50vh;overflow-y:auto"></div>
+</div>
+<div id="sysPop" class="pop" hidden style="width:min(420px,92vw)">
+  <div class="cpop-head" style="padding:10px 14px 2px">system notes - this chat only</div>
+  <textarea id="sysTxt" rows="6" placeholder="Extra standing instructions for this chat (blank clears; applied to your next messages)" style="width:calc(100% - 28px);margin:8px 14px;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px;font-family:inherit"></textarea>
+  <div style="display:flex;align-items:center;gap:10px;padding:0 14px 12px">
+    <button id="sysSave" class="btn-small">Save</button>
+    <span id="sysNote" style="font-size:12px;color:var(--dim)"></span>
+  </div>
+</div>
 <script>
 const NL = String.fromCharCode(10);
 const THEME_DEFAULT = 'neon';
@@ -13527,6 +14892,70 @@ let streaming = false;
 const $ = (id) => document.getElementById(id);
 const menuBtn = $('menuBtn'), drawer = $('drawer'), backdrop = $('backdrop');
 const convList = $('convList'), newChatBtn = $('newChatBtn');
+/* U5: drawer title filter (client-side; scheduled Tasks live in Settings). */
+var msgResTimer = null, msgResSeq = 0;
+let convQuery = '';
+let convFilterTimer = null;
+$('convFilter').addEventListener('input', function () {
+  convQuery = String(this.value || '').trim().toLowerCase();
+  clearTimeout(convFilterTimer);
+  convFilterTimer = setTimeout(loadConversations, 150);
+  // patch35: same box now also searches message bodies (debounced a touch
+  // longer so typing doesn't spam the endpoint).
+  clearTimeout(msgResTimer);
+  if (convQuery.length >= 2) { msgResTimer = setTimeout(function () { msgSearch(convQuery); }, 320); }
+  else { srClear(); }
+});
+/* ── patch35 (W3 gap audit, K80 2026-10-06): message full-text search ──
+   Title matches render through the old client filter in loadConversations
+   (untouched). Body hits render under #msgResults from api/search, which is
+   scoped server-side exactly like the conversation list. XSS-safe by
+   construction: createElement/textContent only (U18 doctrine) — the only
+   markup produced is a <b> around query matches. Stale-response guarded by
+   msgResSeq so a slow fetch can't paint over a newer query. */
+function srClear() {
+  var b = document.getElementById('msgResults');
+  if (b) { b.textContent = ''; b.style.display = 'none'; }
+}
+function srRow(h, q) {
+  var el = document.createElement('div'); el.className = 'sr-item';
+  var t = document.createElement('div'); t.className = 'sr-t';
+  var glyph = h.role === 'user' ? '🧑' : (h.role === 'assistant' ? '🤖' : '·');
+  t.textContent = glyph + ' ' + (h.title || 'New chat') + ' · ' + relTime(h.ts);
+  var s = document.createElement('div'); s.className = 'sr-s';
+  var snip = String(h.snippet || ''), low = snip.toLowerCase(), from = 0, i;
+  for (;;) {
+    i = q ? low.indexOf(q, from) : -1;
+    if (i < 0) { s.appendChild(document.createTextNode(snip.slice(from))); break; }
+    if (i > from) s.appendChild(document.createTextNode(snip.slice(from, i)));
+    var bb = document.createElement('b'); bb.textContent = snip.slice(i, i + q.length);
+    s.appendChild(bb); from = i + q.length;
+  }
+  el.appendChild(t); el.appendChild(s);
+  el.addEventListener('click', function () { switchConv(h.conv_id); closeDrawer(); });
+  return el;
+}
+async function msgSearch(q) {
+  var seq = ++msgResSeq;
+  if (!q || q.length < 2) { srClear(); return; }
+  var j = null;
+  try {
+    const r = await fetch('api/search?q=' + encodeURIComponent(q));
+    if (!r.ok) return;
+    j = await r.json();
+  } catch (e) { return; }
+  if (seq !== msgResSeq || !j) return;
+  var b = document.getElementById('msgResults');
+  if (!b) return;
+  b.textContent = '';
+  var hits = (j && j.hits) || [];
+  if (!hits.length) { b.style.display = 'none'; return; }
+  var hd = document.createElement('div'); hd.className = 'sr-h';
+  hd.textContent = 'In messages';
+  b.appendChild(hd);
+  hits.forEach(function (h) { b.appendChild(srRow(h, q)); });
+  b.style.display = '';
+}
 const chatArea = $('chatArea'), chatCol = $('chatCol'), emptyState = $('emptyState');
 const msgInput = $('msgInput'), sendBtn = $('sendBtn');
 // dynbrand (K80 2026-09-28): the brand is the registry agent_name, not a constant.
@@ -13710,11 +15139,14 @@ async function loadConversations() {
     if (r.status === 401) { location.href = 'login'; return []; }
     data = await r.json();
   } catch (e) { return []; }
+  if (convQuery) {
+    data = data.filter((c) => String(c.title || '').toLowerCase().indexOf(convQuery) >= 0);
+  }
   convList.innerHTML = '';
   if (!data.length) {
     const el = document.createElement('div');
     el.className = 'conv-empty';
-    el.textContent = 'No conversations yet.';
+    el.textContent = convQuery ? 'No conversations match.' : 'No conversations yet.';
     convList.appendChild(el);
     return data;
   }
@@ -13722,6 +15154,7 @@ async function loadConversations() {
     const el = document.createElement('div');
     el.className = 'conv-item' + (c.id === currentConv ? ' active' : '');
     f21Convs.set(c.id, f21Parse(c.model_override));
+    convTitles.set(c.id, c.title || 'New chat');
     const body = document.createElement('div');
     body.className = 'conv-body';
     const t = document.createElement('div');
@@ -13751,16 +15184,183 @@ async function loadConversations() {
     el.addEventListener('click', () => { switchConv(c.id); closeDrawer(); });
     convList.appendChild(el);
   });
+  pillRefresh();
   return data;
 }
 
 function showEmpty() { emptyState.style.display = 'flex'; }
 function hideEmpty() { emptyState.style.display = 'none'; }
 
+/* U18 (K80 GO 2026-10-05): markdown-ish rendering for chat messages.
+   XSS-safe by construction: message text is parsed by a plain char scanner
+   and rebuilt with createElement/textContent only. There is no code path
+   where untrusted text reaches an HTML parser (no HTML-string injection
+   so raw tags, entities and event attributes can only ever render as text.
+   Links are fenced to http/https/mailto after stripping control chars, which
+   kills javascript:/data:/vbscript: incl. whitespace tricks. Any failure
+   falls back to the old plain-text path. Streaming stays plain; finalize
+   and reload render. Share clones untouched (separate renderer). */
+const MD_NL = String.fromCharCode(10);
+var MD_RAW = null; try { MD_RAW = new WeakMap(); } catch (e) {}
+function mdSafeUrl(u) {
+  var s = '', i; u = String(u || '');
+  for (i = 0; i < u.length; i++) { var c = u.charCodeAt(i); if (c > 32 && c !== 127) s += u.charAt(i); }
+  var low = s.toLowerCase();
+  if (low.indexOf('http://') === 0 || low.indexOf('https://') === 0 || low.indexOf('mailto:') === 0) return s;
+  return null;
+}
+function mdEdge(s, i) {
+  if (i === 0) return true;
+  var p = s.charCodeAt(i - 1);
+  return p === 32 || p === 9 || p === 10 || p === 13 || p === 40 || p === 91 || p === 123 || p === 58 || p === 59 || p === 44 || p === 45 || p === 47 || p === 62;
+}
+function mdInlineInto(el, s) {
+  var i = 0, buf = '';
+  function flush() { if (buf) { el.appendChild(document.createTextNode(buf)); buf = ''; } }
+  while (i < s.length) {
+    var ch = s.charAt(i);
+    if (ch === '`') {
+      var n = 0; while (s.charAt(i + n) === '`') n++;
+      var fence = s.substr(i, n);
+      var close = s.indexOf(fence, i + n);
+      if (close > i + n - 1 && close !== -1) {
+        var code = document.createElement('code');
+        code.textContent = s.slice(i + n, close);
+        flush(); el.appendChild(code); i = close + n; continue;
+      }
+    }
+    if (ch === '[') {
+      var cb = s.indexOf(']', i + 1);
+      if (cb > -1 && s.charAt(cb + 1) === '(') {
+        var rp = s.indexOf(')', cb + 2);
+        if (rp > -1) {
+          var url = mdSafeUrl(s.slice(cb + 2, rp));
+          if (url !== null) {
+            var a = document.createElement('a');
+            a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+            a.textContent = s.slice(i + 1, cb);
+            flush(); el.appendChild(a); i = rp + 1; continue;
+          }
+        }
+      }
+    }
+    var two = s.substr(i, 2);
+    if (two === '**' || two === '__' || two === '~~') {
+      var end = s.indexOf(two, i + 2);
+      if (end > i + 2) {
+        var node = document.createElement(two === '~~' ? 'del' : 'strong');
+        mdInlineInto(node, s.slice(i + 2, end));
+        flush(); el.appendChild(node); i = end + 2; continue;
+      }
+    }
+    if ((ch === '*' || ch === '_') && mdEdge(s, i) && s.charAt(i + 1) !== ' ' && s.charAt(i + 1) !== '') {
+      var end2 = s.indexOf(ch, i + 1);
+      if (end2 > i + 1 && s.charAt(end2 - 1) !== ' ') {
+        var em = document.createElement('em');
+        mdInlineInto(em, s.slice(i + 1, end2));
+        flush(); el.appendChild(em); i = end2 + 1; continue;
+      }
+    }
+    buf += ch; i++;
+  }
+  flush();
+}
+function mdIsHr(t) {
+  if (t.length < 3) return false;
+  var c0 = t.charAt(0);
+  if (c0 !== '-' && c0 !== '*' && c0 !== '_') return false;
+  for (var i = 0; i < t.length; i++) { var c = t.charAt(i); if (c !== c0 && c !== ' ') return false; }
+  return true;
+}
+function mdIsBullet(t) {
+  return (t.charAt(0) === '-' || t.charAt(0) === '*' || t.charAt(0) === '+') && t.charAt(1) === ' ';
+}
+function mdIsOrdered(t) {
+  var i = 0;
+  while (i < t.length) { var c = t.charCodeAt(i); if (c < 48 || c > 57) break; i++; }
+  if (i === 0 || i >= t.length) return false;
+  if (t.charAt(i) !== '.' && t.charAt(i) !== ')') return false;
+  return t.charAt(i + 1) === ' ';
+}
+function mdStartsBlock(t) {
+  return t.indexOf('```') === 0 || t.indexOf('~~~') === 0 || t.charAt(0) === '#' || t.charAt(0) === '>' || mdIsHr(t) || mdIsBullet(t) || mdIsOrdered(t);
+}
+function mdBlocksInto(el, src) {
+  var lines = src.split(MD_NL), i = 0;
+  while (i < lines.length) {
+    var t = lines[i].trimStart().trimEnd();
+    if (!t) { i++; continue; }
+    if (t.indexOf('```') === 0 || t.indexOf('~~~') === 0) {
+      var fence = t.substr(0, 3), body = [], j = i + 1;
+      while (j < lines.length && lines[j].trimStart().indexOf(fence) !== 0) { body.push(lines[j]); j++; }
+      var pre = document.createElement('pre');
+      var pc = document.createElement('code');
+      pc.textContent = body.join(MD_NL);
+      pre.appendChild(pc); el.appendChild(pre);
+      i = j + 1; continue;
+    }
+    if (t.charAt(0) === '#') {
+      var n = 0; while (t.charAt(n) === '#' && n < 7) n++;
+      if (n <= 6 && t.charAt(n) === ' ') {
+        var h = document.createElement('h' + n);
+        mdInlineInto(h, t.slice(n + 1));
+        el.appendChild(h); i++; continue;
+      }
+    }
+    if (mdIsHr(t)) { el.appendChild(document.createElement('hr')); i++; continue; }
+    if (t.charAt(0) === '>') {
+      var q = document.createElement('blockquote'), qbuf = [];
+      while (i < lines.length) {
+        var qt = lines[i].trimStart();
+        if (qt.charAt(0) !== '>') break;
+        qbuf.push(qt.charAt(1) === ' ' ? qt.slice(2) : qt.slice(1));
+        i++;
+      }
+      mdBlocksInto(q, qbuf.join(MD_NL));
+      el.appendChild(q); continue;
+    }
+    if (mdIsBullet(t) || mdIsOrdered(t)) {
+      var ordered = mdIsOrdered(t);
+      var list = document.createElement(ordered ? 'ol' : 'ul');
+      while (i < lines.length) {
+        var lt = lines[i].trimStart();
+        if (!lt) break;
+        var isO = mdIsOrdered(lt), isB = mdIsBullet(lt);
+        if (ordered ? !isO : !isB) break;
+        var li = document.createElement('li');
+        var content = ordered ? lt.slice(lt.indexOf(' ') + 1) : lt.slice(2);
+        mdInlineInto(li, content);
+        list.appendChild(li); i++;
+      }
+      el.appendChild(list); continue;
+    }
+    var pbuf = [];
+    while (i < lines.length) {
+      var pt = lines[i].trimStart().trimEnd();
+      if (!pt || mdStartsBlock(pt)) break;
+      pbuf.push(lines[i]); i++;
+    }
+    var p = document.createElement('div');
+    p.className = 'md-p';
+    mdInlineInto(p, pbuf.join(MD_NL));
+    el.appendChild(p);
+  }
+}
+function mdInto(el, src) {
+  var raw;
+  try { raw = (src === undefined || src === null) ? el.textContent : String(src); } catch (e) { return; }
+  try {
+    el.textContent = '';
+    mdBlocksInto(el, raw);
+    if (MD_RAW) { try { MD_RAW.set(el, raw); } catch (e) {} }
+  } catch (e) {
+    try { el.textContent = raw; } catch (e2) {}
+  }
+}
 function addMsgDiv(cls, text) {
   const div = document.createElement('div');
   div.className = 'msg ' + cls;
-  div.textContent = text || '';
+  mdInto(div, text || '');
   chatCol.appendChild(div);
   return div;
 }
@@ -13777,25 +15377,71 @@ function addAssistantMsg(text) {
   avwrap.className = 'msg-avwrap';
   div.appendChild(av);
   div.appendChild(avwrap);
-  const det = document.createElement('details');
+  const det = document.createElement('div');
   det.className = 'thoughts';
-  const sum = document.createElement('summary');
-  sum.textContent = 'thinking';
-  det.appendChild(sum);
+  const sLogo = document.createElement('span');
+  sLogo.className = 'tlogo';
+  sLogo.innerHTML = CAIRN_EMBLEM_SVG;
+  const ttl = document.createElement('span');
+  ttl.className = 'tlabel';
+  ttl.textContent = 'Thinking';
+  const prev = document.createElement('span');
+  prev.className = 'tprev';
+  det.appendChild(sLogo);
+  det.appendChild(ttl);
+  det.appendChild(prev);
   const tb = document.createElement('div');
   tb.className = 'thoughts-body';
+  tb.style.display = 'none';
   det.appendChild(tb);
+  det.addEventListener('click', function(){ openThinkSheet(tb.textContent); });
   avwrap.appendChild(det);
   const body = document.createElement('div');
   body.className = 'msg-text';
-  body.textContent = text || '';
+  mdInto(body, text || '');
   avwrap.appendChild(body);
   chatCol.appendChild(div);
-  return { div: div, body: body, thoughts: tb, det: det };
+  return { div: div, body: body, thoughts: tb, det: det, prev: prev };
 }
 
+var ctxBudget = 0;
+/* PATCH43/U27: ONE painter for the top-bar context meter. Agora semantics
+   (Katy ruling): the badge counts THIS conversation's context usage
+   (compaction handoff + live rows); the system prompt is tooltip-only.
+   ⚠ fires on the real trigger: conversation + prompt vs the compaction
+   point. Shared by conv-load and turn-done so the two can never disagree. */
+var _ctxPoll28 = 0;  // PATCH44/U28: repaint loop while a manual fold is in flight
+function _paintCtx27(c) {
+  if (!c || typeof c.est_tokens !== 'number') return;
+  ctxBudget = c.context_budget || ctxBudget;
+  var _job = c.compact_job || null;
+  var _fresh = !!(_job && (Date.now() / 1000 - (_job.ts || 0) < 300));
+  if (_job && _job.state === 'running') {
+    // PATCH44/U28: the server thread keeps folding even if this tab blinks;
+    // polling the same /api/ctx re-attaches the view after any reload.
+    ctxMeter.textContent = '\u23f3 compacting\u2026';
+    ctxMeter.style.color = '#e0a030';
+    ctxMeter.title = (_job.detail || 'starting') + ' \u00b7 runs on your model + key \u00b7 the history stays intact until the handoff lands';
+    if (_ctxPoll28) clearTimeout(_ctxPoll28);
+    _ctxPoll28 = setTimeout(function () { _refreshCtx27(currentConv); }, 4000);
+    return;
+  }
+  var _req = (typeof c.request_est === 'number') ? c.request_est : c.est_tokens;
+  var _near = c.compact_at && _req >= c.compact_at;
+  var _pct = c.context_budget ? Math.round(100 * _req / c.context_budget) : 0;
+  ctxMeter.textContent = (_near ? '\u26a0 ' : '') + '~' + (c.est_tokens / 1000).toFixed(1) + 'K / ' + ((c.context_budget || 0) / 1000).toFixed(0) + 'K tokens';
+  ctxMeter.style.color = _near ? '#e0a030' : '';
+  ctxMeter.title = (c.compact_at ? ('this conversation: ~' + (c.est_tokens / 1000).toFixed(1) + 'K \u00b7 system prompt adds ~' + ((c.prompt_tokens || 0) / 1000).toFixed(0) + 'K \u00b7 compaction fires when they pass ~' + (c.compact_at / 1000).toFixed(0) + 'K (' + _pct + '% of the window now) \u00b7 ' + (c.has_summary ? 'continuity handoff exists' : 'no handoff yet')) : '')
+    + (_fresh && _job.state === 'done' ? ' \u00b7 just folded: ' + (_job.detail || 'handoff saved') : '')
+    + (_fresh && _job.state === 'failed' ? ' \u00b7 last fold did not land: ' + (_job.detail || 'unknown') + ' (history untouched)' : '');
+}
+function _refreshCtx27(id) {
+  if (!id) return;
+  fetch('api/ctx?conv=' + encodeURIComponent(id)).then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (c) { if (c && currentConv === id) _paintCtx27(c); }).catch(function () {});
+}
 async function loadMessages(id) {
-  chatCol.querySelectorAll('.msg, .toolrow, .thinking').forEach((n) => n.remove());
+  chatCol.querySelectorAll('.msg, .toolrow, .thinking, .thinkcard').forEach((n) => n.remove());
   let data = [];
   try {
     const r = await fetch('api/conversations/' + id + '/messages');
@@ -13807,31 +15453,76 @@ async function loadMessages(id) {
   if (!data.length) { showEmpty(); exportBtn.hidden = true; return; }
   hideEmpty();
   exportBtn.hidden = false;
+  // U10 (patch18): context roll-out visualization. Rows the compactor has
+  // marked are what the agent now sees only through its summary; we dim the
+  // prefix they render into. No compaction = no marking = zero change.
+  var _ctxCut = null;
   data.forEach((m) => {
     if (m.role === 'user') {
       const d = addMsgDiv('user', m.content);
       const ac = attChipsFor(m);
       if (ac) d.appendChild(ac);
-    } else if (m.role === 'assistant' && m.content) {
-      if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
-        m.tool_calls.forEach((t) => {
-          const c = addToolChip(t.name, fmtToolArgs(t.arguments), false);
+    } else if (m.role === 'assistant') {
+      // patch16: marker-carrying rows render as interleaved cards; unmarked
+      // rows keep the exact legacy order (tools first, then bubble + drawer).
+      // U20 (patch29): tool/thought-only rows (empty content) render too -
+      // imported Agora agent turns are mostly this shape.
+      const sessArr = m.reasoning ? String(m.reasoning).split(TSEP16) : [];
+      const tlArr = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+      if (!m.content && !tlArr.length && !sessArr.length) return;
+      if (sessArr.length > 1) {
+        for (let sk = 0; sk < sessArr.length; sk++) {
+          if (sessArr[sk].trim()) { const tcx = mkThinkCard(); tcx.add(sessArr[sk]); }
+          tlArr.forEach((t) => {
+            if ((typeof t.s === 'number' ? t.s : 0) === sk) {
+              const c = addToolChip(t.name, fmtToolArgs(t.arguments), false, t.arguments);
+              c.addResult(String(t.result || ''), false);
+            }
+          });
+        }
+        tlArr.forEach((t) => {
+          if ((typeof t.s === 'number' ? t.s : 0) >= sessArr.length) {
+            const c = addToolChip(t.name, fmtToolArgs(t.arguments), false, t.arguments);
+            c.addResult(String(t.result || ''), false);
+          }
+        });
+      } else if (tlArr.length) {
+        tlArr.forEach((t) => {
+          const c = addToolChip(t.name, fmtToolArgs(t.arguments), false, t.arguments);
           c.addResult(String(t.result || ''), false);
         });
       }
-      const b = addAssistantMsg(m.content);
-      const acA = attChipsFor(m);
-      if (acA) b.body.parentElement.insertBefore(acA, b.body); /* B-13: chips belong INSIDE the text column; as a bubble child they joined the flex row and stole ~210px of text width (K80 2026-09-26) */
-      if (m.stopped) {
-        const sm = document.createElement('span');
-        sm.className = 'stoppedmark';
-        sm.textContent = '⏹ stopped - incomplete';
-        b.body.appendChild(sm);
+      if (m.content) {
+        const b = addAssistantMsg(m.content);
+        const acA = attChipsFor(m);
+        if (acA) b.body.parentElement.insertBefore(acA, b.body); /* B-13: chips belong INSIDE the text column; as a bubble child they joined the flex row and stole ~210px of text width (K80 2026-09-26) */
+        if (m.stopped) {
+          const sm = document.createElement('span');
+          sm.className = 'stoppedmark';
+          sm.textContent = '⏹ stopped - incomplete';
+          b.body.appendChild(sm);
+        }
+        if (m.reasoning && sessArr.length <= 1) { b.thoughts.textContent = m.reasoning; b.prev.textContent = String(m.reasoning).slice(0, 140); }
+        else b.det.remove();
+      } else if (sessArr.length === 1 && String(m.reasoning).trim()) {
+        const tcx2 = mkThinkCard(); tcx2.add(sessArr[0]);
       }
-      if (m.reasoning) b.thoughts.textContent = m.reasoning;
-      else b.det.remove();
     }
+    if (m.compacted_at) _ctxCut = chatCol.lastElementChild;  // U10 cut mark
   });
+  /* PATCH41/U25 + PATCH43/U27: never local math. The daemon answers
+     /api/ctx (what the next request carries + when compaction fires);
+     Agora semantics live in _paintCtx27. A fetch failure leaves the pill
+     alone rather than lying. */
+  _refreshCtx27(id);
+  if (_ctxCut) {
+    var _cn = chatCol.firstElementChild;
+    while (_cn) {
+      if (_cn.classList && (_cn.classList.contains('msg') || _cn.classList.contains('toolrow') || _cn.classList.contains('thinkcard') || _cn.classList.contains('thinking'))) _cn.classList.add('ctxout');
+      if (_cn === _ctxCut) break;
+      _cn = _cn.nextElementSibling;
+    }
+  }
   scrollBottom(true);
   attachStream(id);
 }
@@ -13841,6 +15532,7 @@ async function switchConv(id) {
   clearPending();
   currentConv = id;
   f21Label();
+  pillRefresh();
   await loadMessages(id);
   loadConversations();
 }
@@ -13850,7 +15542,9 @@ function newChat() {
   clearPending();
   currentConv = null;
   f21Label();
-  chatCol.querySelectorAll('.msg, .toolrow, .thinking').forEach((n) => n.remove());
+  pillRefresh();
+  ctxMeter.textContent = ''; ctxMeter.title = ''; ctxMeter.style.color = '';  // PATCH41/U25: a new chat has no context yet
+  chatCol.querySelectorAll('.msg, .toolrow, .thinking, .thinkcard').forEach((n) => n.remove());
   showEmpty();
   exportBtn.hidden = true;
   loadConversations();
@@ -13862,6 +15556,14 @@ let userScrolling = false;
 let scrollIdleTimer = null;
 let programmaticScroll = false;
 const jumpBtn = $('jumpBottom'), ctxMeter = $('ctxMeter');
+const convTitles = new Map();
+function pillRefresh() {
+  const pill = $('convPill');
+  if (!pill) return;
+  if (!currentConv) { pill.classList.remove('show'); return; }
+  $('convPillTitle').textContent = convTitles.get(currentConv) || 'New chat';
+  pill.classList.add('show');
+}
 function updateJumpBtn() {
   const dist = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight;
   jumpBtn.hidden = dist < 300;
@@ -13888,8 +15590,8 @@ function addThinking() {
   const el = document.createElement('div');
   el.className = 'thinking';
   const dots = document.createElement('span');
-  dots.className = 'dots';
-  dots.innerHTML = '<i></i><i></i><i></i>';
+  dots.className = 'tlogo';
+  dots.innerHTML = CAIRN_EMBLEM_SVG;
   const lab = document.createElement('span');
   lab.className = 'tlabel';
   lab.textContent = 'waking up…';
@@ -13916,54 +15618,238 @@ function fmtToolArgs(a) {
   } catch (e) { return a; }
 }
 
-function addToolChip(name, args, open) {
+function attachSwipe(el, canStart, onEnd){
+  var sy=0, dy=0, t0=0, active=false;
+  el.addEventListener('touchstart', function(e){
+    if (e.touches.length!==1 || !canStart()){ active=false; return; }
+    active=true; sy=e.touches[0].clientY; dy=0; t0=Date.now(); el.style.transition='';
+  }, {passive:true});
+  el.addEventListener('touchmove', function(e){
+    if (!active) return;
+    dy=e.touches[0].clientY-sy;
+    if (dy>0) el.style.transform='translateY('+dy+'px)';
+  }, {passive:true});
+  el.addEventListener('touchend', function(){
+    if (!active) return; active=false;
+    var dt=Date.now()-t0, v=dt>0?dy/dt:0;
+    el.style.transition='transform .2s ease'; el.style.transform='';
+    onEnd(dy, v);
+  });
+}
+function closeSheet(){
+  var bg = document.getElementById('tsheetBg');
+  openSheetSd = null;
+  if (!bg || !bg.classList.contains('on')) return;
+  if (window.matchMedia && window.matchMedia('(min-width:720px)').matches) { bg.classList.remove('on'); bg.classList.remove('closing'); return; }
+  bg.classList.add('closing');
+  setTimeout(function(){ bg.classList.remove('on'); bg.classList.remove('closing'); }, 210);
+}
+function liveOff(){ document.querySelectorAll('.thinkcard.live').forEach(function(n){ n.classList.remove('live'); }); }
+function openThinkSheet(txt){
+  var bg = document.getElementById('tsheetBg');
+  if (!bg) {
+    bg = document.createElement('div');
+    bg.id = 'tsheetBg';
+    bg.className = 'tsheet-bg';
+    var sh = document.createElement('div'); sh.className = 'tsheet';
+    var gr = document.createElement('span'); gr.className = 'grip';
+    var bd0 = document.createElement('div'); bd0.className = 'tsheet-body'; bd0.id = 'tsheetBody';
+    sh.appendChild(gr); sh.appendChild(bd0); bg.appendChild(sh);
+    document.body.appendChild(bg);
+    bg.addEventListener('click', function(e){ if (e.target === bg) closeSheet(); });
+    attachSwipe(sh, function(){ return sh.scrollTop<=0; }, function(dy,v){ if (dy>90 || (dy>40 && v>0.4)) closeSheet(); });
+    document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeSheet(); });
+  }
+  var b = document.getElementById('tsheetBody');
+  b.textContent = '';
+  b.appendChild(toolSheetEl('tsheet-title', 'Thinking'));
+  var t = String(txt || '');
+  b.appendChild(toolSheetEl('tprose', t.length > 12000 ? t.substring(0, 12000) + '…' : t));
+  bg.classList.add('on');
+}
+function toolSheetEl(cls, txt){ var el = document.createElement('div'); el.className = cls; if (txt !== undefined) el.textContent = txt; return el; }
+function sheetBg(){
+  var bg = document.getElementById('tsheetBg');
+  if (!bg) {
+    bg = document.createElement('div');
+    bg.id = 'tsheetBg';
+    bg.className = 'tsheet-bg';
+    var sh = document.createElement('div'); sh.className = 'tsheet';
+    var gr = document.createElement('span'); gr.className = 'grip';
+    var bd0 = document.createElement('div'); bd0.className = 'tsheet-body'; bd0.id = 'tsheetBody';
+    sh.appendChild(gr); sh.appendChild(bd0); bg.appendChild(sh);
+    document.body.appendChild(bg);
+    bg.addEventListener('click', function(e){ if (e.target === bg) closeSheet(); });
+    attachSwipe(sh, function(){ return sh.scrollTop<=0; }, function(dy,v){ if (dy>90 || (dy>40 && v>0.4)) closeSheet(); });
+    document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeSheet(); });
+  }
+  return bg;
+}
+var openSheetSd = null;
+var openSheetRender = null;
+var argChips = {};
+function sweepArgChips(){
+  Object.keys(argChips).forEach(function(k){ var c = argChips[k]; if (c && c.discard) c.discard(); });
+  argChips = {};
+}
+function openToolSheet(name, kind, rawArgs, sd){
+  openSheetSd = sd;
+  openSheetRender = function(){ renderToolSheet(name, kind, sd.rawArgs, sd); };
+  renderToolSheet(name, kind, sd.rawArgs, sd);
+}
+function refreshToolSheet(){
+  if (openSheetSd && openSheetRender) openSheetRender();
+}
+function renderToolSheet(name, kind, rawArgs, sd){
+  var bg = sheetBg();
+  var b = document.getElementById('tsheetBody');
+  b.textContent = '';
+  b.appendChild(toolSheetEl('tsheet-title', (TOOL_GLYPH[kind] || '\u2699') + '  ' + toolLabel(name)));
+  var parsed = null;
+  try { var pj = JSON.parse(String(rawArgs)); if (pj && typeof pj === 'object') parsed = pj; } catch (e) { parsed = null; }
+  if (rawArgs) {
+    b.appendChild(toolSheetEl('tslab', 'Arguments:'));
+    if (parsed) {
+      Object.keys(parsed).forEach(function(k){
+        b.appendChild(toolSheetEl('tchip', k));
+        var v = parsed[k];
+        b.appendChild(toolSheetEl('tval', typeof v === 'string' ? v : JSON.stringify(v)));
+      });
+    } else {
+      b.appendChild(toolSheetEl('tchip', 'input'));
+      b.appendChild(toolSheetEl('tval', String(rawArgs)));
+    }
+  }
+  b.appendChild(toolSheetEl('tslab', 'Result:'));
+  var row = document.createElement('div');
+  row.className = 'tstatrow';
+  row.appendChild(toolSheetEl('tchip tstat-chip', toolVerb(sd)));
+  if (parsed && typeof parsed.server === 'string') row.appendChild(toolSheetEl('tchip', parsed.server));
+  b.appendChild(row);
+  if (!sd.running) {
+    var t = String(sd.res || '');
+    b.appendChild(toolSheetEl('tout', t.length > 8000 ? t.substring(0, 8000) + '\u2026' : (t || '-')));
+  }
+  bg.classList.add('on');
+}
+function toolLabel(n) {
+  const k = String(n || 'tool');
+  const map = { execute_shell: 'Shell', ssh_run: 'SSH', run_with_secret: 'Secret run',
+    read_file: 'Read', write_file: 'Write', edit_file: 'Edit', grep_files: 'Search', glob_files: 'Glob', send_file: 'Send file',
+    web_search: 'Search the web', web_fetch: 'Fetch page', memory: 'Memory', recall: 'Recall', vault_list: 'Vault',
+    generate_image: 'Generate image', generate_speech: 'Speak', ocr_image: 'OCR', transcribe_audio: 'Transcribe',
+    gmail_search: 'Gmail search', gmail_read: 'Gmail read', google_connect: 'Google', calendar_today: 'Calendar', drive_list: 'Drive',
+    outlook_search: 'Outlook search', outlook_read: 'Outlook read', ms_connect: 'Microsoft', ms_calendar_today: 'Outlook calendar', onedrive_list: 'OneDrive',
+    github_connect: 'GitHub', github_repos: 'GitHub repos', github_runs: 'GitHub runs', github_notifications: 'GitHub notifications',
+    ha_connect: 'Home Assistant', ha_state: 'HA state', ha_states: 'HA states',
+    opnsense_connect: 'OPNsense', opnsense_status: 'OPNsense status', opnsense_services: 'OPNsense services',
+    nextcloud_list: 'Cloud files', nextcloud_read: 'Cloud read' };
+  return map[k] || k.replace(/_/g, ' ');
+}
+const TOOL_FILE = ['read_file', 'write_file', 'edit_file', 'grep_files', 'glob_files', 'send_file'];
+const TOOL_CONN = ['google_connect', 'ms_connect', 'github_connect', 'ha_connect', 'opnsense_connect'];
+const TOOL_CONN_PREFIX = ['gmail_', 'google_', 'calendar_', 'drive_', 'outlook_', 'ms_', 'onedrive_', 'github_', 'ha_', 'opnsense_', 'nextcloud_'];
+const TOOL_GLYPH = { shell: '⚙', file: '📄', connector: '🔌', memory: '🧠', vault: '🔒', tool: '🧰' };
+const CAIRN_EMBLEM_SVG = '<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="5"><g opacity="0.95"><ellipse cx="50" cy="50" rx="36" ry="13"/><ellipse cx="50" cy="50" rx="36" ry="13" transform="rotate(72 50 50)"/><ellipse cx="50" cy="50" rx="36" ry="13" transform="rotate(144 50 50)"/><ellipse cx="50" cy="50" rx="36" ry="13" transform="rotate(216 50 50)"/><ellipse cx="50" cy="50" rx="36" ry="13" transform="rotate(288 50 50)"/><circle cx="50" cy="50" r="11"/><circle cx="50" cy="50" r="4" fill="currentColor" stroke="none"/></g></svg>';
+function toolKind(n) {
+  const k = String(n || '');
+  if (k === 'execute_shell' || k === 'ssh_run' || k === 'run_with_secret') return 'shell';
+  if (k === 'memory' || k === 'recall') return 'memory';
+  if (k === 'vault_list') return 'vault'; // K80 2026-10-04: the vault is a lock, not a brain
+  if (TOOL_FILE.indexOf(k) !== -1) return 'file';
+  if (TOOL_CONN.indexOf(k) !== -1) return 'connector';
+  for (let i = 0; i < TOOL_CONN_PREFIX.length; i++) { if (k.indexOf(TOOL_CONN_PREFIX[i]) === 0) return 'connector'; }
+  return 'tool';
+}
+function toolVerb(sd){
+  if (!sd || sd.running) return 'Executing\u2026';
+  return toolStat(sd.res);
+}
+
+function toolStat(r) {
+  if (!r) return 'no output';
+  const s = String(r).trim();
+  if (/^(error|traceback)/i.test(s)) return 'failed';
+  if (/denied|not allowed|refus/i.test(s.slice(0, 120))) return 'denied';
+  return 'Returned ' + (s.length >= 1024 ? (s.length / 1024).toFixed(1) + ' KB' : s.length + ' chars');
+}
+// patch16: thinking timeline cards. TSEP16 mirrors the server _rsep exactly
+// (two newlines, three SEPARATION DOT chars, two newlines - no backslash
+// escapes so this survives every transport layer untouched).
+var TSEP16 = String.fromCharCode(10, 10) + String.fromCharCode(8280, 8280, 8280) + String.fromCharCode(10, 10);
+var thinkCur = null;
+var thinkAfter = false;
+function mkThinkCard() {
+  const wrap = document.createElement('div');
+  wrap.className = 'thinkcard';
+  const lg = document.createElement('span');
+  lg.className = 'tlogo';
+  lg.innerHTML = CAIRN_EMBLEM_SVG;
+  const ttl = document.createElement('span');
+  ttl.className = 'tcname';
+  ttl.textContent = 'Thinking';
+  const prev = document.createElement('span');
+  prev.className = 'tcpv';
+  wrap.appendChild(lg);
+  wrap.appendChild(ttl);
+  wrap.appendChild(prev);
+  const parts = [];
+  const c = { div: wrap, add: function (t) { parts.push(String(t)); var s = parts.join(''); prev.textContent = s.length > 160 ? String.fromCharCode(8230) + s.slice(-160) : s; } };
+  wrap.addEventListener('click', function () { openThinkSheet(parts.join('')); });
+  chatCol.appendChild(wrap);
+  return c;
+}
+function addToolChip(name, args, open, raw) {
+  var rawArgs = (raw === undefined || raw === null) ? String(args) : String(raw);
+  var sheetData = { res: null, running: true, rawArgs: rawArgs };
   const wrap = document.createElement('div');
   wrap.className = 'toolrow';
   const chip = document.createElement('div');
   chip.className = 'toolchip running';
   const g = document.createElement('span');
   g.className = 'tg';
-  g.textContent = '⚙';
+  const kind = toolKind(name);
+  if (kind !== 'shell') chip.classList.add(kind);
+  g.textContent = TOOL_GLYPH[kind] || '⚙';
   const n = document.createElement('span');
-  n.className = 'tname';
-  n.textContent = name || 'tool';
+  n.className = 'tname tlabel';
+  n.textContent = toolLabel(name);
   chip.appendChild(g);
   chip.appendChild(n);
+  const st = document.createElement('span');
+  st.className = 'tstat run';
+  st.textContent = toolVerb(sheetData);
+  chip.appendChild(st);
   wrap.appendChild(chip);
-  if (args) {
-    const d2 = document.createElement('details');
-    d2.className = 'tooldet';
-    d2.open = (open !== false);
-    const s2 = document.createElement('summary');
-    s2.textContent = 'command';
-    const p2 = document.createElement('pre');
-    p2.className = 'toolres';
-    p2.textContent = args.length > 1000 ? args.substring(0, 1000) + '…' : args;
-    d2.appendChild(s2);
-    d2.appendChild(p2);
-    wrap.appendChild(d2);
-  }
+  chip.addEventListener('click', function(){ openToolSheet(name, kind, rawArgs, sheetData); });
   chatCol.appendChild(wrap);
   const c = { name: name, running: open !== false, chip: chip, wrap: wrap, addResult: (res, resOpen) => {
     c.running = false;
+    sheetData.running = false;
     c.chip.classList.remove('running');
-    const det = document.createElement('details');
-    det.className = 'tooldet';
-    det.open = (resOpen !== false);
-    const sum = document.createElement('summary');
-    sum.textContent = 'result (' + res.length + ' chars)';
-    const pre = document.createElement('pre');
-    pre.className = 'toolres';
-    pre.textContent = res.length > 8000 ? res.substring(0, 8000) + '…' : res;
-    det.appendChild(sum);
-    det.appendChild(pre);
-    wrap.appendChild(det);
+    st.className = 'tstat';
+    st.textContent = toolStat(res);
+    refreshToolSheet();
+    sheetData.res = res;
   }};
+  c.setArgs = function(s){
+    sheetData.rawArgs = String(s);
+    if (openSheetSd === sheetData) refreshToolSheet();
+  };
+  c.discard = function(){
+    if (!c.running) return;
+    c.running = false;
+    sheetData.running = false;
+    c.chip.classList.remove('running');
+    st.className = 'tstat';
+    st.textContent = 'not executed';
+    if (openSheetSd === sheetData) refreshToolSheet();
+  };
   return c;
 }
 
 /* ── attachments (P3.2) ── */
-const attachBtn = $('attachBtn'), camBtn = $('camBtn'), filePick = $('filePick'), camPick = $('camPick');
+const attachBtn = $('attachBtn'), filePick = $('filePick'), camPick = $('camPick');
 const attachChips = $('attachChips');
 let pendingAtts = [];
 
@@ -13998,15 +15884,24 @@ function fileToB64(file) {
   });
 }
 
+function vidCountFiles() { var n = 0; pendingAtts.forEach(function (p) { if (p.src !== 'video-frame') n++; }); return n; }
 function addPendingFiles(fileList, src) {
   for (const f of fileList) {
-    if (pendingAtts.length >= 8) { flashNote('Max 8 attachments per message — extra files skipped.'); break; }
+    var isFrame = (src === 'video-frame');
+    var isRawVid = (src === 'video-raw');
+    if (!isFrame && !isRawVid && (f.type || '').startsWith('video/')) { vidIngest(f); continue; }
+    if (isFrame) {
+      if (pendingAtts.length >= 64) { flashNote('Frame budget (64/message) reached — extra frames skipped.'); break; }
+    } else {
+      if (vidCountFiles() >= 8) { flashNote('Max 8 attachments per message — extra files skipped.'); break; }
+      if (pendingAtts.length >= 64) { flashNote('Message attachment budget (64) reached — extra files skipped.'); break; }
+    }
     if (f.size > 15 * 1024 * 1024) { flashNote(f.name + ' is over the 15 MB cap — skipped.'); continue; }
     pendingAtts.push({
       file: f,
       id: null,
-      src: src || 'file',
-      thumb: (f.type || '').startsWith('image/') ? URL.createObjectURL(f) : null,
+      src: isRawVid ? 'file' : (src || 'file'),
+      thumb: (isFrame || (f.type || '').startsWith('image/')) ? URL.createObjectURL(f) : null,
     });
   }
   renderAttachChips();
@@ -14047,11 +15942,428 @@ function clearPending() {
   pendingAtts = [];
   renderAttachChips();
 }
+/* ── patch33 (K80 W1 2026-10-06): video frame ingest ──────────────────────
+   Picking a video opens a sampling sheet (Duration auto / By-Count /
+   By-Interval fps; fps>1 allowed; cap default 24, max 64); frames are
+   extracted CLIENT-SIDE with <video>+canvas, downscaled to <=768px JPEG,
+   and ride to the model as ordinary image attachments over the EXISTING
+   api/upload path (server classifies image/jpeg -> image_url parts; no
+   server pipeline change). Raw video uploads only via "attach raw file".
+   Token estimate = labeled heuristic (85 + 170 per 512px tile). */
+var VID_MAX_DIM = 768, VID_JQ = 0.72, VID_CAP_DEF = 24, VID_CAP_MAX = 64;
+var vidState = null;
+function vidClamp(n, a, b) { n = Math.round(n); if (isNaN(n)) return a; return Math.max(a, Math.min(b, n)); }
+function vidDims(w, h) {
+  var s = Math.min(1, VID_MAX_DIM / Math.max(w || 1, h || 1));
+  return [Math.max(1, Math.round((w || 640) * s)), Math.max(1, Math.round((h || 360) * s))];
+}
+function vidEstTokens(w, h, frames) {
+  var tiles = Math.max(1, Math.ceil(w / 512)) * Math.max(1, Math.ceil(h / 512));
+  return frames * (85 + 170 * tiles);
+}
+function vidSeek(v, t) {
+  return new Promise(function (resolve) {
+    var done = false;
+    var to = setTimeout(function () { if (!done) { done = true; v.onseeked = null; resolve(); } }, 3000);
+    v.onseeked = function () { if (done) return; done = true; clearTimeout(to); v.onseeked = null; resolve(); };
+    try { v.currentTime = Math.max(0, Math.min(t, Math.max(0, (v.duration || 0) - 0.02))); }
+    catch (e) { if (!done) { done = true; clearTimeout(to); v.onseeked = null; } }
+  });
+}
+function vidCleanup(st) {
+  if (!st || !st.video) return;
+  try { st.video.pause(); st.video.removeAttribute('src'); st.video.load(); } catch (e) {}
+  try { URL.revokeObjectURL(st.url); } catch (e) {}
+  st.video = null;
+}
+function vidIngest(file) {
+  if (vidState) vidCleanup(vidState);
+  var url = URL.createObjectURL(file);
+  var v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto';
+  var st = { file: file, url: url, video: v, dur: 0, w: 0, h: 0, busy: false, ready: false, mode: 'auto' };
+  vidState = st;
+  var bg = sheetBg();
+  var body = document.getElementById('tsheetBody');
+  body.textContent = '';
+  body.appendChild(toolSheetEl('tsheet-title', 'Video frames'));
+  var info = toolSheetEl('vest', '');
+  info.textContent = file.name + ' — ' + fmtSize(file.size);
+  body.appendChild(info);
+  var status = toolSheetEl('vprog', 'reading video…');
+  body.appendChild(status);
+  var rowMode = document.createElement('div'); rowMode.className = 'vrow';
+  [['auto', 'Duration (auto ≈1 fps)'], ['count', 'By count'], ['fps', 'By interval (fps)']].forEach(function (m) {
+    var lb = document.createElement('label'); lb.className = 'vrowlabel';
+    var r = document.createElement('input'); r.type = 'radio'; r.name = 'vidMode'; r.value = m[0];
+    if (m[0] === 'auto') r.checked = true;
+    r.addEventListener('change', function () { st.mode = m[0]; nWrap.hidden = m[0] !== 'count'; fWrap.hidden = m[0] !== 'fps'; update(); });
+    lb.appendChild(r); lb.appendChild(document.createTextNode(' ' + m[1]));
+    rowMode.appendChild(lb);
+  });
+  body.appendChild(rowMode);
+  var rowP = document.createElement('div'); rowP.className = 'vrow';
+  var nEl = document.createElement('input'); nEl.type = 'number'; nEl.min = '1'; nEl.max = String(VID_CAP_MAX); nEl.value = '12'; nEl.style.width = '72px';
+  var fEl = document.createElement('input'); fEl.type = 'number'; fEl.min = '0.25'; fEl.max = '8'; fEl.step = '0.25'; fEl.value = '1'; fEl.style.width = '72px';
+  var cEl = document.createElement('input'); cEl.type = 'number'; cEl.min = '1'; cEl.max = String(VID_CAP_MAX); cEl.value = String(VID_CAP_DEF); cEl.style.width = '72px';
+  var nWrap = document.createElement('label'); nWrap.className = 'vrowlabel'; nWrap.appendChild(document.createTextNode('frames ')); nWrap.appendChild(nEl); nWrap.hidden = true;
+  var fWrap = document.createElement('label'); fWrap.className = 'vrowlabel'; fWrap.appendChild(document.createTextNode('fps ')); fWrap.appendChild(fEl); fWrap.hidden = true;
+  var cWrap = document.createElement('label'); cWrap.className = 'vrowlabel'; cWrap.appendChild(document.createTextNode('cap ')); cWrap.appendChild(cEl);
+  rowP.appendChild(nWrap); rowP.appendChild(fWrap); rowP.appendChild(cWrap);
+  body.appendChild(rowP);
+  var estEl = toolSheetEl('vest', '');
+  body.appendChild(estEl);
+  var btns = document.createElement('div'); btns.className = 'vbtns';
+  var goBtn = document.createElement('button'); goBtn.className = 'btn'; goBtn.id = 'vidGo'; goBtn.textContent = 'Extract frames';
+  var rawBtn = document.createElement('button'); rawBtn.className = 'btn'; rawBtn.textContent = 'Attach raw file';
+  var noBtn = document.createElement('button'); noBtn.className = 'btn'; noBtn.textContent = 'Cancel';
+  btns.appendChild(goBtn); btns.appendChild(rawBtn); btns.appendChild(noBtn);
+  body.appendChild(btns);
+  function plan() {
+    var cap = vidClamp(parseInt(cEl.value, 10), 1, VID_CAP_MAX);
+    var fps = parseFloat(fEl.value) || 1; if (fps < 0.25) fps = 0.25; if (fps > 8) fps = 8;
+    var n;
+    if (st.mode === 'count') n = vidClamp(parseInt(nEl.value, 10), 1, cap);
+    else if (st.mode === 'fps') n = Math.max(1, Math.min(cap, Math.floor(st.dur * fps + 1e-6)));
+    else n = Math.max(1, Math.min(cap, Math.ceil(st.dur || 1)));
+    return { n: n, fps: fps, cap: cap };
+  }
+  function update() {
+    var p = plan();
+    var d = vidDims(st.w || 640, st.h || 360);
+    var fpsEff = st.dur > 0 ? p.n / st.dur : 0;
+    estEl.textContent = '\u2248 ' + p.n + ' frames' + (st.dur > 0 ? ' (~' + fpsEff.toFixed(2) + ' fps)' : '') +
+      ' \u00b7 ' + d[0] + '\u00d7' + d[1] + ' JPEG \u00b7 \u2248 ' + vidEstTokens(d[0], d[1], p.n) + ' tok (heuristic)';
+  }
+  rawBtn.addEventListener('click', function () {
+    vidCleanup(st); if (vidState === st) vidState = null;
+    closeSheet();
+    addPendingFiles([file], 'video-raw');
+  });
+  noBtn.addEventListener('click', function () {
+    vidCleanup(st); if (vidState === st) vidState = null;
+    closeSheet();
+  });
+  goBtn.addEventListener('click', function () {
+    if (st.busy) return;
+    if (!st.ready || !(st.dur > 0) || !v.videoWidth) { status.textContent = 'cannot decode this video here — use "attach raw file".'; return; }
+    st.busy = true; goBtn.disabled = true;
+    var p = plan();
+    var d = vidDims(v.videoWidth, v.videoHeight);
+    var cv = document.createElement('canvas'); cv.width = d[0]; cv.height = d[1];
+    var cx = cv.getContext('2d');
+    var base = String(file.name || 'video').replace(/\\.[^.]*$/, '').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60) || 'video';
+    var frames = [];
+    (async function () {
+      try {
+        for (var i = 0; i < p.n; i++) {
+          if (vidState !== st) return;
+          var t = (st.mode === 'fps') ? Math.min(i / p.fps, Math.max(0, st.dur - 0.02))
+                                      : (i + 0.5) * st.dur / p.n;
+          await vidSeek(v, t);
+          cx.drawImage(v, 0, 0, cv.width, cv.height);
+          var blob = await new Promise(function (res) { try { cv.toBlob(res, 'image/jpeg', VID_JQ); } catch (e) { res(null); } });
+          if (blob) frames.push(new File([blob], base + '-f' + String(i + 1) + '.jpg', { type: 'image/jpeg' }));
+          status.textContent = 'extracting ' + (i + 1) + '/' + p.n + '\u2026';
+        }
+        if (vidState !== st) return;
+        if (!frames.length) { status.textContent = 'no frames extracted — use "attach raw file".'; return; }
+        var est = vidEstTokens(cv.width, cv.height, frames.length);
+        vidCleanup(st); if (vidState === st) vidState = null;
+        addPendingFiles(frames, 'video-frame');
+        flashNote('🎞️ ' + file.name + ' \u2192 ' + frames.length + ' frames \u2248 ' + est + ' tok (heuristic) \u2014 send to attach.');
+        closeSheet();
+      } catch (e) {
+        status.textContent = 'extraction failed: ' + ((e && e.message) || e);
+      } finally { st.busy = false; goBtn.disabled = false; }
+    })();
+  });
+  v.onerror = function () { if (vidState !== st) return; status.textContent = 'could not decode this video here — "attach raw file" will upload it as a plain file.'; };
+  v.onloadedmetadata = function () {
+    if (vidState !== st) return;
+    if (!isFinite(v.duration) || !(v.duration > 0)) {
+      try { v.currentTime = 1e101; } catch (e) {}
+      setTimeout(function () {
+        if (vidState !== st) return;
+        st.dur = isFinite(v.duration) ? v.duration : 0;
+        st.w = v.videoWidth; st.h = v.videoHeight; st.ready = true;
+        if (!(st.dur > 0)) { status.textContent = 'duration unreadable — use "attach raw file".'; }
+        else { status.textContent = st.dur.toFixed(1) + 's \u00b7 ' + st.w + '\u00d7' + st.h; }
+        update();
+      }, 1500);
+      return;
+    }
+    st.dur = v.duration; st.w = v.videoWidth; st.h = v.videoHeight; st.ready = true;
+    status.textContent = st.dur.toFixed(1) + 's \u00b7 ' + st.w + '\u00d7' + st.h;
+    update();
+  };
+  v.src = url;
+  bg.classList.add('on');
+}
 
-attachBtn.addEventListener('click', () => { if (!streaming) filePick.click(); });
-camBtn.addEventListener('click', () => { if (!streaming) camPick.click(); });
+attachBtn.addEventListener('click', function (e) { e.stopPropagation(); if (!streaming) toggleCpop(mediaPop); });
 filePick.addEventListener('change', () => { addPendingFiles(filePick.files, 'file'); filePick.value = ''; });
 camPick.addEventListener('change', () => { addPendingFiles(camPick.files, 'camera'); camPick.value = ''; });
+// iter5 (K80 2026-10-04): Agora-style composer popovers. The + button opens
+// a media menu (camera/photos/videos/files); the model chip opens the full
+// saved-models list. Pure UI over the existing api/upload + api/conv/model
+// paths - no new endpoints, no new powers.
+const mediaPop = $('mediaPop'), modelPop = $('modelPop');
+function closeCpops() { mediaPop.hidden = true; modelPop.hidden = true; qsPop.hidden = true; }
+function toggleCpop(el) { const was = !el.hidden; closeCpops(); exportPop.hidden = true; if (!was) { el.hidden = false; if (el === modelPop) cpRenderModels(); } }
+function pickMedia(kind) {
+  closeCpops();
+  if (kind === 'camera') { camPick.click(); return; }
+  if (kind === 'photos') { filePick.accept = 'image/*'; }
+  else if (kind === 'videos') { filePick.accept = 'video/*'; }
+  else { filePick.accept = ''; }
+  filePick.click();
+}
+$('mpCam').addEventListener('click', function () { pickMedia('camera'); });
+$('mpPhotos').addEventListener('click', function () { pickMedia('photos'); });
+$('mpVideos').addEventListener('click', function () { pickMedia('videos'); });
+$('mpFiles').addEventListener('click', function () { pickMedia('files'); });
+/* ── patch34 (K80 W2 2026-10-06): CAIRN Files ────────────────────────────
+   "Chat files" opens a per-chat file drawer rooted in THIS chat's upload
+   space. Bytes upload through the EXISTING api/upload lane (with a logical
+   folder label); mkdir/rmdir/delete ride api/cairnfiles. Tapping a file
+   adds a LINK CHIP: the bytes are already server-side, so send reuses the
+   attachment id instead of re-uploading. Folder is a DB label, never a
+   disk path — uploads stay flat per conv. ─────────────────────────────── */
+var cfConv = null, cfDir = '', cfData = { files: [], folders: [] };
+var cfPick = document.createElement('input');
+cfPick.type = 'file'; cfPick.multiple = true; cfPick.hidden = true; cfPick.id = 'cfPick';
+document.body.appendChild(cfPick);
+function cfPost(body) {
+  return fetch('api/cairnfiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); });
+}
+function cfOpen() {
+  closeCpops();
+  if (!currentConv) { flashNote('send a message first — each chat gets its own file space'); return; }
+  cfConv = currentConv; cfDir = ''; cfLoad();
+}
+function cfLoad() {
+  sheetBg().classList.add('on');
+  cfPaint('loading…');
+  cfPost({ conversation_id: cfConv, op: 'list' }).then(function (x) {
+    if (!x.ok) { cfData = { files: [], folders: [] }; cfPaint((x.j && x.j.error) || 'could not load files'); return; }
+    cfData = { files: x.j.files || [], folders: x.j.folders || [] };
+    cfPaint(null);
+  }).catch(function () { cfPaint('could not load files'); });
+}
+function cfPaint(msg) {
+  var b = document.getElementById('tsheetBody');
+  if (!b) return;
+  b.textContent = '';
+  b.appendChild(toolSheetEl('tsheet-title', 'Chat files'));
+  var cr = document.createElement('div'); cr.className = 'cfCrumb';
+  function crumb(txt, dir) {
+    var bt = document.createElement('button'); bt.textContent = txt;
+    bt.addEventListener('click', function () { cfDir = dir; cfLoad(); });
+    cr.appendChild(bt);
+  }
+  crumb('chat root', '');
+  var acc = '';
+  cfDir.split('/').filter(Boolean).forEach(function (seg) {
+    acc = acc ? acc + '/' + seg : seg;
+    cr.appendChild(toolSheetEl('cfSep', '/')); crumb(seg, acc);
+  });
+  b.appendChild(cr);
+  var bar = document.createElement('div'); bar.className = 'cfBar';
+  var up = document.createElement('button'); up.className = 'btn'; up.textContent = '⬆ upload';
+  up.addEventListener('click', function () { cfPick.click(); });
+  var mk = document.createElement('button'); mk.className = 'btn'; mk.textContent = '+ folder';
+  var mi = document.createElement('input'); mi.placeholder = 'folder name'; mi.style.display = 'none'; mi.autocomplete = 'off';
+  var ms = document.createElement('button'); ms.className = 'btn'; ms.textContent = 'create'; ms.style.display = 'none';
+  function mkGo() {
+    var nm = (mi.value || '').trim(); if (!nm) return;
+    cfPost({ conversation_id: cfConv, op: 'mkdir', folder: (cfDir ? cfDir + '/' : '') + nm }).then(function (x) {
+      if (!x.ok) { flashNote('mkdir: ' + ((x.j && x.j.error) || 'failed')); return; }
+      cfLoad();
+    });
+  }
+  mk.addEventListener('click', function () {
+    var show = mi.style.display === 'none';
+    mi.style.display = show ? '' : 'none'; ms.style.display = show ? '' : 'none';
+    if (show) { try { mi.focus(); } catch (e) {} }
+  });
+  mi.addEventListener('keydown', function (e) { if (e.key === 'Enter') mkGo(); });
+  ms.addEventListener('click', mkGo);
+  bar.appendChild(up); bar.appendChild(mk); bar.appendChild(mi); bar.appendChild(ms);
+  b.appendChild(bar);
+  if (msg) { b.appendChild(toolSheetEl('cfEmpty', msg)); return; }
+  var pre = cfDir ? cfDir + '/' : '';
+  var subs = {}, nfile = 0;
+  (cfData.folders || []).forEach(function (f) {
+    if (String(f).slice(0, pre.length) !== pre) return;
+    var rest = String(f).slice(pre.length);
+    if (!rest || rest.indexOf('/') >= 0) return;
+    subs[rest] = 1;
+  });
+  Object.keys(subs).sort().forEach(function (nm) {
+    var r = document.createElement('div'); r.className = 'cfRow';
+    r.appendChild(toolSheetEl('cfIco', '📁'));
+    r.appendChild(toolSheetEl('cfNm', nm));
+    var d = document.createElement('button'); d.className = 'cfDel'; d.textContent = '🗑';
+    d.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (!window.confirm('Remove empty folder ' + nm + '?')) return;
+      cfPost({ conversation_id: cfConv, op: 'rmdir', folder: pre + nm }).then(function (x) {
+        if (!x.ok) { flashNote('rmdir: ' + ((x.j && x.j.error) || 'failed')); return; }
+        cfLoad();
+      });
+    });
+    r.appendChild(d);
+    r.addEventListener('click', function () { cfDir = pre + nm; cfLoad(); });
+    b.appendChild(r);
+  });
+  (cfData.files || []).forEach(function (fl) {
+    if ((fl.folder || '') !== cfDir) return;
+    nfile++;
+    var r = document.createElement('div'); r.className = 'cfRow';
+    r.appendChild(toolSheetEl('cfIco', fl.kind === 'image' ? '🖼' : '📄'));
+    r.appendChild(toolSheetEl('cfNm', fl.name));
+    r.appendChild(toolSheetEl('cfSz', fmtSize(fl.size || 0)));
+    var d = document.createElement('button'); d.className = 'cfDel'; d.textContent = '🗑';
+    d.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (!window.confirm('Delete ' + fl.name + ' from this chat?')) return;
+      cfPost({ conversation_id: cfConv, op: 'delete', id: fl.id }).then(function (x) {
+        if (!x.ok) { flashNote('delete: ' + ((x.j && x.j.error) || 'failed')); return; }
+        flashNote('deleted ' + fl.name);
+        cfLoad();
+      });
+    });
+    r.appendChild(d);
+    r.addEventListener('click', function () { cfLink(fl); });
+    b.appendChild(r);
+  });
+  if (!nfile && !Object.keys(subs).length) b.appendChild(toolSheetEl('cfEmpty', 'This chat has no files yet — upload one, or start the chat with a message first.'));
+}
+function cfLink(fl) {
+  if (pendingAtts.some(function (p) { return p.id && fl.id === p.id; })) { flashNote('already in the composer'); return; }
+  if (vidCountFiles() >= 8) { flashNote('Max 8 attachments per message'); return; }
+  if (pendingAtts.length >= 64) { flashNote('Message attachment budget (64) reached'); return; }
+  var mime = fl.mime || 'application/octet-stream';
+  pendingAtts.push({
+    file: { name: fl.name, size: fl.size || 0, type: mime },
+    id: fl.id, src: 'cairnfile',
+    thumb: mime.indexOf('image/') === 0 ? ('api/attachments/' + encodeURIComponent(fl.id)) : null
+  });
+  renderAttachChips();
+  flashNote('attached ' + fl.name + ' (already uploaded)');
+}
+cfPick.addEventListener('change', function () {
+  var fs = Array.prototype.slice.call(cfPick.files || []);
+  cfPick.value = '';
+  if (!fs.length || !cfConv) return;
+  (async function () {
+    var done = 0, fail = 0, skip = 0;
+    for (const f of fs) {
+      if (f.size > 15 * 1024 * 1024) { skip++; continue; }
+      try {
+        const b64 = await fileToB64(f);
+        const ur = await fetch('api/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: cfConv, name: f.name, mime: f.type || 'application/octet-stream', data: b64, source: 'file', folder: cfDir }) });
+        if (!ur.ok) { fail++; continue; }
+        done++;
+      } catch (e) { fail++; }
+    }
+    if (done) flashNote('uploaded ' + done + ' — tap a file to attach' + (skip ? ' (' + skip + ' over 15 MB skipped)' : '') + (fail ? ' — ' + fail + ' failed' : ''));
+    else if (skip) flashNote(skip + ' file(s) over the 15 MB cap skipped');
+    else if (fail) flashNote('upload failed');
+    cfLoad();
+  })();
+});
+$('mpCairn').addEventListener('click', cfOpen);
+function cpModelSet(prov, model) {
+  if (!currentConv) { flashNote('send a message first, then pick a model for this chat'); return; }
+  fetch('api/conv/model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: currentConv, provider: prov, model: model }) })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (x) {
+      if (!x.ok) { flashNote('model change failed: ' + ((x.j && x.j.error) || '')); return; }
+      f21Convs.set(currentConv, f21Parse(x.j.model_override));
+      f21Label();
+    }).catch(function () { flashNote('model change failed'); });
+}
+function cpRenderModels() {
+  const box = $('mpList'); if (!box) return;
+  box.textContent = '';
+  const ov = currentConv ? f21Convs.get(currentConv) : null;
+  const curP = (ov && ov.provider) || f21Acct.provider;
+  const curM = (ov && ov.model) || f21Acct.model || '';
+  function cpRow(title, sub, on, fn) {
+    const b = document.createElement('button');
+    b.className = 'cpop-item' + (on ? ' on' : '');
+    const t = document.createElement('span');
+    t.textContent = title;
+    t.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    const s = document.createElement('span');
+    s.className = 'cpsub';
+    s.textContent = sub;
+    b.appendChild(t); b.appendChild(s);
+    b.addEventListener('click', function () { closeCpops(); fn(); });
+    box.appendChild(b);
+  }
+  cpRow('Account default', (f21ProvNames[f21Acct.provider] || f21Acct.provider) + (f21Acct.model ? ' / ' + f21Acct.model : ''), (!ov || !(ov.provider || ov.model)), function () { cpModelSet('', ''); });
+  f21Saved.forEach(function (m) {
+    cpRow(f21ChipName(m), f21ProvNames[m.provider] || m.provider, (m.provider === curP && m.model === curM), function () { cpModelSet(m.provider, m.model); });
+  });
+  if (!f21Saved.length) {
+    const d = document.createElement('div');
+    d.className = 'cpop-head';
+    d.textContent = 'no saved models yet - add them in Settings';
+    box.appendChild(d);
+  }
+}
+const cmLabel = $('chatModelLabel');
+if (cmLabel) { cmLabel.title = 'pick a model for this chat'; cmLabel.addEventListener('click', function (e) { e.stopPropagation(); toggleCpop(modelPop); }); }
+document.addEventListener('click', function (e) {
+  if (e.target && e.target.closest && (e.target.closest('.cpop') || e.target.closest('#attachBtn') || e.target.closest('#qsBtn') || e.target.closest('#chatModelLabel'))) return;
+  closeCpops();
+});
+// iter6 (K80 2026-10-04): quick-settings state. Everything here is a
+// client-side request to use LESS (per browser, persisted). The server
+// treats off_* body flags as subtractions from its own ceiling.
+const qsPop = $('qsPop');
+let qsState = { think: true, web: true, shell: true };
+try {
+  const q = JSON.parse(localStorage.getItem('cairn-qs') || 'null');
+  if (q && typeof q === 'object') {
+    if (q.think === false) qsState.think = false;
+    if (q.web === false) qsState.web = false;
+    if (q.shell === false) qsState.shell = false;
+  }
+} catch (e) {}
+function qsSave() { try { localStorage.setItem('cairn-qs', JSON.stringify(qsState)); } catch (e) {} }
+function qsPaint() {
+  ['web', 'shell'].forEach(function (k) {
+    const row = $(k === 'web' ? 'qsWeb' : 'qsShell');
+    if (!row) return;
+    row.classList.toggle('on', !!qsState[k]);
+    const sw = row.querySelector('.qsw');
+    if (sw) sw.textContent = qsState[k] ? 'on' : 'off';
+  });
+}
+// U-PARK: qsThink row removed from the popover; qsState.think stays true
+// forever so off_think is never sent (server path dormant, K80 2026-10-04).
+$('qsWeb').addEventListener('click', function () { qsState.web = !qsState.web; qsSave(); qsPaint(); });
+$('qsShell').addEventListener('click', function () { qsState.shell = !qsState.shell; qsSave(); qsPaint(); });
+$('qsBtn').addEventListener('click', function (e) { e.stopPropagation(); toggleCpop(qsPop); });
+/* PATCH44/U28: Context Compact — Katy asked for the wheel, not just the airbag.
+   Kicks POST api/compact for THIS chat; the fold runs server-side and the
+   badge paints it via compact_job. Confirm-first: it spends her model/key. */
+$('qsCompact').addEventListener('click', function (e) {
+  e.stopPropagation(); qsPop.hidden = true;
+  if (!currentConv) { alert('Open a chat first - the fold works on one conversation at a time.'); return; }
+  if (!confirm('Fold this chat\u2019s older history into a continuity handoff now?\\n\\nIt runs on your model + key. Long chats fold in parts and can take several minutes - the badge shows an hourglass while it works. Your recent messages stay verbatim and nothing is deleted either way.')) return;
+  fetch('api/compact', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conv: currentConv }) })
+    .then(function (r) {
+      if (r.status === 202 || r.status === 409) { ctxMeter.textContent = '\u23f3 compacting\u2026'; ctxMeter.style.color = '#e0a030'; _refreshCtx27(currentConv); return; }
+      return r.json().then(function (j) { alert((j && j.error) || 'could not start the fold'); }).catch(function () { alert('could not start the fold'); });
+    }).catch(function () { alert('could not reach the daemon'); });
+});
+qsPaint();
 
 /* Render attachment chips inside a user bubble from server metadata (m.attachments). */
 /* F24: fetch->blob->objectURL download. Plain <a href> + Content-Disposition
@@ -14110,9 +16422,31 @@ function attChipsFor(m) {
 
 /* ── send + SSE ── */
 function autosize() {
+  if (document.querySelector('.composer.expanded')) return;
   msgInput.style.height = 'auto';
   msgInput.style.height = Math.min(msgInput.scrollHeight, 140) + 'px';
 }
+/* patch32: composer expand-to-sheet + swipe-down-to-collapse (Agora slide parity) */
+(function(){
+  var foot=document.querySelector('.composer');
+  var exp=document.getElementById('cmpExpand');
+  if (!foot || !exp) return;
+  function setExpanded(on){
+    foot.classList.toggle('expanded', on);
+    exp.setAttribute('title', on ? 'Collapse composer' : 'Expand composer');
+    if (on) msgInput.focus(); else autosize();
+  }
+  exp.addEventListener('click', function(){ setExpanded(!foot.classList.contains('expanded')); });
+  document.addEventListener('keydown', function(e){ if (e.key==='Escape' && foot.classList.contains('expanded')) setExpanded(false); });
+  if ('ontouchstart' in window) {
+    foot.classList.add('grabbable');
+    attachSwipe(foot, function(){
+      if (!foot.classList.contains('expanded')) return false;
+      var t=document.activeElement; return t===msgInput || t===document.body || t===null || foot.contains(t);
+    }, function(dy,v){ if (dy>90 || (dy>40 && v>0.4)) setExpanded(false); });
+  }
+  window.__cmpSetExpanded = setExpanded;
+})();
 
 let queuedMsgs = [];
 const queueBar = $('queueBar');
@@ -14180,6 +16514,7 @@ function send() {
   }
   if (!currentConv) currentConv = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('c' + Date.now().toString(36) + Math.random().toString(36).slice(2));
   const conv = currentConv;
+  pillRefresh();
   hideEmpty();
   const udiv = addMsgDiv('user', text || '(attachment)');
   if (pendingAtts.length) {
@@ -14197,6 +16532,8 @@ function send() {
   streaming = true;
   refreshSendFace();
   const think = addThinking();
+  thinkCur = null;
+  thinkAfter = false;
   scrollBottom(true);
 
   let bubble = null;
@@ -14207,12 +16544,14 @@ function send() {
     return bubble;
   };
   const chips = [];
+  argChips = {};
 
   (async () => {
     try {
       // P3.2: upload pending attachments first (ids go with the chat message)
       const attIds = [];
       for (const p of pendingAtts) {
+        if (p.id) { attIds.push(p.id); continue; }  // patch34: link chip — bytes already server-side
         p.uploading = true;
         renderAttachChips();
         const b64 = await fileToB64(p.file);
@@ -14244,7 +16583,7 @@ function send() {
       const resp = await fetch('api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversation_id: conv || '', message: text, attachments: attIds }),   // P1-I/S03: '' = server mints
+        body: JSON.stringify({ conversation_id: conv || '', message: text, attachments: attIds, off_web: qsState.web ? undefined : true, off_shell: qsState.shell ? undefined : true }),   // P1-I/S03: '' = server mints
         signal: abortCtrl.signal
       });
       if (resp.status === 409) {
@@ -14277,13 +16616,28 @@ function send() {
             think.querySelector('.tlabel').textContent = payload.phase;
           }
         } else if (cur === 'reasoning') {
-          const b = ensureBubble();
-          if (payload.content) { b.thoughts.textContent += payload.content; scrollBottom(); }
+          // patch16: standalone timeline card, not the in-bubble drawer.
+          // A tool event since the last delta (thinkAfter) opens a new card.
+          if (payload.content) {
+            if (!thinkCur || thinkAfter) { liveOff(); thinkCur = mkThinkCard(); thinkCur.div.classList.add('live'); think.remove(); scrollBottom(); }
+            thinkAfter = false;
+            thinkCur.add(payload.content);
+            scrollBottom();
+          }
         } else if (cur === 'message') {
           const b = ensureBubble();
           if (payload.content) { b.body.textContent += payload.content; scrollBottom(); }
+        } else if (cur === 'tool_args') {
+          thinkAfter = true; // patch16: next reasoning delta opens a new card
+          var _ta = (payload.idx !== undefined) ? argChips[payload.idx] : null;
+          if (_ta) { _ta.setArgs(String(payload.arguments || '')); }
+          else if (payload.name) { var _nc = addToolChip(payload.name, fmtToolArgs(payload.arguments), true, payload.arguments); chips.push(_nc); if (payload.idx !== undefined) argChips[payload.idx] = _nc; }
+          scrollBottom();
         } else if (cur === 'tool_call') {
-          chips.push(addToolChip(payload.name, fmtToolArgs(payload.arguments)));
+          thinkAfter = true; // patch16
+          var _tc = (payload.idx !== undefined) ? argChips[payload.idx] : null;
+          if (_tc) { _tc.setArgs(String(payload.arguments || '')); delete argChips[payload.idx]; }
+          else { chips.push(addToolChip(payload.name, fmtToolArgs(payload.arguments), undefined, payload.arguments)); }
           scrollBottom();
         } else if (cur === 'tool_result') {
           for (let i = chips.length - 1; i >= 0; i--) {
@@ -14300,16 +16654,21 @@ function send() {
           }
         } else if (cur === 'error') {
           const b = ensureBubble();
+          sweepArgChips();
           b.body.textContent += (b.body.textContent ? NL : '') + '[Error: ' + (payload.message || 'unknown') + ']';
           scrollBottom();
         } else if (cur === 'stopped') {
           const b = ensureBubble();
+          sweepArgChips();
           b.body.textContent += (b.body.textContent ? NL : '') + '⏹ Stopped — partial answer saved. Follow-ups pick up from here.';
           scrollBottom();
         } else if (cur === 'done') {
+          sweepArgChips();
           if (payload.conversation_id) currentConv = payload.conversation_id;
           if (payload.title) { const _f16el = convList.querySelector('.conv-item.active .ct'); if (_f16el) _f16el.textContent = payload.title; }
-          if (payload.est_tokens) ctxMeter.textContent = 'ctx ' + (payload.est_tokens / 1000).toFixed(1) + 'K / ' + (payload.context_budget / 1000).toFixed(0) + 'K';
+          if (payload.title && currentConv) convTitles.set(currentConv, payload.title);
+          pillRefresh();
+          if (payload.est_tokens) { ctxBudget = payload.context_budget || ctxBudget; _refreshCtx27(currentConv); }  // PATCH43/U27: badge = context usage from the daemon painter, not the prompt-inclusive turn est
           if (payload.attachments && payload.attachments.length) {
             const fb = ensureBubble();
             const acF = attChipsFor({ attachments: payload.attachments });
@@ -14359,6 +16718,7 @@ function send() {
         scrollBottom();
       }
     }
+    liveOff(); if (bubble && bubble.body.textContent) mdInto(bubble.body);
     if (bubble && !bubble.body.textContent && !bubble.thoughts.textContent) bubble.div.remove();
     if (bubble && bubble.thoughts.textContent === '') bubble.det.remove();
     abortCtrl = null;
@@ -14388,6 +16748,8 @@ async function attachStream(id) {
   streaming = true;
   refreshSendFace();
   const think = addThinking();
+  thinkCur = null;
+  thinkAfter = false;
   scrollBottom(true);
   let bubble = null;
   const ensureBubble = () => {
@@ -14397,6 +16759,7 @@ async function attachStream(id) {
     return bubble;
   };
   const chips = [];
+  argChips = {};
   try {
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
@@ -14413,13 +16776,20 @@ async function attachStream(id) {
             think.querySelector('.tlabel').textContent = payload.phase;
           }
         } else if (cur === 'reasoning') {
-          const b = ensureBubble();
-          if (payload.content) { b.thoughts.textContent += payload.content; scrollBottom(); }
+          // patch16: standalone timeline card, not the in-bubble drawer.
+          // A tool event since the last delta (thinkAfter) opens a new card.
+          if (payload.content) {
+            if (!thinkCur || thinkAfter) { liveOff(); thinkCur = mkThinkCard(); thinkCur.div.classList.add('live'); think.remove(); scrollBottom(); }
+            thinkAfter = false;
+            thinkCur.add(payload.content);
+            scrollBottom();
+          }
         } else if (cur === 'message') {
           const b = ensureBubble();
           if (payload.content) { b.body.textContent += payload.content; scrollBottom(); }
         } else if (cur === 'tool_call') {
-          chips.push(addToolChip(payload.name, fmtToolArgs(payload.arguments)));
+          thinkAfter = true; // patch16
+          chips.push(addToolChip(payload.name, fmtToolArgs(payload.arguments), undefined, payload.arguments));
           scrollBottom();
         } else if (cur === 'tool_result') {
           for (let i = chips.length - 1; i >= 0; i--) {
@@ -14436,16 +16806,21 @@ async function attachStream(id) {
           }
         } else if (cur === 'error') {
           const b = ensureBubble();
+          sweepArgChips();
           b.body.textContent += (b.body.textContent ? NL : '') + '[Error: ' + (payload.message || 'unknown') + ']';
           scrollBottom();
         } else if (cur === 'stopped') {
           const b = ensureBubble();
+          sweepArgChips();
           b.body.textContent += (b.body.textContent ? NL : '') + '⏹ Stopped — partial answer saved. Follow-ups pick up from here.';
           scrollBottom();
         } else if (cur === 'done') {
+          sweepArgChips();
           if (payload.conversation_id) currentConv = payload.conversation_id;
           if (payload.title) { const _f16el = convList.querySelector('.conv-item.active .ct'); if (_f16el) _f16el.textContent = payload.title; }
-          if (payload.est_tokens) ctxMeter.textContent = 'ctx ' + (payload.est_tokens / 1000).toFixed(1) + 'K / ' + (payload.context_budget / 1000).toFixed(0) + 'K';
+          if (payload.title && currentConv) convTitles.set(currentConv, payload.title);
+          pillRefresh();
+          if (payload.est_tokens) { ctxBudget = payload.context_budget || ctxBudget; _refreshCtx27(currentConv); }  // PATCH43/U27: badge = context usage from the daemon painter, not the prompt-inclusive turn est
           if (payload.attachments && payload.attachments.length) {
             const fb = ensureBubble();
             const acF = attChipsFor({ attachments: payload.attachments });
@@ -14476,7 +16851,8 @@ async function attachStream(id) {
     scrollBottom();
     setTimeout(() => { if (currentConv) loadMessages(currentConv); }, 800);
   }
-  if (bubble && !bubble.body.textContent && !bubble.thoughts.textContent) bubble.div.remove();
+  liveOff(); if (bubble && bubble.body.textContent) mdInto(bubble.body);
+    if (bubble && !bubble.body.textContent && !bubble.thoughts.textContent) bubble.div.remove();
   if (bubble && bubble.thoughts.textContent === '') bubble.det.remove();
   streaming = false;
   refreshSendFace();
@@ -14507,9 +16883,13 @@ document.querySelectorAll('.chip').forEach((ch) => {
 /* ── export ── */
 exportBtn.addEventListener('click', (e) => {
   e.stopPropagation();
-  exportPop.hidden = !exportPop.hidden;
+  exportPop.hidden = !exportPop.hidden; if (!exportPop.hidden) { closeCpops(); }
 });
-document.addEventListener('click', () => { exportPop.hidden = true; });
+document.addEventListener('click', (e) => {
+  exportPop.hidden = true;
+  if (!convSearch.hidden && !convSearch.contains(e.target)) convSearch.hidden = true;
+  if (!sysPop.hidden && !sysPop.contains(e.target)) sysPop.hidden = true;
+});
 
 async function doExport(fmt) {
   if (!currentConv) return;
@@ -14534,11 +16914,94 @@ async function doExport(fmt) {
 }
 $('mdBtn').addEventListener('click', () => doExport('md'));
 $('jsonBtn').addEventListener('click', () => doExport('json'));
+/* -- U (patch15): conversation menu - in-chat search / system notes / fork -- */
+const convSearch = $('convSearch'), sysPop = $('sysPop');
+function csSearch() {
+  const q = $('csQ').value.trim().toLowerCase();
+  const box = $('csRes'), msg = $('csMsg');
+  box.textContent = '';
+  msg.hidden = true;
+  if (q.length < 2) { msg.hidden = false; msg.textContent = 'type at least 2 characters'; return; }
+  const els = Array.prototype.slice.call(chatCol.querySelectorAll('.msg'));
+  const hits = [];
+  els.forEach(function (el) {
+    const t = (el.textContent || '').toLowerCase();
+    const i = t.indexOf(q);
+    if (i >= 0) hits.push([el, i]);
+  });
+  if (!hits.length) { msg.hidden = false; msg.textContent = 'no matches in this conversation'; return; }
+  msg.hidden = false;
+  msg.textContent = hits.length + ' match' + (hits.length === 1 ? '' : 'es') + (hits.length > 40 ? ' (showing first 40)' : '');
+  hits.slice(0, 40).forEach(function (h) {
+    const raw = h[0].textContent || '';
+    const i = raw.toLowerCase().indexOf(q);
+    const from = Math.max(0, i - 40);
+    const btn = document.createElement('button');
+    btn.className = 'pop-item';
+    btn.style.minHeight = '38px';
+    btn.style.fontSize = '13px';
+    btn.textContent = (from > 0 ? '...' : '') + raw.slice(from, i + q.length + 70) + (i + q.length + 70 < raw.length ? '...' : '');
+    btn.addEventListener('click', function () {
+      convSearch.hidden = true;
+      h[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      h[0].style.outline = '1px solid var(--accent)';
+      setTimeout(function () { h[0].style.outline = ''; }, 2200);
+    });
+    box.appendChild(btn);
+  });
+}
+let csTimer = null;
+$('csQ').addEventListener('input', function () { clearTimeout(csTimer); csTimer = setTimeout(csSearch, 200); });
+$('cmSearch').addEventListener('click', function (e) {
+  e.stopPropagation();
+  if (!currentConv) return;
+  sysPop.hidden = true;
+  exportPop.hidden = true;
+  convSearch.hidden = !convSearch.hidden;
+  if (!convSearch.hidden) { $('csQ').focus(); csSearch(); }
+});
+let sysConv = null;
+$('cmSys').addEventListener('click', function (e) {
+  e.stopPropagation();
+  if (!currentConv) return;
+  convSearch.hidden = true;
+  exportPop.hidden = true;
+  if (!sysPop.hidden) { sysPop.hidden = true; return; }
+  sysConv = currentConv;
+  $('sysNote').textContent = 'loading...';
+  sysPop.hidden = false;
+  fetch('api/conv/sysprompt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: sysConv }) })
+    .then(function (r) { return r.json(); })
+    .then(function (d) { if (sysConv === currentConv) { $('sysTxt').value = (d && d.text) || ''; $('sysNote').textContent = 'notes ride this chat prompt on your next messages'; } })
+    .catch(function () { $('sysNote').textContent = 'could not load'; });
+});
+$('sysSave').addEventListener('click', function () {
+  if (!sysConv || sysConv !== currentConv) { $('sysNote').textContent = 'conversation changed - reopen the menu'; return; }
+  $('sysNote').textContent = 'saving...';
+  fetch('api/conv/sysprompt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: sysConv, text: $('sysTxt').value }) })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (x) { $('sysNote').textContent = x.ok ? 'saved' : ('failed: ' + ((x.j && x.j.error) || 'unknown')); })
+    .catch(function () { $('sysNote').textContent = 'save failed (network)'; });
+});
+$('cmFork').addEventListener('click', function () {
+  if (!currentConv || streaming) return;
+  const src = currentConv;
+  if (!window.confirm('Fork this conversation? The copy becomes a NEW conversation with the same history and files. The original stays untouched.')) return;
+  exportPop.hidden = true;
+  fetch('api/conv/fork', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: src }) })
+    .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+    .then(function (x) {
+      if (x.ok && x.j && x.j.conversation_id) { switchConv(x.j.conversation_id); }
+      else { const b = addAssistantMsg(''); b.body.textContent = '[Fork failed: ' + ((x.j && x.j.error) || 'unknown') + ']'; }
+    })
+    .catch(function () { const b = addAssistantMsg(''); b.body.textContent = '[Fork failed: network]'; });
+});
 
 /* ── boot ── */
 (async () => {
   try {
     const s = await (await fetch('api/settings')).json();
+    if (s && s.context_budget) ctxBudget = s.context_budget;  // PATCH41/U25: pill knows the budget from the first paint
     applyTheme(s.theme || THEME_DEFAULT);
   } catch (e) { applyTheme(THEME_DEFAULT); }
   const data = await loadConversations();
@@ -14863,6 +17326,9 @@ body{padding:10px;padding-bottom:44px}
 .secnav a:hover{background:var(--bg);color:var(--accent)}
 .secnav .sec-empty{color:var(--dim);font-size:12.5px;padding:10px 12px}
 .secflash{outline:2px solid var(--accent);outline-offset:4px;border-radius:14px}
+/* U17 thematic drawer groups */
+.secgroup{margin:12px 0 3px;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);opacity:.7;padding-left:2px}
+.secgroup:first-child{margin-top:0}
 .card[data-sec]{scroll-margin-top:70px}
 .sbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:8px 12px;margin-bottom:16px;box-shadow:0 6px 18px rgba(0,0,0,0.25)}
 #secBtn{flex:none;width:40px;min-width:40px;height:40px;padding:0;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:9px;cursor:pointer;margin-top:0}
@@ -14965,10 +17431,51 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     <textarea id="custom_instructions" rows="5" style="width:100%;max-width:520px" placeholder="Standing directions for your agent (voice, focus, standing rules). Shapes how it works - it can never grant or remove tools."></textarea>
   </div>
   <p style="font-size:12px;opacity:.6;margin:0">Shown to your agent in every conversation. <span id="ciCount" style="opacity:.7"></span></p>
+  <div id="plWrap" style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+    <div style="font-size:12px;opacity:.6;margin-bottom:4px">Prompt library - named persona prompts. The selected prompt replaces the inline instructions above while it is active; nothing else changes.</div>
+    <div id="plList"></div>
+    <div class="status" id="plStatus"></div>
+    <div id="plEdit" style="display:none;margin-top:8px">
+      <input id="plName" placeholder="prompt name" autocomplete="off" style="max-width:280px;margin-bottom:6px">
+      <textarea id="plBody" rows="6" style="width:100%;max-width:520px" placeholder="The full text of this persona prompt"></textarea>
+      <div class="row" style="margin-top:6px;gap:8px">
+        <button class="btn" onclick="plSave()">Save prompt</button>
+        <button class="btn" onclick="plHideEd()">Cancel</button>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px"><button class="btn" onclick="plNew()">+ New prompt</button></div>
+  </div>
   <div class="row" style="margin-top:8px"><button class="btn" onclick="savePersonaCard()">Save persona</button></div>
   <div class="status" id="personaStatus"></div>
 </div>
+<div class="card" id="memoryCard" data-sec="personal">
+  <h2>Conversation memory</h2>
+  <div class="hint">Keyword recall is always on. Semantic recall embeds your past messages and searches by meaning - it uses your chat provider&rsquo;s base URL and key with an embedding model id (e.g. <code>BAAI/bge-large-en-v1.5</code>). Leave the model blank to keep it off.</div>
+  <div class="row" style="margin-top:8px"><label for="conv_search">Recall search</label>
+    <select id="conv_search">
+      <option value="keyword">Keyword (full-text, always available)</option>
+      <option value="semantic">Semantic (embeddings, needs a model below)</option>
+    </select>
+  </div>
+  <div class="row" style="margin-top:8px"><label for="embed_model">Embedding model id</label>
+    <input id="embed_model" type="text" style="max-width:340px" placeholder="blank = semantic search off" autocomplete="off">
+  </div>
+  <div class="row" style="margin-top:8px"><label for="conv_sim_min">Min similarity <span id="simVal">0.50</span></label>
+    <input id="conv_sim_min" type="range" min="0" max="0.95" step="0.05" value="0.50" style="max-width:220px">
+  </div>
+  <div class="status" id="embedStatus"></div>
+  <div class="row" style="margin-top:8px"><button class="btn" onclick="embedCacheBtn(false)">Build cache</button> <button class="btn" onclick="embedCacheBtn(true)">Re-cache everything</button></div>
+  <div class="hint">Building runs in batches (up to 240 per click) - press again until it says complete. Changing or clearing the model id discards old vectors on save.</div>
+</div>
 
+<div class="card" id="mcpCard" data-sec="admin">
+  <h2>MCP Servers</h2>
+  <div class="hint">Model Context Protocol servers over stdio (npx / uvx style). One JSON array: <b>[{"name":"files","command":"npx","args":["-y","some-mcp-server"],"env":{"KEY":"..."}}]</b> - server names are a-z 0-9 _ - (no double underscore), max 8 servers. Their tools appear to the agent automatically as mcp__servername__toolname. <b>Every server runs ON THIS BOX with CAIRN's own permissions - only define servers you trust.</b></div>
+  <div class="row" style="margin-top:8px"><textarea id="mcpServers" rows="7" spellcheck="false" autocomplete="off" style="width:100%;max-width:640px;font-family:monospace;font-size:12px" placeholder="[]"></textarea></div>
+  <div class="row" style="margin-top:8px"><button class="btn" onclick="mcpProbe()">Probe saved servers</button></div>
+  <div class="status" id="mcpStatus"></div>
+  <div class="hint">Probe tests what is ALREADY SAVED - drafts in the box are never executed. Save the settings form to apply changes; the first message after a change may pause briefly while servers start. Clearing this box removes every MCP tool. Probe results are held a few minutes so chat does not re-spawn your servers each turn.</div>
+</div>
 <div class="card" id="tlsCard" data-sec="owner">
   <h2>Connection & TLS</h2>
   <div class="hint" id="tlsBody">Loading connection status&hellip;</div>
@@ -15002,9 +17509,9 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <div class="status" id="toolsStatus"></div>
 </div>
 
-<div class="card" id="compactionCard" style="display:none" data-sec="admin">
+<div class="card" id="compactionCard" style="display:none" data-sec="personal">
   <h2>Compaction</h2>
-  <p style="font-size:12px;opacity:.65;margin:0 0 10px">When a conversation outgrows its context window, the agent compresses the older part into a continuity handoff and keeps the recent messages. The prompt below steers that handoff - blank = the house original (the verbatim prompt that ships in the daemon). Threshold = the fraction of the context window at which compaction fires - 0.3 to 0.95, blank = 0.8. Admin/owner only: users do not edit their own amnesia.</p>
+  <p style="font-size:12px;opacity:.65;margin:0 0 10px">When a conversation outgrows its context window, the agent compresses the older part into a continuity handoff and keeps the recent messages. The prompt below steers that handoff - blank = the house original (the verbatim prompt that ships in the daemon). Threshold = the fraction of the context window at which compaction fires - 0.3 to 0.95, blank = 0.8. Individual level (since 2026-10-05): the compaction call runs on <b>your</b> model and <b>your</b> key - so you steer what your own continuity handoff looks like.</p>
   <div class="row"><label>Compaction prompt</label>
     <textarea id="compaction_prompt" rows="8" style="width:100%;max-width:520px;font-family:monospace;font-size:12px" placeholder="Blank = house original. 32KB cap."></textarea>
   </div>
@@ -15119,6 +17626,9 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
   <div class="hint">Applies immediately on change and is saved to your account on this instance + remembered per-browser (localStorage).</div>
   <div class="row"><label>Auto-titles</label><label><input type="checkbox" id="title_gen"> Generate a short title after the first reply</label></div>
   <div class="hint">One tiny capped request to your own model, once per new conversation. If it ever hiccups the first-50-chars snippet title stays - nothing breaks. Unchecked = never call for titles.</div>
+  <div class="row" style="margin-top:8px"><label for="title_prompt">Title prompt</label></div>
+  <textarea id="title_prompt" rows="2" style="width:100%;max-width:520px" placeholder="Blank = default: 2-6 words, no quotes, no preamble"></textarea>
+  <div class="hint">Optional - how the title request is worded (e.g. &ldquo;Sum up the general context for retrieval later&rdquo;). One short instruction, 2000 chars max; blank restores the default.</div>
 </div>
 
 <div class="card" data-sec="personal">
@@ -15483,8 +17993,9 @@ body[data-page="personal"] .card:not([data-sec="personal"]),body[data-page="admi
     <button class="btn" onclick="importArchive()">Import</button>
     <label style="display:inline-block;margin-left:12px"><input type="checkbox" id="importRestore"> Also restore settings (safe keys only; every changed key is logged)</label>
     <label style="display:inline-block;margin-left:12px"><input type="checkbox" id="importIdentity"> FULL TRUST: also OVERWRITE my memory files and system prompt from this archive (principal only)</label>
+    <label style="display:inline-block;margin-left:12px"><input type="checkbox" id="importSecrets"> Import API keys & device secrets from this archive (vault-sealed CV1; never overwrites existing keys; principal only)</label>
   </div>
-  <div class="hint" id="impStatus">Exports are Agora-compatible (.cairn, format v4) - importable here, in Agora, or between accounts. Import accepts Cairn/Agora archives, ChatGPT exports, and Claude exports. API keys are never included. Ceilings: one .cairn archive builds up to 512&nbsp;MiB; the import side decodes up to 64&nbsp;MB, so a huge export may not re-import whole in one pass.</div>
+  <div class="hint" id="impStatus">Exports are Agora-compatible (.cairn, format v4) - importable here, in Agora, or between accounts. Import accepts Cairn/Agora archives, ChatGPT exports, and Claude exports. Exports never include API keys; import can vault-seal them from your own archive via the opt-in checkbox. Ceilings: one .cairn archive builds up to 512&nbsp;MiB; files up to 48&nbsp;MB ride the classic JSON door (64&nbsp;MB cap); anything larger streams up raw to 4&nbsp;GB - your full Agora export with media fits.</div>
 </div>
 
 <div class="card" data-sec="personal">
@@ -15571,6 +18082,14 @@ async function loadSettings() {
     document.getElementById('v1TokenStatus').textContent = s.v1_token_set ? (s.v1_token_weak ? 'v1 token: set (only ' + s.v1_token_len + ' chars - rotate it)' : 'v1 token: set') : 'v1 token: none — /v1 accepts the owner session only';
     onModelProviderChange();
     document.getElementById('custom_instructions').value = s.custom_instructions || '';
+    plLoad();
+    document.getElementById('embed_model').value = s.embed_model || '';
+    document.getElementById('conv_search').value = (s.conv_search === 'semantic') ? 'semantic' : 'keyword';
+    document.getElementById('conv_sim_min').value = s.conv_sim_min || '0.50';
+    document.getElementById('simVal').textContent = s.conv_sim_min || '0.50';
+    embedStatus();
+    var _mc22 = document.getElementById('mcpServers');
+    if (_mc22) _mc22.value = s.mcp_servers || '';
     document.getElementById('temperature').value = s.temperature || '';
     document.getElementById('max_tokens').value = s.max_tokens || '';
     document.getElementById('top_p').value = s.top_p || '';
@@ -15578,6 +18097,7 @@ async function loadSettings() {
     const th = document.getElementById('theme');
     th.value = s.theme || THEME_DEFAULT;
     document.getElementById('title_gen').checked = s.title_gen !== 'off';
+    document.getElementById('title_prompt').value = s.title_prompt || '';
     const mg = s.mediagen || {};
     document.getElementById('imagegen_mode').value = mg.image_mode || 'off';
     document.getElementById('imagegen_kind').value = mg.image_kind || 'openai';
@@ -15834,6 +18354,84 @@ async function resetParam(key) {
 
 // S4f2: custom-instructions size counter — the persona block ships with
 // every message too, so it gets the same honesty (K80 10:34/11:09).
+// U9 (patch17): named persona prompt library (server: /api/prompts).
+var plData = { items: [], active: '' };
+var plEditId = '';
+function plEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+    return c === '&' ? '&amp;' : (c === '<' ? '&lt;' : (c === '>' ? '&gt;' : '&quot;'));
+  });
+}
+async function plLoad() {
+  try {
+    const r = await fetch('api/prompts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j && j.items) { plData = j; plRender(); }
+  } catch (e) {}
+}
+function plRender() {
+  var el = document.getElementById('plList');
+  if (!el) return;
+  var RS = 'display:flex;align-items:center;gap:8px;padding:5px 0;flex-wrap:wrap';
+  var h = '<div style="' + RS + '"><label><input type="radio" name="plRad" data-pid=""' + (plData.active ? '' : ' checked') + ' onchange="plAct(this.dataset.pid)"> Inline instructions (the text area above)</label></div>';
+  for (var i = 0; i < plData.items.length; i++) {
+    var it = plData.items[i];
+    h += '<div style="' + RS + '"><label><input type="radio" name="plRad" data-pid="' + it.id + '"' + (plData.active === it.id ? ' checked' : '') + ' onchange="plAct(this.dataset.pid)"> <b>' + plEsc(it.name) + '</b> <span style="opacity:.55">(' + it.chars + ' chars)</span></label>'
+      + '<span style="margin-left:auto;display:inline-flex;gap:6px"><button class="btn" data-pid="' + it.id + '" onclick="plEd(this)">edit</button>'
+      + '<button class="btn" data-pid="' + it.id + '" onclick="plDelBtn(this)">delete</button></span></div>';
+  }
+  el.innerHTML = h;
+}
+async function plEd(btn) {
+  const pid = btn.dataset.pid;
+  try {
+    const r = await fetch('api/prompts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get', id: pid }) });
+    if (!r.ok) return;
+    const j = await r.json();
+    plEditId = pid;
+    document.getElementById('plName').value = j.name || '';
+    document.getElementById('plBody').value = j.body || '';
+    document.getElementById('plEdit').style.display = '';
+  } catch (e) {}
+}
+function plNew() {
+  plEditId = '';
+  document.getElementById('plName').value = '';
+  document.getElementById('plBody').value = '';
+  document.getElementById('plEdit').style.display = '';
+}
+function plHideEd() { document.getElementById('plEdit').style.display = 'none'; }
+async function plSave() {
+  const st = document.getElementById('plStatus');
+  try {
+    const r = await fetch('api/prompts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'save', id: plEditId, name: document.getElementById('plName').value, body: document.getElementById('plBody').value }) });
+    const j = await r.json().catch(function () { return {}; });
+    if (!r.ok) { st.textContent = String((j && j.error) || 'save failed'); return; }
+    plHideEd();
+    st.textContent = 'prompt saved';
+    await plLoad();
+  } catch (e) { st.textContent = 'save failed (network)'; }
+}
+async function plDelBtn(btn) {
+  if (!window.confirm('Delete this prompt from the library?')) return;
+  const st = document.getElementById('plStatus');
+  try {
+    const r = await fetch('api/prompts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'delete', id: btn.dataset.pid }) });
+    if (r.ok) { st.textContent = 'prompt deleted'; await plLoad(); }
+    else st.textContent = 'delete failed';
+  } catch (e) { st.textContent = 'delete failed (network)'; }
+}
+async function plAct(pid) {
+  const st = document.getElementById('plStatus');
+  try {
+    const r = await fetch('api/prompts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'activate', id: pid }) });
+    const j = await r.json().catch(function () { return {}; });
+    if (!r.ok) { st.textContent = String((j && j.error) || 'activation failed'); plRender(); return; }
+    plData.active = j.active || '';
+    st.textContent = plData.active ? 'library prompt active - inline instructions are paused' : 'inline instructions active';
+  } catch (e) { st.textContent = 'activation failed (network)'; }
+}
 (function () {
   var ci = document.getElementById('custom_instructions');
   var el = document.getElementById('ciCount');
@@ -15844,7 +18442,58 @@ async function resetParam(key) {
   ci.addEventListener('input', upd);
   upd();
 })();
-
+(function () {
+  var sm = document.getElementById('conv_sim_min');
+  var sv = document.getElementById('simVal');
+  sm.addEventListener('input', function () { sv.textContent = parseFloat(sm.value).toFixed(2); });
+})();
+function mcpProbe() {
+  var st = document.getElementById('mcpStatus');
+  if (!st) return;
+  st.textContent = 'Probing saved servers - each one is started fresh, this can take a moment...';
+  fetch('/api/mcp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var out = [];
+      (d.servers || []).forEach(function(s) {
+        if (s.ok) {
+          out.push(s.name + ': ' + s.count + ' tools' + (s.tools && s.tools.length ? ' (' + s.tools.slice(0, 8).join(', ') + ')' : ''));
+        } else {
+          out.push(s.name + ': FAILED - ' + (s.error || 'no response'));
+        }
+      });
+      st.textContent = out.length ? out.join('  |  ') : 'No servers saved for this account.';
+    })
+    .catch(function() { st.textContent = 'Probe request failed.'; });
+}
+function embedStatus() {
+  var st = document.getElementById('embedStatus');
+  st.textContent = 'checking vector cache...';
+  st.style.color = '';
+  fetch('api/embed', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: 'status' })
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (!j.enabled) { st.textContent = 'semantic recall off - set an embedding model id to turn it on'; return; }
+    st.textContent = 'vectors: ' + j.cached + ' / ' + j.total + ' messages embedded (model ' + j.model + ')';
+  }).catch(function () { st.textContent = 'vector cache status unavailable'; });
+}
+function embedCacheBtn(recache) {
+  var st = document.getElementById('embedStatus');
+  st.textContent = recache ? 'wiping cache and embedding a batch...' : 'embedding a batch (up to 240)...';
+  st.style.color = '';
+  fetch('api/embed', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: recache ? 'recache' : 'cache' })
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (j.error) { st.textContent = 'embedding failed - ' + j.error; st.style.color = 'var(--warn)'; return; }
+    if (!j.enabled) { st.textContent = 'semantic recall is off - set an embedding model id first'; return; }
+    st.textContent = 'vectors: ' + j.cached + ' / ' + j.total + ' embedded' + (j.cached >= j.total ? ' - complete' : ' - press again to continue');
+    setTimeout(embedStatus, 400);
+  }).catch(function () { st.textContent = 'embedding request failed (network)'; st.style.color = 'var(--warn)'; });
+}
 async function saveSettings() {
   const btn = document.getElementById('saveBtn');
   btn.disabled = true;
@@ -15864,8 +18513,13 @@ async function saveSettings() {
         top_p: document.getElementById('top_p').value,
         model_params: document.getElementById('model_params').value,
         custom_instructions: document.getElementById('custom_instructions').value,
+        embed_model: document.getElementById('embed_model').value,
+        conv_search: document.getElementById('conv_search').value,
+        conv_sim_min: document.getElementById('conv_sim_min').value,
+        mcp_servers: (document.getElementById('mcpServers') || {}).value,
         theme: document.getElementById('theme').value,
         title_gen: document.getElementById('title_gen').checked ? 'on' : 'off',
+        title_prompt: document.getElementById('title_prompt').value,
         imagegen_mode: document.getElementById('imagegen_mode').value,
         imagegen_kind: document.getElementById('imagegen_kind').value,
         imagegen_model: document.getElementById('imagegen_model').value,
@@ -16041,12 +18695,40 @@ async function exportAll() {
   }
 }
 
+function impDone(d, inp) {
+  let msg = 'Imported ' + d.conversations + ' conversations / ' + d.messages + ' messages' + (d.attachments ? ' / ' + d.attachments + ' attachments' : '');
+  if (d.identity_restored) msg += ' - memory & system prompt OVERWRITTEN';
+  if (d.settings_keys_changed && d.settings_keys_changed.length) msg += ' - settings changed: ' + d.settings_keys_changed.join(', ');
+  setStatus('impStatus', 'ok', msg + ' (format: ' + d.format + ')');
+  inp.value = '';
+}
 async function importArchive() {
   const inp = document.getElementById('importFile');
   const f = inp.files && inp.files[0];
   if (!f) { setStatus('impStatus', 'warn', 'Choose a file first.'); return; }
   if (document.getElementById('importIdentity').checked &&
       !confirm('FULL TRUST: this archive will OVERWRITE your memory files and system prompt, which steer every future reply. Only do this with an archive you trust. Continue?')) return;
+  if (document.getElementById('importSecrets').checked &&
+      !confirm('SECRETS: API keys and device passwords from this archive will be imported and sealed into the vault (existing keys are never overwritten). Only do this with an archive you trust. Continue?')) return;
+  if (f.size > 48 * 1024 * 1024) {
+    // PATCH28: past 48 MB base64 would inflate the file by a third AND double
+    // the memory on both ends - stream the raw bytes instead and let the
+    // server open the ZIP from disk. Restore flags ride the headers here.
+    setStatus('impStatus', 'warn', 'Importing ' + f.name + ' (' + (f.size / 1048576).toFixed(0) + ' MB) - streaming raw; big archives can take several minutes, keep this tab open...');
+    try {
+      const r = await fetch('api/import', {
+        method: 'POST',
+        headers: {'X-Cairn-Raw': '1', 'X-Cairn-Restore': document.getElementById('importRestore').checked ? '1' : '0', 'X-Cairn-Restore-Identity': document.getElementById('importIdentity').checked ? '1' : '0', 'X-Cairn-Import-Secrets': document.getElementById('importSecrets').checked ? '1' : '0'},
+        body: f
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      impDone(d, inp);
+    } catch (e) {
+      setStatus('impStatus', 'warn', 'Import failed: ' + e.message);
+    }
+    return;
+  }
   setStatus('impStatus', 'warn', 'Importing ' + f.name + '...');
   const reader = new FileReader();
   reader.onload = async () => {
@@ -16055,15 +18737,11 @@ async function importArchive() {
       const r = await fetch('api/import', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: f.name, data: b64, restore: document.getElementById('importRestore').checked, restore_identity: document.getElementById('importIdentity').checked})
+        body: JSON.stringify({name: f.name, data: b64, restore: document.getElementById('importRestore').checked, restore_identity: document.getElementById('importIdentity').checked, import_secrets: document.getElementById('importSecrets').checked})
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-      let msg = 'Imported ' + d.conversations + ' conversations / ' + d.messages + ' messages' + (d.attachments ? ' / ' + d.attachments + ' attachments' : '');
-      if (d.identity_restored) msg += ' - memory & system prompt OVERWRITTEN';
-      if (d.settings_keys_changed && d.settings_keys_changed.length) msg += ' - settings changed: ' + d.settings_keys_changed.join(', ');
-      setStatus('impStatus', 'ok', msg + ' (format: ' + d.format + ')');
-      inp.value = '';
+      impDone(d, inp);
     } catch (e) {
       setStatus('impStatus', 'warn', 'Import failed: ' + e.message);
     }
@@ -16515,11 +19193,19 @@ function secSetPage(p) {
 function renderSecNav() {
   const nav = s$('secNav'); if (!nav) return;
   nav.innerHTML = '';
-  let shown = 0;
-  document.querySelectorAll('.card[data-sec="' + secPageNow + '"]').forEach(function(c, i) {
-    if (!c.offsetParent) return;
-    if (!c.id) c.id = 'seccard-' + secPageNow + '-' + i;
-    const h = c.querySelector('h2'); if (!h) return;
+  /* U17 (K80 2026-10-05, Agora-style grouping): the drawer groups its links
+     thematically. Cards stay exactly where they render - only the index is
+     grouped. Titles not listed below fall into "More", so a future card can
+     never disappear from the nav. */
+  const GROUPS = [
+    ["Responses", ["Model", "Advanced — model parameters", "Compaction"]],
+    ["Persona", ["Your persona", "Conversation memory", "Your Memory Files", "Your Skills", "System prompt", "Tier 0 — the constitution"]],
+    ["Capabilities", ["Tools", "MCP Servers", "Web Search", "Media generation", "Connectors", "Credential Vault", "Scheduled Tasks", "Credential Approvals"]],
+    ["Appearance", ["Agent face", "Appearance"]],
+    ["Account & Data", ["System", "Session", "Instance Logs", "Export / Import", "Backup & Restore", "Invites", "Updates", "Pending Access", "Connection & TLS"]]
+  ];
+  const mkLink = function(c) {
+    const h = c.querySelector('h2');
     const a = document.createElement('a');
     a.href = '#' + c.id;
     a.textContent = h.textContent;
@@ -16530,9 +19216,30 @@ function renderSecNav() {
       c.classList.add('secflash');
       setTimeout(function() { c.classList.remove('secflash'); }, 1200);
     };
-    nav.appendChild(a); shown++;
+    nav.appendChild(a);
+  };
+  const cards = [];
+  document.querySelectorAll('.card[data-sec="' + secPageNow + '"]').forEach(function(c, i) {
+    if (!c.offsetParent) return;
+    if (!c.id) c.id = 'seccard-' + secPageNow + '-' + i;
+    const h = c.querySelector('h2'); if (!h) return;
+    cards.push([c, h.textContent.trim()]);
   });
-  if (!shown) { const e = document.createElement('div'); e.className = 'sec-empty'; e.textContent = 'Nothing here for your role yet.'; nav.appendChild(e); }
+  if (!cards.length) { const e = document.createElement('div'); e.className = 'sec-empty'; e.textContent = 'Nothing here for your role yet.'; nav.appendChild(e); return; }
+  const used = {};
+  GROUPS.forEach(function(g) {
+    const hits = cards.filter(function(p) { return g[1].indexOf(p[1]) !== -1 && !used[p[0].id]; });
+    if (!hits.length) return;
+    const t = document.createElement('div'); t.className = 'secgroup'; t.textContent = g[0];
+    nav.appendChild(t);
+    hits.forEach(function(p) { used[p[0].id] = 1; mkLink(p[0]); });
+  });
+  const rest = cards.filter(function(p) { return !used[p[0].id]; });
+  if (rest.length) {
+    const t = document.createElement('div'); t.className = 'secgroup'; t.textContent = 'More';
+    nav.appendChild(t);
+    rest.forEach(function(p) { mkLink(p[0]); });
+  }
 }
 async function initSections() {
   const btn = s$('secBtn'); if (!btn) return;
@@ -17069,13 +19776,13 @@ async function restoreUser(id, name) {
   } catch (e) { setStatus('userRoleStatus', 'warn', 'restore failed (network)'); }
 }
 
-// S4f9: compaction settings - a/o only (K80 10:54: users do not edit
-// their own amnesia). The server re-checks role + instance on every
-// save; the hidden card is cosmetic.
+// S4f9 -> U13: compaction settings - individual level (K80 2026-10-05:
+// each agent steers its own handoff, on its own model + key). The server
+// re-checks account status on every save; the hidden card is cosmetic.
 async function loadCompactionCard() {
   try {
     const me = await (await fetch('api/me')).json();
-    if (!me.authenticated || (me.role !== 'admin' && me.role !== 'owner')) return;
+    if (!me.authenticated) return;
     document.getElementById('compactionCard').style.display = '';
     const s = await (await fetch('api/settings')).json();
     document.getElementById('compaction_prompt').value = s.compaction_prompt || '';
@@ -17871,6 +20578,52 @@ class MaraHandler(BaseHTTPRequestHandler):
                     self.wfile.write(body)
                     return
             self._json(404, {"error": "not found"})
+        elif path == "/api/search":
+            # patch35 (W3 gap audit, K80 2026-10-06): full-text search over
+            # the caller's OWN message bodies. Agora has message search; the
+            # drawer box only filtered titles in JS. Scoping MIRRORS the list
+            # route on purpose (V14): a share principal without history
+            # consent only sees its own visit's threads; fail-closed when the
+            # session carries no guest stamp. LIKE is SQLite-default ASCII
+            # case-insensitive; backslash, % and _ are stripped from the
+            # query so user input can never inject wildcards. 50-hit cap,
+            # snippets windowed server-side. XSS-safe rendering client-side.
+            u = self._need_user()
+            if not u:
+                return
+            _q35 = dict(_nc_up.parse_qsl(_nc_up.urlsplit(self.path).query)).get("q") or ""
+            _q35 = _q35.replace("\\", " ").replace("%", " ").replace("_", " ").strip()[:64]
+            if len(_q35) < 2:
+                self._json(200, {"q": _q35, "hits": []})
+                return
+            with sqlite3.connect(DB_PATH) as db:
+                sql35 = ("SELECT m.id, m.conv_id, m.role, m.ts, substr(m.content,1,8000),"
+                         " cv.title FROM messages m JOIN conversations cv ON cv.id=m.conv_id"
+                         " WHERE cv.user_id=?")
+                args35 = [u["username"]]
+                if _is_share_principal(u["username"]) and not _share_history_allowed(u["username"]):
+                    g35 = self._sess_guest_id()
+                    if g35 is None:
+                        self._json(200, {"q": _q35, "hits": []})
+                        return
+                    sql35 += " AND cv.guest_id=?"
+                    args35.append(g35)
+                sql35 += " AND m.content LIKE ? ORDER BY m.ts DESC LIMIT 50"
+                args35.append("%" + _q35 + "%")
+                rows35 = db.execute(sql35, tuple(args35)).fetchall()
+            ql35 = _q35.lower()
+            hits35 = []
+            for r in rows35:
+                body35 = r[4] or ""
+                i35 = body35.lower().find(ql35)
+                if i35 < 0:
+                    i35 = 0
+                st35 = max(0, i35 - 90)
+                en35 = min(len(body35), i35 + len(_q35) + 90)
+                snip35 = ("…" if st35 else "") + body35[st35:en35] + ("…" if en35 < len(body35) else "")
+                hits35.append({"mid": r[0], "conv_id": r[1], "role": r[2], "ts": r[3],
+                               "title": r[5] or "New chat", "snippet": snip35})
+            self._json(200, {"q": _q35, "hits": hits35})
         elif path == "/api/conversations":
             u = self._need_user()
             if not u:
@@ -17929,7 +20682,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             with sqlite3.connect(DB_PATH) as db:
                 db.row_factory = sqlite3.Row
                 rows = db.execute(
-                    "SELECT role, content, ts, attachments, reasoning, tool_calls, stopped FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts",
+                    "SELECT role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts",  # U10
                     (conv_id,)
                 ).fetchall()
                 out = []
@@ -17953,6 +20706,58 @@ class MaraHandler(BaseHTTPRequestHandler):
                         d["reasoning"] = None
                     out.append(d)
                 self._json(200, out)
+        elif path == "/api/ctx":  # PATCH41/U25: honest numbers for the top-bar context meter
+            # What the NEXT request would actually carry: effective system
+            # prompt (identity + memory + persona + skills, same estimator
+            # the settings page uses) + latest compaction handoff + every
+            # uncompacted row (same row filter as the chat path). Read-only,
+            # owner-only, never calls a model. Agora-style "X / Y" meter +
+            # the exact point where compaction fires.
+            u = self._need_user()
+            if not u:
+                return
+            # PATCH43/U27: .get() on a dict returns a STRING; PATCH41's
+            # `or [""])[0]` tail sliced it to one char and 404'd every valid
+            # conv. Take the string as-is.
+            _cid25 = dict(_nc_up.parse_qsl(_nc_up.urlsplit(self.path).query)).get("conv") or ""
+            if not _cid25 or not self._conv_owner(_cid25, u["username"]):
+                self._json(404, {"error": "not found"})
+                return
+            with sqlite3.connect(DB_PATH) as db:
+                _rows25 = db.execute(
+                    "SELECT role, content FROM messages WHERE conv_id=? AND role IN ('user','assistant') "
+                    "AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",
+                    (_cid25,)).fetchall()
+                _sum25 = db.execute(
+                    "SELECT summary FROM compactions WHERE conv_id=? ORDER BY ts DESC LIMIT 1",
+                    (_cid25,)).fetchone()
+            _m25 = [{"role": r[0], "content": r[1]} for r in _rows25]
+            if _sum25 and _sum25[0]:
+                _m25.insert(0, {"role": "system", "content": _sum25[0]})
+            # PATCH43/U27 (Katy ruling 2026-10-07): the BADGE is context
+            # usage only — compaction handoff + live uncompacted rows, the
+            # same rows the next request actually carries from history. The
+            # system prompt is a separate field (tooltip), never folded into
+            # the badge; request_est/trigger_left keep the real trigger
+            # visible since compaction compares BOTH to compact_at.
+            _conv25 = messages_token_count(_m25)
+            _prompt25 = _est_prompt_tokens(u["username"])
+            _b25 = ctx_budget(u["username"])
+            _thr25 = compaction_threshold_for(u["username"])
+            _at25 = int(_b25 * _thr25)
+            # PATCH44/U28: a fold in flight rides the same paint lane. The
+            # job belongs to whoever kicked it; strangers see nothing.
+            with _U28_LOCK:
+                _j28 = dict(_U28_JOBS.get(_cid25) or {})
+            if _j28.get("username") != u["username"]:
+                _j28 = {}
+            self._json(200, {"est_tokens": _conv25, "prompt_tokens": _prompt25,
+                             "request_est": _conv25 + _prompt25,
+                             "context_budget": _b25, "compact_at": _at25,
+                             "trigger_left": _at25 - _conv25 - _prompt25,
+                             "threshold": _thr25,
+                             "has_summary": bool(_sum25 and _sum25[0]),
+                             "compact_job": (_j28 or None)})
         elif path == "/api/settings":
             u = self._need_user()
             if not u:
@@ -17973,6 +20778,11 @@ class MaraHandler(BaseHTTPRequestHandler):
                 "model_custom": get_setting("model_custom", "", u["username"]) or "",
                 "saved_models": _saved_models(u["username"]),  # B-21: ids only, never keys
                 "custom_instructions": get_setting("custom_instructions", "", u["username"]) or "",
+                "active_prompt": get_setting("active_prompt", "", u["username"]) or "",
+                "embed_model": get_setting("embed_model", "", u["username"]) or "",
+                "conv_search": get_setting("conv_search", "keyword", u["username"]) or "keyword",
+                "conv_sim_min": get_setting("conv_sim_min", "0.50", u["username"]) or "0.50",
+                "mcp_servers": get_setting("mcp_servers", "", u["username"]) or "",
                 # S4f8: tool toggles (this tier's tool universe + this
                 # user's disabled set - remove-only, never grants) and tool
                 # notes (rendered after the auto tool list in the prompt).
@@ -17981,7 +20791,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 "tool_notes": get_setting("tool_notes", "", u["username"]) or "",
                 # S4f10: avatar presence (the face itself is served by /api/avatar).
                 "has_avatar": any((AVATAR_DIR / (u["username"] + "." + e)).is_file() for e in AVATAR_EXTS),
-                # S4f9: compaction settings (a/o only). Blank = the house
+                # S4f9 -> U13: compaction settings (individual). Blank = the house
                 # original (the verbatim prompt is a code constant) / 0.80.
                 "compaction_prompt": get_setting("compaction_prompt", "", u["username"]) or "",
                 "compaction_threshold": get_setting("compaction_threshold", "", u["username"]) or "",
@@ -17994,6 +20804,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 "model_params": get_setting("model_params", "", u["username"]) or "",
                 "theme": get_setting("theme", "neon", u["username"]),
                "title_gen": get_setting("title_gen", "on", u["username"]),
+                "title_prompt": get_setting("title_prompt", "", u["username"]) or "",
                 # F17: media generation config - values + key presence, never the key.
                 "mediagen": {"image_mode": get_setting("imagegen_mode", "off", u["username"]),
                              "image_kind": get_setting("imagegen_kind", "openai", u["username"]),
@@ -18908,6 +21719,28 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._handle_avatar_post()
         elif path == "/api/avatar/reset":
             self._handle_avatar_reset()
+        elif path == "/api/compact":  # PATCH44/U28: manual context fold (Katy's ask)
+            u = self._need_user()
+            if not u:
+                return
+            body = self._json_object_body()
+            if body is None:
+                return
+            _cid28 = str(body.get("conv") or "").strip()
+            if not _cid28 or not self._conv_owner(_cid28, u["username"]):
+                self._json(404, {"error": "not found"})
+                return
+            with _U28_LOCK:
+                _prev28 = _U28_JOBS.get(_cid28)
+                if _prev28 and _prev28.get("state") == "running":
+                    self._json(409, {"error": "a compaction is already running for this chat"})
+                    return
+                _job28 = {"state": "running", "detail": "starting...", "ts": time.time(),
+                          "username": u["username"]}
+                _U28_JOBS[_cid28] = _job28
+            _p1b_threading.Thread(target=_u28_compact_worker,
+                                  args=(_cid28, u["username"], _job28), daemon=True).start()
+            self._json(202, {"ok": True})
         elif path == "/api/import":
             self._handle_import()
         elif path == "/api/connectors/ms/start":
@@ -18954,14 +21787,14 @@ class MaraHandler(BaseHTTPRequestHandler):
                         return _mv
                 return get_setting(_key, _def, u["username"])
             # B11: compaction gates run BEFORE any settings write so a
-            # refusal can never leave a partial write behind. The checks
-            # inside the compaction block below stay as defense in depth.
+            # refusal can never leave a partial write behind. U13 (K80
+            # 2026-10-05): individual level - an active account is the only
+            # precondition; rows are self-scoped by u["username"] and the
+            # summarizer runs on that user's own model + key. The status
+            # check inside the compaction block below stays as depth.
             if "compaction_prompt" in body or "compaction_threshold" in body:
-                if u["role"] not in ("admin", "owner") or u["status"] != "active":
-                    self._json(403, {"error": "compaction settings are admin/owner only (users do not edit their own amnesia)"})
-                    return
-                if not _instance_access(u, _instance_principal()):
-                    self._json(403, {"error": "forbidden - not your instance (the owner's instance is owner-only)"})
+                if u["status"] != "active":
+                    self._json(403, {"error": "account is not active"})
                     return
             # B-22: theme is a closed set. The picker is a <select> but the
             # POST is a public door; an unvalidated string must not reach the
@@ -18980,6 +21813,13 @@ class MaraHandler(BaseHTTPRequestHandler):
             # by accident and cannot smuggle anything else into settings).
             if "title_gen" in body:
                 muts.append(("title_gen", "off" if str(body["title_gen"]).lower() == "off" else "on", u["username"]))
+            # U12: custom title prompt. One short instruction; control chars
+            # rejected outright (it ships as a system message), blank = default.
+            if "title_prompt" in body:
+                _tp12 = str(body["title_prompt"] or "").strip()[:2000]
+                if any(ord(ch) < 32 or ord(ch) == 127 for ch in _tp12):
+                    _tp12 = ""
+                muts.append(("title_prompt", _tp12, u["username"]))
             # F17: media generation config (design: f17-media-gen-design). Closed
             # sets for modes/kinds; base URLs SSRF-gated HERE and again at call
             # time; media_key is write-only - only a non-empty POST overwrites it
@@ -19280,6 +22120,54 @@ class MaraHandler(BaseHTTPRequestHandler):
             if "custom_instructions" in body:
                 muts.append(("custom_instructions",
                              str(body["custom_instructions"] or "")[:USER_PERSONA_CAP], u["username"]))
+            # U11: conversation memory (semantic recall) settings. Changing
+            # embed_model invalidates every cached vector (dims/space differ),
+            # so the cache is wiped for that user on any model change.
+            if "embed_model" in body:
+                _em11 = str(body["embed_model"] or "").strip()[:200]
+                if any(ord(ch) < 32 or ord(ch) == 127 for ch in _em11):
+                    _em11 = ""
+                if _em11 != (get_setting("embed_model", "", u["username"]) or ""):
+                    with sqlite3.connect(DB_PATH) as db:
+                        db.execute("DELETE FROM msg_vec WHERE username=?", (u["username"],))
+                        db.commit()
+                    log.info("U11: %s embed_model changed - vector cache cleared", u["username"])
+                muts.append(("embed_model", _em11, u["username"]))
+            if "conv_search" in body:
+                muts.append(("conv_search",
+                             "semantic" if str(body["conv_search"] or "").strip().lower() == "semantic" else "keyword",
+                             u["username"]))
+            if "conv_sim_min" in body:
+                try:
+                    _sm11 = min(0.95, max(0.0, float(body["conv_sim_min"])))
+                except (TypeError, ValueError):
+                    _sm11 = 0.50
+                muts.append(("conv_sim_min", "%.2f" % _sm11, u["username"]))
+            # U14 (patch22): MCP server defs. Role-fenced (owner/admin):
+            # these execute on THIS box with CAIRN's own permissions, so
+            # this is the one setting whose save path carries an
+            # execution-privilege check, mirroring _mcp_servers_for at call
+            # time. A save that does not actually change the defs passes
+            # silently (the client ships every field on every save).
+            if "mcp_servers" in body:
+                _ms22, _me22 = _mcp_valid_servers(body.get("mcp_servers"))
+                if _ms22 is None:
+                    self._json(400, {"error": _me22})
+                    return
+                _cur22, _ce22 = _mcp_valid_servers(get_setting("mcp_servers", "", u["username"]))
+                if _cur22 is None:
+                    _cur22 = []
+                if _ms22 != _cur22:
+                    if (u["role"] or "") not in ("owner", "admin"):
+                        self._json(403, {"error": "forbidden - mcp servers are owner/admin only (they run with this box's permissions)"})
+                        return
+                    _sj22 = json.dumps(_ms22)
+                    if len(_sj22) > MCP_SETTING_CAP:
+                        self._json(400, {"error": "mcp_servers too large after cleanup (max %d characters)" % MCP_SETTING_CAP})
+                        return
+                    _MCP_TOOL_CACHE.pop(u["username"], None)
+                    log.info("U14: %s updated mcp_servers (%d servers)", u["username"], len(_ms22))
+                    muts.append(("mcp_servers", _sj22, u["username"]))
             # S4f8: tool notes - standing guidance about the tools, rendered
             # in the prompt right after the auto tool list. Clamped like
             # custom_instructions; text in this field can never grant
@@ -19303,17 +22191,15 @@ class MaraHandler(BaseHTTPRequestHandler):
                 muts.append(("tools_disabled",
                              json.dumps(sorted(set(str(n) for n in _td if isinstance(n, str)) & set(_tool_base_set()))),
                              u["username"]))
-            # S4f9: compaction settings - a/o ONLY (K80 10:54: users do
-            # not edit their own amnesia) AND instance-gated like the F3
-            # prompt editor: the owner's instance is owner-only, an admin
-            # edits their own instance, the owner may set any instance
-            # (fleet ops). The role check runs first, then the instance.
+            # S4f9 -> U13 (K80 ask 2026-10-05): compaction settings are
+            # INDIVIDUAL level. Every active principal steers their own
+            # handoff prompt/threshold; rows land under u["username"] so
+            # this is self-scoped by construction, and the compaction call
+            # already runs on that user's own model config + key (their
+            # budget, their summary). Supersedes the older a/o-only ruling.
             if "compaction_prompt" in body or "compaction_threshold" in body:
-                if u["role"] not in ("admin", "owner") or u["status"] != "active":
-                    self._json(403, {"error": "compaction settings are admin/owner only (users do not edit their own amnesia)"})
-                    return
-                if not _instance_access(u, _instance_principal()):
-                    self._json(403, {"error": "forbidden - not your instance (the owner's instance is owner-only)"})
+                if u["status"] != "active":
+                    self._json(403, {"error": "account is not active"})
                     return
                 if "compaction_prompt" in body:
                     cp = str(body["compaction_prompt"] or "")
@@ -19362,6 +22248,9 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "tools_disabled": _tools_disabled_list(u["username"])})
         elif path == "/api/upload":
             self._handle_upload()
+        elif path == "/api/cairnfiles":
+            # patch34 (W2): per-chat file space for the Chat files drawer.
+            self._handle_cairnfiles()
         elif path == "/api/conv/model":
             # F21 (K80 2026-09-23): per-chat provider/model override.
             # {"conversation_id": id, "provider": id|"", "model": str|""} -
@@ -19423,6 +22312,310 @@ class MaraHandler(BaseHTTPRequestHandler):
                                (payload, cid_in))
                 db.commit()
             self._json(200, {"conversation_id": cid_in, "model_override": payload})
+        elif path == "/api/mcp":
+            # U14 (patch22): probe the SAVED mcp_servers defs for the
+            # settings card. Nothing executes from the request body - only
+            # what is already saved (role-checked at save AND inside
+            # _mcp_servers_for). Per-server ok/count/tools/error.
+            u = self._need_user()
+            if not u:
+                return
+            raw = self._read_body()
+            if raw is None:
+                return
+            out22 = []
+            for defn in _mcp_servers_for(u["username"]):
+                tools22, err22 = _mcp_session(defn, MCP_TIMEOUT_INIT, _mcp_list_work)
+                names22 = []
+                for t in (tools22 or []):
+                    if isinstance(t, dict):
+                        names22.append(str(t.get("name") or "")[:64])
+                out22.append({"name": defn["name"], "ok": not err22,
+                              "count": len(tools22 or []), "tools": names22[:48],
+                              "error": (err22 or "")[:200]})
+            self._json(200, {"servers": out22})
+        elif path == "/api/embed":
+            # U11 (patch19): semantic-recall cache controls for the settings
+            # card. action=status -> counts; action=cache -> build a batch;
+            # action=recache -> wipe then build a batch. All per-user; all
+            # silent-fail with a message, never a stack trace.
+            u = self._need_user()
+            if not u:
+                return
+            raw = self._read_body()
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw)
+            except Exception:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            if not isinstance(body, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            who = u["username"]
+            act = body.get("action", "status")
+            conf = _embed_conf(who)
+            with sqlite3.connect(DB_PATH) as db:
+                total11 = db.execute(
+                    "SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id=m.conv_id "
+                    "WHERE c.user_id=? AND m.role IN ('user','assistant') "
+                    "AND length(trim(m.content)) > 0", (who,)).fetchone()[0]
+                if act == "recache":
+                    db.execute("DELETE FROM msg_vec WHERE username=?", (who,))
+                    db.commit()
+            if not conf:
+                self._json(200, {"enabled": False, "model": "", "cached": 0, "total": total11})
+                return
+            if act in ("cache", "recache"):
+                n = _vec_pending(who, conf, EMBED_BTN_BATCH)
+                if n < 0:
+                    self._json(200, {"ok": False, "error": "embedding call failed - check the model id and provider",
+                                     "enabled": True, "model": conf["model"]})
+                    return
+                log.info("U11: %s built %d vectors (%s)", who, n, conf["model"])
+            with sqlite3.connect(DB_PATH) as db:
+                cached11 = db.execute("SELECT COUNT(*) FROM msg_vec WHERE username=? AND model=?",
+                                      (who, conf["model"])).fetchone()[0]
+            self._json(200, {"enabled": True, "model": conf["model"], "cached": cached11, "total": total11})
+            return
+        elif path == "/api/prompts":
+            # U9 (patch17): named persona prompt library (Agora-inspired,
+            # K80 GO 2026-10-05). POST {} reads the list + active id;
+            # action=get {id} fetches one body for the editor; action=save
+            # creates/updates {id?, name, body}; action=activate switches the
+            # projected persona prompt (id '' = back to the inline custom
+            # instructions textarea); action=delete removes a row and
+            # deactivates it if it was active. Only _user_persona_block reads
+            # this table - nothing else in the daemon changes. Caps mirror
+            # the persona cap; 20 rows per user.
+            u = self._need_user()
+            if not u:
+                return
+            raw = self._read_body()
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw)
+            except Exception:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            if not isinstance(body, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            who = u["username"]
+            act = body.get("action", "")
+            if act == "save":
+                pid_in = body.get("id", "")
+                name_in = body.get("name", "")
+                text_in = body.get("body", "")
+                if not isinstance(pid_in, str) or not isinstance(name_in, str) or not isinstance(text_in, str):
+                    self._json(400, {"error": "id/name/body must be strings"})
+                    return
+                name_in = name_in.strip()[:120]
+                text_in = text_in.strip()[:USER_PERSONA_CAP]
+                if not name_in:
+                    self._json(400, {"error": "name is required"})
+                    return
+                if not text_in:
+                    self._json(400, {"error": "body is required"})
+                    return
+                if any((ord(ch) < 32 and ch != chr(10) and ch != chr(9)) or ord(ch) == 127 for ch in text_in + name_in):
+                    self._json(400, {"error": "text contains control characters"})
+                    return
+                now = time.time()
+                with sqlite3.connect(DB_PATH) as db:
+                    if pid_in:
+                        if not db.execute("SELECT id FROM prompts WHERE id=? AND username=?",
+                                          (pid_in, who)).fetchone():
+                            self._json(404, {"error": "not found"})
+                            return
+                        db.execute("UPDATE prompts SET name=?, body=?, updated=? WHERE id=? AND username=?",
+                                   (name_in, text_in, now, pid_in, who))
+                    else:
+                        n = db.execute("SELECT COUNT(*) FROM prompts WHERE username=?", (who,)).fetchone()[0]
+                        if n >= 20:
+                            self._json(400, {"error": "prompt library is full (20 max)"})
+                            return
+                        pid_in = str(uuid.uuid4())
+                        db.execute("INSERT INTO prompts (id, username, name, body, created, updated) VALUES (?,?,?,?,?,?)",
+                                   (pid_in, who, name_in, text_in, now, now))
+                    db.commit()
+                log.info("U9: %s saved prompt %.60s (%d chars)", who, name_in, len(text_in))
+                self._json(200, {"ok": True, "id": pid_in})
+                return
+            if act == "get":
+                pid_in = body.get("id", "")
+                with sqlite3.connect(DB_PATH) as db:
+                    row = db.execute("SELECT name, body FROM prompts WHERE id=? AND username=?",
+                                     (str(pid_in), who)).fetchone()
+                if not row:
+                    self._json(404, {"error": "not found"})
+                    return
+                self._json(200, {"name": row[0], "body": row[1]})
+                return
+            if act == "activate":
+                pid_in = body.get("id", "")
+                if not isinstance(pid_in, str):
+                    self._json(400, {"error": "id must be a string"})
+                    return
+                pid_in = pid_in.strip()
+                if pid_in:
+                    with sqlite3.connect(DB_PATH) as db:
+                        if not db.execute("SELECT id FROM prompts WHERE id=? AND username=?",
+                                          (pid_in, who)).fetchone():
+                            self._json(404, {"error": "not found"})
+                            return
+                set_setting("active_prompt", pid_in, who)
+                log.info("U9: %s activated prompt %s", who, pid_in or "(inline)")
+                self._json(200, {"ok": True, "active": pid_in})
+                return
+            if act == "delete":
+                pid_in = body.get("id", "")
+                if not isinstance(pid_in, str) or not pid_in.strip():
+                    self._json(400, {"error": "id is required"})
+                    return
+                pid_in = pid_in.strip()
+                with sqlite3.connect(DB_PATH) as db:
+                    cur = db.execute("DELETE FROM prompts WHERE id=? AND username=?", (pid_in, who))
+                    db.commit()
+                    gone = cur.rowcount > 0
+                if gone and (get_setting("active_prompt", "", who) or "").strip() == pid_in:
+                    set_setting("active_prompt", "", who)
+                self._json(200, {"ok": True, "deleted": gone})
+                return
+            with sqlite3.connect(DB_PATH) as db:
+                rows = db.execute("SELECT id, name, length(body), updated FROM prompts WHERE username=? ORDER BY updated DESC",
+                                  (who,)).fetchall()
+            self._json(200, {
+                "items": [{"id": r[0], "name": r[1], "chars": r[2], "updated": r[3]} for r in rows],
+                "active": (get_setting("active_prompt", "", who) or ""),
+            })
+        elif path == "/api/conv/sysprompt":
+            # U3 (patch15): per-conversation system notes. POST with
+            # {"conversation_id": id} reads the current text; adding "text"
+            # writes it ('' clears). Ownership enforced; clamped to 8000 chars;
+            # control characters other than tab/newline are rejected.
+            u = self._need_user()
+            if not u:
+                return
+            raw = self._read_body()
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw)
+            except Exception:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            if not isinstance(body, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            cid_in = body.get("conversation_id", "")
+            if not isinstance(cid_in, str) or not _valid_conv_id(cid_in):
+                self._json(400, {"error": "invalid conversation_id"})
+                return
+            if not self._conv_owner(cid_in, u["username"]):
+                self._json(404, {"error": "not found"})
+                return
+            if "text" not in body:
+                with sqlite3.connect(DB_PATH) as db:
+                    row = db.execute("SELECT sys_extra FROM conversations WHERE id=?", (cid_in,)).fetchone()
+                self._json(200, {"text": (row[0] if row and row[0] else "")})
+                return
+            txt_in = body["text"]
+            if txt_in is None:
+                txt_in = ""
+            if not isinstance(txt_in, str):
+                self._json(400, {"error": "text must be a string"})
+                return
+            txt_in = txt_in.strip()[:8000]
+            if any((ord(ch) < 32 and ch != chr(10) and ch != chr(9)) or ord(ch) == 127 for ch in txt_in):
+                self._json(400, {"error": "text contains control characters"})
+                return
+            with sqlite3.connect(DB_PATH) as db:
+                db.execute("UPDATE conversations SET sys_extra=? WHERE id=? AND user_id=?",
+                           (txt_in, cid_in, u["username"]))
+                db.commit()
+            log.info("U3: %s set conversation notes for %s (%d chars)", u["username"], cid_in, len(txt_in))
+            self._json(200, {"ok": True, "length": len(txt_in)})
+        elif path == "/api/conv/fork":
+            # U4 (patch15): fork = copy THIS conversation into a brand-new one
+            # for the same user. New conv id, new message ids, duplicated
+            # attachment rows AND files (the fork survives deleting the
+            # original - files are copied, so quota doubles for that content;
+            # same trade the import archive makes). Deliberately NOT copied:
+            # compactions (the fork shows full history; if it overruns the
+            # budget, normal compaction runs on its next message) and
+            # model_override (account defaults rule the fork).
+            u = self._need_user()
+            if not u:
+                return
+            raw = self._read_body()
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw)
+            except Exception:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            if not isinstance(body, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            cid_in = body.get("conversation_id", "")
+            if not isinstance(cid_in, str) or not _valid_conv_id(cid_in):
+                self._json(400, {"error": "invalid conversation_id"})
+                return
+            if not self._conv_owner(cid_in, u["username"]):
+                self._json(404, {"error": "not found"})
+                return
+            new_cid = str(uuid.uuid4())
+            now = time.time()
+            with sqlite3.connect(DB_PATH) as db:
+                db.execute("BEGIN IMMEDIATE")
+                crow = db.execute("SELECT title, sys_extra FROM conversations WHERE id=? AND user_id=?",
+                                  (cid_in, u["username"])).fetchone()
+                if not crow:
+                    self._json(404, {"error": "not found"})
+                    return
+                title = (str(crow[0] or "New Chat") + " (fork)")[:120]
+                db.execute(
+                    "INSERT INTO conversations (id, title, created_at, updated_at, user_id, model_override, guest_id, sys_extra) VALUES (?,?,?,?,?,?,?,?)",
+                    (new_cid, title, now, now, u["username"], None, None, crow[1] or ""))
+                id_map = {}
+                for ar in db.execute(
+                        "SELECT id, name, stored_name, mime, size, source, kind, ts, folder FROM attachments WHERE conv_id=?",
+                        (cid_in,)).fetchall():
+                    aid = str(uuid.uuid4())
+                    id_map[str(ar[0])] = aid
+                    db.execute(
+                        "INSERT INTO attachments (id, conv_id, name, stored_name, mime, size, source, kind, ts, user_id, folder) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (aid, new_cid, ar[1], ar[2], ar[3], ar[4], ar[5], ar[6], ar[7], u["username"], ar[8]))
+                for mr in db.execute(
+                        "SELECT role, content, tool_calls, ts, attachments, reasoning, stopped FROM messages WHERE conv_id=? ORDER BY ts",
+                        (cid_in,)).fetchall():
+                    att_col = mr[4]
+                    if att_col and id_map:
+                        try:
+                            alist = json.loads(att_col)
+                            if isinstance(alist, list):
+                                for a in alist:
+                                    if isinstance(a, dict) and str(a.get("id", "")) in id_map:
+                                        a["id"] = id_map[str(a.get("id", ""))]
+                                att_col = json.dumps(alist)
+                        except Exception:
+                            pass  # unreadable manifest rides along untouched
+                    db.execute(
+                        "INSERT INTO messages (id, conv_id, role, content, tool_calls, ts, attachments, reasoning, stopped, compacted_at) VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                        (str(uuid.uuid4()), new_cid, mr[0], mr[1], mr[2], mr[3], att_col, mr[5], mr[6]))
+                db.commit()
+            try:
+                src_dir = UPLOADS_DIR / cid_in
+                if src_dir.is_dir():
+                    shutil.copytree(src_dir, UPLOADS_DIR / new_cid)
+            except Exception:
+                log.warning("U4: fork %s: attachment file copy failed (chips/inline degrade to missing)", new_cid)
+            log.info("U4: %s forked %s -> %s", u["username"], cid_in, new_cid)
+            self._json(200, {"ok": True, "conversation_id": new_cid, "title": title})
         elif path == "/api/stop":
             self._handle_stop()
         elif path == "/api/account/password":
@@ -20376,6 +23569,18 @@ class MaraHandler(BaseHTTPRequestHandler):
         if not isinstance(att_ids, list):
             self._json(400, {"error": "attachments must be a list"})
             return
+        # iter6 (K80 2026-10-04): composer quick-settings hints from the
+        # client. RESTRICT-ONLY by construction: they can only SUBTRACT
+        # from the server-computed eff_tools ceiling (never a union, so a
+        # hostile client cannot grant itself anything). True/absent only -
+        # any other type is just not True and changes nothing.
+        qs_off_shell = body.get("off_shell") is True
+        qs_off_web = body.get("off_web") is True
+        qs_off_think = body.get("off_think") is True
+        if qs_off_shell:
+            eff_tools = eff_tools - frozenset(("execute_shell", "ssh_run", "run_with_secret"))
+        if qs_off_web:
+            eff_tools = eff_tools - frozenset(("web_search", "web_fetch"))
         if not message and not att_ids:
             self._json(400, {"error": "message or attachments required"})
             return
@@ -20418,12 +23623,17 @@ class MaraHandler(BaseHTTPRequestHandler):
             # P3.6d single-flight: one generation per conversation at a time
             self._json(409, {"error": "generation in flight for this conversation"})
             return
+        # P26: per-connection write lock + heartbeat stop flag. Born BEFORE
+        # the big try so the R9-B3 finally can silence the pinger on every
+        # possible exit path (including the pre-SSE 400/503 returns).
+        _p26_wlock = Lock()
+        _p26_stop = Event()
         try:
             # P3.2: resolve attachment ids for this conversation (unknown/foreign
             # ids are ignored; the all-unknown case is rejected below)
             atts = []
             if att_ids:
-                if not isinstance(att_ids, list) or len(att_ids) > MAX_ATTACH_PER_MSG:
+                if not isinstance(att_ids, list) or len(att_ids) > MAX_ATTACH_PER_MSG_CHAT:
                     # F21/P1-J: release the reserved recorder on EVERY early exit
                     # (house pattern = context-build failure below). Pre-fix, an
                     # early 400/503 after _p1i_reserve_stream left the recorder in
@@ -20431,7 +23641,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     # by the F21 503 harness - reachable since 0.6e with any
                     # no-key 503).
                     _close_stream_rec(conv_id)
-                    self._json(400, {"error": "attachments must be a list of at most " + str(MAX_ATTACH_PER_MSG) + " ids"})
+                    self._json(400, {"error": "attachments must be a list of at most " + str(MAX_ATTACH_PER_MSG_CHAT) + " ids"})
                     return
                 with sqlite3.connect(DB_PATH) as db:
                     for aid in att_ids:
@@ -20472,7 +23682,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 # Load history
                 db.row_factory = sqlite3.Row
                 history = db.execute(
-                    "SELECT id, role, content, attachments, stopped FROM messages WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL ORDER BY ts",  # F28/C1
+                    "SELECT id, role, content, attachments, stopped FROM messages WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",  # F28/C1
                     (conv_id,)
                 ).fetchall()
                 db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
@@ -20493,11 +23703,17 @@ class MaraHandler(BaseHTTPRequestHandler):
                 # client must never hold the global stream lock hostage).
                 _p1i_dispatch(rec, (event_type, data))
                 try:
-                    self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
-                    self.wfile.flush()
+                    with _p26_wlock:
+                        self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
+                        self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass  # client gone — work continues (P3.6d)
 
+            # P26: heartbeat starts AFTER send_event exists and BEFORE the
+            # first model byte is even requested - the silence it defends is
+            # the pre-first-token window. Shares _p26_wlock with send_event.
+            Thread(target=_p26_pinger, args=(self.wfile, _p26_wlock, _p26_stop),
+                   daemon=True).start()
             send_event("status", {"phase": "waking up"})
             # V13 (0.6w): announce the claimed conversation id on the wire BEFORE
             # any model work - the guest page adopts it (localStorage) on this
@@ -20533,7 +23749,18 @@ class MaraHandler(BaseHTTPRequestHandler):
             _CANCEL_EVENTS[conv_id] = cancel
             rec["cancel"] = cancel
             try:
-                assistant_text, assistant_reasoning, tool_log = agent_loop(messages, model_cfg, send_event, cancel,
+                # iter6: Thinking OFF = no reasoning reaches the stream,
+                # the recorder, or the DB for THIS turn. The model may
+                # still think internally (providers decide); we just
+                # never show or keep it. Tool offers already narrowed via
+                # eff_tools above.
+                _qs_send = send_event
+                if qs_off_think:
+                    def _qs_send(event_type, data, _se=send_event):
+                        if event_type == "reasoning":
+                            return
+                        return _se(event_type, data)
+                assistant_text, assistant_reasoning, tool_log = agent_loop(messages, model_cfg, _qs_send, cancel,
                                                                            username=uname, allow_tools=allow_tools,
                                                                            tool_names=eff_tools,
                                                                            conv_id=conv_id, files_sink=turn_files)
@@ -20557,7 +23784,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                     db.execute(
                         "INSERT INTO messages (id, conv_id, role, content, reasoning, tool_calls, stopped, ts, attachments) VALUES (?,?,?,?,?,?,?,?,?)",
                         (str(uuid.uuid4()), conv_id, "assistant", assistant_text,
-                         assistant_reasoning or None,
+                         (None if qs_off_think else (assistant_reasoning or None)),
                          json.dumps(tool_log) if tool_log else None,
                          stopped_flag,
                          time.time(),
@@ -20617,6 +23844,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             send_event("done", _done)
             _close_stream_rec(conv_id)
         finally:
+            _p26_stop.set()  # P26: silence the heartbeat on EVERY exit
             # R9-B3: generation runs INLINE here (no thread takes
             # ownership), so the recorder must be dead at every exit
             # from this handler. _close_stream_rec is an idempotent
@@ -20793,6 +24021,7 @@ class MaraHandler(BaseHTTPRequestHandler):
         # T-V23 (C9 tail): a numeric name used to crash .replace() inside
         # _safe_upload_name. str() first; the sanitizer still has the last word.
         name = _safe_upload_name(str(body.get("name") or ""))
+        folder34 = _safe_att_folder(body.get("folder"))  # patch34 (W2)
         # P1-C/F4 (round-2 audit): the client-declared type is a rumor. SVG
         # is a script carrier and html/xhtml can be snorted; none of them get
         # to be stored as an inlineable image/* type. The serve path decides
@@ -20862,10 +24091,11 @@ class MaraHandler(BaseHTTPRequestHandler):
                 db.execute(
                     "INSERT INTO attachments (id, conv_id, name, stored_name,"
                     " mime, size, source, kind, ts, user_id, guest_id,"
-                    " pending_until) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " pending_until, folder) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (att_id, conv_id, name, stored_name, mime, len(raw),
                      body.get("source") if body.get("source") in ("file", "camera") else "file",
-                     kind, _now, uname, _g03, _now + UPLOAD_PENDING_SECS))
+                     kind, _now, uname, _g03, _now + UPLOAD_PENDING_SECS,
+                     folder34))
                 db.commit()
         except QuotaExceeded as e:
             self._json(507, {"error": str(e)})
@@ -21027,6 +24257,119 @@ class MaraHandler(BaseHTTPRequestHandler):
                         pass
         self._json(200, {"ok": True, "removed": removed})
 
+    def _handle_cairnfiles(self):
+        # patch34 (K80 W2 2026-10-06): CAIRN Files — the per-chat file space
+        # behind the "Chat files" attach drawer. Ops: list / mkdir / rmdir /
+        # delete. folder is a LOGICAL column on attachments; disk layout stays
+        # flat (uploads/<conv>/<stored_name>) so serve, quota, orphan prune,
+        # and F22 export keep working exactly as built. Ownership is
+        # _conv_owner — the same posture as attachment-get, guest isolation
+        # included. NOTE (by design): delete removes the bytes for real — an
+        # older message that referenced this attachment loses its preview.
+        u = self._need_user()
+        if not u:
+            return
+        raw = self._read_body()
+        if raw is None:
+            return
+        try:
+            body = json.loads(raw)
+        except Exception:
+            self._json(400, {"error": "invalid JSON body"})
+            return
+        if not isinstance(body, dict):
+            self._json(400, {"error": "invalid JSON body"})
+            return
+        cid_in = body.get("conversation_id", "")
+        if not isinstance(cid_in, str) or not _valid_conv_id(cid_in):
+            self._json(400, {"error": "invalid conversation_id"})
+            return
+        if not self._conv_owner(cid_in, u["username"]):
+            self._json(404, {"error": "not found"})
+            return
+        op = str(body.get("op") or "list")
+        if op == "list":
+            with sqlite3.connect(DB_PATH) as db:
+                rows = db.execute(
+                    "SELECT id, name, folder, mime, size, kind, ts FROM attachments"
+                    " WHERE conv_id=? ORDER BY ts DESC LIMIT 500", (cid_in,)).fetchall()
+                expl = db.execute("SELECT folder FROM conv_folders WHERE conv_id=?",
+                                  (cid_in,)).fetchall()
+            files = [{"id": r[0], "name": r[1], "folder": r[2] or "",
+                      "mime": r[3] or "", "size": r[4], "kind": r[5] or "binary",
+                      "ts": r[6]} for r in rows]
+            seen = set()
+            for f in files:
+                if f["folder"]:
+                    segs = f["folder"].split("/")
+                    for i in range(1, len(segs) + 1):
+                        seen.add("/".join(segs[:i]))
+            for r in expl:
+                if r[0]:
+                    fsegs = r[0].split("/")
+                    for i in range(1, len(fsegs) + 1):
+                        seen.add("/".join(fsegs[:i]))
+            self._json(200, {"files": files, "folders": sorted(seen)})
+            return
+        fold = _safe_att_folder(body.get("folder"))
+        if op == "mkdir":
+            if not fold:
+                self._json(400, {"error": "folder name required"})
+                return
+            with sqlite3.connect(DB_PATH) as db:
+                db.execute("INSERT OR IGNORE INTO conv_folders (conv_id, folder, user_id, ts)"
+                           " VALUES (?,?,?,?)", (cid_in, fold, u["username"], time.time()))
+                db.commit()
+            self._json(200, {"ok": True, "folder": fold})
+            return
+        if op == "rmdir":
+            if not fold:
+                self._json(400, {"error": "folder name required"})
+                return
+            with sqlite3.connect(DB_PATH) as db:
+                for r in db.execute("SELECT DISTINCT folder FROM attachments WHERE conv_id=?",
+                                    (cid_in,)).fetchall():
+                    v = r[0] or ""
+                    if v == fold or v.startswith(fold + "/"):
+                        self._json(400, {"error": "folder not empty"})
+                        return
+                db.execute("DELETE FROM conv_folders WHERE conv_id=? AND folder=?",
+                           (cid_in, fold))
+                db.commit()
+            self._json(200, {"ok": True, "folder": fold})
+            return
+        if op == "delete":
+            aid_in = body.get("id")
+            if not isinstance(aid_in, str) or not aid_in:
+                self._json(400, {"error": "id required"})
+                return
+            with sqlite3.connect(DB_PATH) as db:
+                row = db.execute(
+                    "SELECT conv_id, stored_name, size, user_id FROM attachments"
+                    " WHERE id=? AND conv_id=?", (aid_in, cid_in)).fetchone()
+                if not row:
+                    self._json(404, {"error": "not found"})
+                    return
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    db.execute("DELETE FROM attachments WHERE id=?", (aid_in,))
+                    _quota_release(db, row[3] or u["username"], int(row[2] or 0))
+                    db.commit()
+                except sqlite3.Error:
+                    db.execute("ROLLBACK")
+                    self._json(500, {"error": "could not delete"})
+                    return
+            try:
+                _fp = _att_path(row[0], row[1])
+                if _fp.is_file():
+                    _fp.unlink()
+            except OSError:
+                log.warning("patch34: attachment %s row deleted, bytes still on disk", aid_in)
+            log.info("patch34: %s deleted attachment %s from %s", u["username"], aid_in, cid_in)
+            self._json(200, {"ok": True})
+            return
+        self._json(400, {"error": "unknown op"})
+
     def _handle_attachment_get(self, att_id, username):
         """P3.2: serve an attachment (GUI thumbnails, downloads). DB-lookup only — no raw paths."""
         with sqlite3.connect(DB_PATH) as db:
@@ -21115,6 +24458,43 @@ class MaraHandler(BaseHTTPRequestHandler):
         finally:
             Path(tmp).unlink(missing_ok=True)
 
+    def _read_raw_import(self, cap):
+        """PATCH28/U19: stream a raw POST body to a 0600 temp file in the state
+        dir. Returns the path on success; returns None AFTER answering
+        (413/400/500). Nothing is buffered whole in RAM - that is the whole
+        point of this door. Chunked reads ride the handler socket timeout per
+        gap, so a stalled upload dies cleanly instead of pinning a thread."""
+        import tempfile as _p28_tf
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length < 4 or length > cap:
+            self._json(413, {"error": "raw archive must be between 4 B and %d MB" % (cap // 1048576)})
+            return None
+        _fd, _p = _p28_tf.mkstemp(prefix="import-raw-", dir=str(Path(DB_PATH).parent))
+        try:
+            _left = length
+            with os.fdopen(_fd, "wb") as _f:
+                while _left > 0:
+                    _buf = self.rfile.read(min(1048576, _left))
+                    if not _buf:
+                        break
+                    _f.write(_buf)
+                    _left -= len(_buf)
+            if _left != 0:
+                os.unlink(_p)
+                self._json(400, {"error": "upload truncated mid-body"})
+                return None
+            return _p
+        except Exception:
+            log.exception("Raw import upload failed")
+            try:
+                os.unlink(_p)
+            except OSError:
+                pass
+            self._json(500, {"error": "upload failed"})
+            return None
     def _handle_import(self):
         """S4f7: POST /api/import {name, data(b64), restore} - detect and import a
         Cairn/Agora (.cairn/.agora), ChatGPT, or Claude archive into the caller's
@@ -21123,36 +24503,56 @@ class MaraHandler(BaseHTTPRequestHandler):
         u = self._need_user()
         if not u:
             return
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            length = 0
-        if length > IMPORT_BODY_MAX:
-            self._json(413, {"error": "archive too large (64 MB decoded cap)"})
-            return
-        body = self._json_object_body(IMPORT_BODY_MAX)
-        if body is None:
-            # P1-C/F1: the helper already answered (400/413) - early return.
-            return
-        data = body.get("data")
-        if not isinstance(data, str) or not data:
-            self._json(400, {"error": "data (base64) required"})
-            return
-        try:
-            raw = base64.b64decode(data, validate=True)
-        except Exception:
-            self._json(400, {"error": "invalid base64 data"})
-            return
-        if len(raw) > IMPORT_MAX_BYTES:
-            self._json(413, {"error": "archive too large (64 MB decoded cap)"})
-            return
-        restore = bool(body.get("restore"))
+        # PATCH28/U19: two transport doors, one importer. The JSON door (the
+        # long-standing default: base64 inside a JSON POST) is behaviorally
+        # UNTOUCHED. The raw door (client streams the file bytes as the body
+        # with header X-Cairn-Raw: 1) lands in a 0600 temp file and the ZIP
+        # opens from disk - a 634 MB .agora cannot be base64'd in a phone
+        # browser and must not be buffered whole here either. Restore flags
+        # ride headers on this door (X-Cairn-Restore / X-Cairn-Restore-Identity).
+        body = None
+        raw = None
+        raw_path = None
+        if self.headers.get("X-Cairn-Raw") == "1":
+            raw_path = self._read_raw_import(IMPORT_RAW_MAX)
+            if raw_path is None:
+                return   # helper already answered (413/400/500)
+        else:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length > IMPORT_BODY_MAX:
+                self._json(413, {"error": "archive too large (64 MB decoded cap)"})
+                return
+            body = self._json_object_body(IMPORT_BODY_MAX)
+            if body is None:
+                # P1-C/F1: the helper already answered (400/413) - early return.
+                return
+            data = body.get("data")
+            if not isinstance(data, str) or not data:
+                self._json(400, {"error": "data (base64) required"})
+                return
+            try:
+                raw = base64.b64decode(data, validate=True)
+            except Exception:
+                self._json(400, {"error": "invalid base64 data"})
+                return
+            if len(raw) > IMPORT_MAX_BYTES:
+                self._json(413, {"error": "archive too large (64 MB decoded cap)"})
+                return
+        restore = bool((body or {}).get("restore")) or self.headers.get("X-Cairn-Restore") == "1"
         if restore and u["username"] != DAEMON_OWNER:
             self._json(403, {"error": "restore (memory + system prompt + settings) is for this instance's principal only"})
             return
         # P1-D/B2 (round-3 audit): identity (memory + system prompt) split
         # from settings restore - its own flag, its own principal gate.
-        restore_identity = bool(body.get("restore_identity"))
+        # U21 (patch36): secrets import is its OWN door — opt-in, principal-only.
+        import_secrets = bool((body or {}).get("import_secrets")) or self.headers.get("X-Cairn-Import-Secrets") == "1"
+        if import_secrets and u["username"] != DAEMON_OWNER:
+            self._json(403, {"error": "secrets import is for this instance's principal only"})
+            return
+        restore_identity = bool((body or {}).get("restore_identity")) or self.headers.get("X-Cairn-Restore-Identity") == "1"
         if restore_identity and u["username"] != DAEMON_OWNER:
             self._json(403, {"error": "identity restore (memory + system prompt) is for this instance's principal only"})
             return
@@ -21161,8 +24561,8 @@ class MaraHandler(BaseHTTPRequestHandler):
         chatgpt_convs = None
         claude_convs = None
         try:
-            if raw[:4] == b"PK\x03\x04":
-                zf = zipfile.ZipFile(io.BytesIO(raw))
+            if raw_path is not None or raw[:4] == b"PK\x03\x04":
+                zf = zipfile.ZipFile(raw_path) if raw_path is not None else zipfile.ZipFile(io.BytesIO(raw))
                 names = zf.namelist()
                 # P1-B (audit): expansion caps. They trust the ZIP's declared
                 # sizes - which is the point: a bomb must DECLARE its intent
@@ -21172,8 +24572,11 @@ class MaraHandler(BaseHTTPRequestHandler):
                 if len(_zi) > 5000:
                     self._json(400, {"error": "archive has too many members"})
                     return
-                if sum(i.file_size for i in _zi) > 400 * 1024 * 1024 \
-                        or any(i.file_size > 64 * 1024 * 1024 for i in _zi):
+                _zc_m, _zc_t = ((IMPORT_RAW_MEMBER_MAX, IMPORT_RAW_TOTAL_MAX)
+                                if raw_path is not None
+                                else (64 * 1024 * 1024, 400 * 1024 * 1024))
+                if (sum(i.file_size for i in _zi) > _zc_t
+                        or any(i.file_size > _zc_m for i in _zi)):
                     self._json(400, {"error": "archive expands too large"})
                     return
                 if "manifest.json" in names:
@@ -21235,7 +24638,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 return
             if fmt == "cairn":
                 try:
-                    stats, restored = _import_cairn_archive(zf, u["username"], restore, restore_identity)
+                    stats, restored = _import_cairn_archive(zf, u["username"], restore, restore_identity, import_secrets)
                 except QuotaExceeded as qe:
                     # A5/V10 (round-9): import output now rides the V15 quota
                     # ledger; a refusal is the same 507 the upload path gives.
@@ -21271,6 +24674,11 @@ class MaraHandler(BaseHTTPRequestHandler):
                 try:
                     zf.close()
                 except Exception:
+                    pass
+            if raw_path is not None:
+                try:
+                    os.unlink(raw_path)
+                except OSError:
                     pass
 
     def _handle_export(self, path, username):
