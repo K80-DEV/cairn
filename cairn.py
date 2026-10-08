@@ -15440,16 +15440,53 @@ function _refreshCtx27(id) {
   fetch('api/ctx?conv=' + encodeURIComponent(id)).then(function (r) { return r.ok ? r.json() : null; })
     .then(function (c) { if (c && currentConv === id) _paintCtx27(c); }).catch(function () {});
 }
+/* PATCH47/U30 (K80 2026-10-07): one page on open, "Load earlier" prepends
+   the rest on demand. No-param server contract untouched for the export
+   builder; here we always send ?limit so we get the cursor object. */
+const PAGE47 = 400;
+var _pg47 = {conv: null, older: null, has: false, rows: []};
 async function loadMessages(id) {
-  chatCol.querySelectorAll('.msg, .toolrow, .thinking, .thinkcard').forEach((n) => n.remove());
-  let data = [];
+  let o = null;
   try {
-    const r = await fetch('api/conversations/' + id + '/messages');
-    data = await r.json();
+    const r = await fetch('api/conversations/' + id + '/messages?limit=' + PAGE47);
+    o = await r.json();
   } catch (e) {
+    chatCol.querySelectorAll('.msg, .toolrow, .thinking, .thinkcard').forEach((n) => n.remove());
     addMsgDiv('assistant', '[Could not load this conversation.]');
     return;
   }
+  const data = Array.isArray(o) ? o : ((o && o.messages) || []);
+  _pg47 = {conv: id, older: Array.isArray(o) ? null : ((o && o.older) || null),
+           has: !Array.isArray(o) && !!(o && o.has_more), rows: data.slice()};
+  await renderMsgs47(id, _pg47.rows, true);
+}
+async function older47(btn) {
+  if (!btn || btn.disabled || !_pg47.older) return;
+  btn.disabled = true; btn.textContent = 'Loading earlier messages\u2026';
+  let o = null;
+  try {
+    const r = await fetch('api/conversations/' + _pg47.conv + '/messages?limit=' + PAGE47 + '&before=' + encodeURIComponent(_pg47.older));
+    o = await r.json();
+  } catch (e) { o = null; }
+  if (!o || !Array.isArray(o.messages)) { btn.disabled = false; btn.textContent = 'Could not load - tap to retry'; return; }
+  _pg47.rows = o.messages.concat(_pg47.rows);
+  _pg47.older = o.older || null; _pg47.has = !!o.has_more;
+  const _dh47 = chatArea.scrollHeight - chatArea.scrollTop;  // keep the reader anchored
+  await renderMsgs47(_pg47.conv, _pg47.rows, false);
+  chatArea.scrollTop = chatArea.scrollHeight - _dh47;
+}
+function mountOlder47() {
+  const gone = document.getElementById('older47'); if (gone) gone.remove();
+  if (!_pg47.conv || !_pg47.has || !_pg47.older) return;
+  const b = document.createElement('button');
+  b.id = 'older47';
+  b.textContent = 'Load earlier messages';
+  b.style.cssText = 'display:block;margin:4px auto 12px auto;padding:6px 14px;border-radius:14px;border:1px solid rgba(150,150,150,0.4);background:transparent;color:#bbb;cursor:pointer;font-size:12px';
+  b.onclick = function () { older47(b); };
+  chatCol.insertBefore(b, chatCol.firstChild);
+}
+async function renderMsgs47(id, data, fresh) {
+  chatCol.querySelectorAll('.msg, .toolrow, .thinking, .thinkcard').forEach((n) => n.remove());
   if (!data.length) { showEmpty(); exportBtn.hidden = true; return; }
   hideEmpty();
   exportBtn.hidden = false;
@@ -15523,8 +15560,8 @@ async function loadMessages(id) {
       _cn = _cn.nextElementSibling;
     }
   }
-  scrollBottom(true);
-  attachStream(id);
+  mountOlder47();
+  if (fresh) { scrollBottom(true); attachStream(id); }
 }
 
 async function switchConv(id) {
@@ -20679,15 +20716,51 @@ class MaraHandler(BaseHTTPRequestHandler):
             if not self._conv_owner(conv_id, u["username"]):
                 self._json(404, {"error": "not found"})
                 return
+            # PATCH47/U30 (K80 2026-10-07): OPT-IN pagination. ?limit=N pages
+            # the tail of the transcript; NO limit = exact legacy full array
+            # (export/share mini-chat parses it raw). Cursor "ts|rowid" ties
+            # broken by rowid because import-era identical-ts rows are real.
+            _q47 = dict(_nc_up.parse_qsl(_nc_up.urlsplit(self.path).query))
+            _lim47 = 0
+            try:
+                if _q47.get("limit"):
+                    _lim47 = max(1, min(2000, int(_q47["limit"])))
+            except Exception:
+                _lim47 = 0
+            _cur47 = _q47.get("before") or ""
             with sqlite3.connect(DB_PATH) as db:
                 db.row_factory = sqlite3.Row
-                rows = db.execute(
-                    "SELECT role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts",  # U10
-                    (conv_id,)
-                ).fetchall()
+                _more47 = False
+                _tot47 = 0
+                if _lim47:
+                    _w47 = "conv_id=? AND role IN ('user','assistant')"
+                    _a47 = [conv_id]
+                    if _cur47 and "|" in _cur47:
+                        try:
+                            _cts47, _crd47 = _cur47.rsplit("|", 1)
+                            _a47 += [float(_cts47), float(_cts47), int(_crd47)]
+                            _w47 += " AND (ts < ? OR (ts = ? AND rowid < ?))"
+                        except Exception:
+                            pass  # junk cursor = first page, never a 500
+                    rows = db.execute(
+                        "SELECT rowid AS _rid47, role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at "
+                        "FROM messages WHERE " + _w47 + " ORDER BY ts DESC, rowid DESC LIMIT ?",
+                        _a47 + [_lim47 + 1]
+                    ).fetchall()
+                    _more47 = len(rows) > _lim47
+                    rows = list(rows)[:_lim47][::-1]
+                    _tot47 = db.execute(
+                        "SELECT count(1) FROM messages WHERE conv_id=? AND role IN ('user','assistant')",
+                        (conv_id,)).fetchone()[0]
+                else:
+                    rows = db.execute(
+                        "SELECT role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts",  # U10
+                        (conv_id,)
+                    ).fetchall()
                 out = []
                 for r in rows:
                     d = dict(r)
+                    d.pop("_rid47", None)  # PATCH47/U30: internal, never served
                     if d.get("attachments"):
                         try:
                             d["attachments"] = json.loads(d["attachments"])
@@ -20705,7 +20778,14 @@ class MaraHandler(BaseHTTPRequestHandler):
                     if not d.get("reasoning"):
                         d["reasoning"] = None
                     out.append(d)
-                self._json(200, out)
+                if _lim47:
+                    _old47 = None
+                    if _more47 and len(rows):
+                        _old47 = "%s|%d" % (rows[0]["ts"], rows[0]["_rid47"])
+                    self._json(200, {"messages": out, "older": _old47,
+                                     "has_more": _more47, "total": _tot47})
+                else:
+                    self._json(200, out)
         elif path == "/api/ctx":  # PATCH41/U25: honest numbers for the top-bar context meter
             # What the NEXT request would actually carry: effective system
             # prompt (identity + memory + persona + skills, same estimator
