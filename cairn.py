@@ -14707,8 +14707,8 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .composer.grabbable{padding-top:14px}
 .composer.grabbable::before{content:'';position:absolute;top:4px;left:50%;transform:translateX(-50%);width:44px;height:5px;border-radius:3px;background:var(--dim);opacity:.5;pointer-events:none}
 .composer.expanded{position:fixed;inset:0;z-index:96;padding-top:calc(14px + env(safe-area-inset-top));display:flex;flex-direction:column;animation:expin .22s cubic-bezier(.22,.9,.28,1)}
-.composer.expanded .composer-col{flex:1;display:grid;grid-template-rows:1fr auto auto;grid-template-columns:auto auto 1fr auto auto;min-height:0;overflow-y:auto}  /* PATCH52/U35: column->grid so icons share the bottom row (K80 20:49 'shitty almost') */
-.composer.expanded #msgInput{grid-row:1;grid-column:1/-1;max-height:none;height:auto;min-height:120px}
+.composer.expanded .composer-col{flex:1;width:100%;display:grid;grid-template-rows:1fr auto auto;grid-template-columns:auto auto 1fr auto auto;min-height:0;overflow-y:auto}  /* PATCH52/U35: column->grid so icons share the bottom row (K80 20:49 'shitty almost') */
+.composer.expanded #msgInput{grid-row:1;grid-column:1/-1;max-height:none;height:100%!important;min-height:120px;width:100%}
 .composer.expanded #chatModelBar{grid-row:2;grid-column:1/-1;max-width:100%}
 .composer.expanded #attachBtn{grid-row:3;grid-column:1}
 .composer.expanded #qsBtn{grid-row:3;grid-column:2}
