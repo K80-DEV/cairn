@@ -14602,7 +14602,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .thoughts[open] summary::after{transform:rotate(270deg)}
 .thoughts summary::-webkit-details-marker{display:none}
 .thoughts-body{font-size:12.5px;color:var(--dim);white-space:pre-wrap;word-wrap:break-word;max-height:280px;overflow-y:auto;margin-top:4px;line-height:1.5}
-.toolrow{align-self:stretch;display:flex;flex-direction:column;gap:6px;max-width:94%}.ctxout{opacity:.40;transition:opacity .3s}
+.toolrow{align-self:stretch;display:flex;flex-direction:column;gap:6px;max-width:94%}.ctxout{transition:opacity .24s}body.rollout .ctxout{opacity:.38}  /* PATCH50/U33: opt-in, Agora parity .38/.24s */
 .thinkcard{align-self:stretch;max-width:94%;border:1px solid var(--border);border-radius:12px;padding:9px 13px;background:var(--surface);display:flex;gap:9px;align-items:center;cursor:pointer;min-height:30px;box-sizing:border-box}
 .thinkcard .tlogo{flex:none;width:16px;height:16px;display:inline-flex}
 .thinkcard .tcname{font-size:12.5px;font-weight:600;color:var(--text);white-space:nowrap}
@@ -14857,6 +14857,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
          path stays in the daemon, dormant: no client ever sends off_think. -->
     <button id="qsWeb" class="cpop-item"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>Web Search<span class="qsw">on</span></button>
     <button id="qsShell" class="cpop-item"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg>Shell<span class="qsw">on</span></button>
+    <button id="qsRoll" class="cpop-item" title="dim the rows this chat's context no longer carries (Agora-style roll-out view)"><svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 11-11 11-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>Context Roll-Out<span class="qsw">off</span></button>
     <button id="qsCompact" class="cpop-item" title="fold this chat's older history into a continuity handoff, now"><svg viewBox="0 0 24 24"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg>Context Compact</button>
     <div class="cpop-head">switching one off restricts your next messages - it never grants</div>
   </div>
@@ -16401,29 +16402,36 @@ document.addEventListener('click', function (e) {
 // client-side request to use LESS (per browser, persisted). The server
 // treats off_* body flags as subtractions from its own ceiling.
 const qsPop = $('qsPop');
-let qsState = { think: true, web: true, shell: true };
+let qsState = { think: true, web: true, shell: true, roll: false };  // PATCH50/U33: roll-out dim default off (Agora parity)
 try {
   const q = JSON.parse(localStorage.getItem('cairn-qs') || 'null');
   if (q && typeof q === 'object') {
     if (q.think === false) qsState.think = false;
     if (q.web === false) qsState.web = false;
     if (q.shell === false) qsState.shell = false;
+    if (q.roll === true) qsState.roll = true;  // PATCH50/U33: opt-in only
   }
 } catch (e) {}
 function qsSave() { try { localStorage.setItem('cairn-qs', JSON.stringify(qsState)); } catch (e) {} }
 function qsPaint() {
-  ['web', 'shell'].forEach(function (k) {
-    const row = $(k === 'web' ? 'qsWeb' : 'qsShell');
+  [['web', 'qsWeb'], ['shell', 'qsShell'], ['roll', 'qsRoll']].forEach(function (p) {
+    const row = $(p[1]);
     if (!row) return;
-    row.classList.toggle('on', !!qsState[k]);
+    const on = !!qsState[p[0]];
+    row.classList.toggle('on', on);
     const sw = row.querySelector('.qsw');
-    if (sw) sw.textContent = qsState[k] ? 'on' : 'off';
+    if (sw) sw.textContent = on ? 'on' : 'off';
   });
+  // PATCH50/U33 (bench #3): the dim is armed by a body class, default OFF -
+  // .ctxout classes still ride the render, they just stay invisible until
+  // she flips Context Roll-Out on. Agora parity: opt-in, 240ms, alpha .38.
+  document.body.classList.toggle('rollout', !!qsState.roll);
 }
 // U-PARK: qsThink row removed from the popover; qsState.think stays true
 // forever so off_think is never sent (server path dormant, K80 2026-10-04).
 $('qsWeb').addEventListener('click', function () { qsState.web = !qsState.web; qsSave(); qsPaint(); });
 $('qsShell').addEventListener('click', function () { qsState.shell = !qsState.shell; qsSave(); qsPaint(); });
+$('qsRoll').addEventListener('click', function () { qsState.roll = !qsState.roll; qsSave(); qsPaint(); });  // PATCH50/U33
 $('qsBtn').addEventListener('click', function (e) { e.stopPropagation(); toggleCpop(qsPop); });
 /* PATCH44/U28: Context Compact — Katy asked for the wheel, not just the airbag.
    Kicks POST api/compact for THIS chat; the fold runs server-side and the
