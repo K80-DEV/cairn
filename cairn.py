@@ -200,8 +200,12 @@ def _close_stream_rec(conv_id):
                 entry["q"].put_nowait(None)
             except Exception:
                 pass
-COMPACTION_THRESHOLD = 0.80
-MAX_TOOL_ITERATIONS = 10
+COMPACTION_THRESHOLD = 0.80  # PATCH56/U39a marker
+# PATCH56/U39a (K80 ask): the old collar of 10 throttled real agent
+# turns. Ceiling now = the P1-H/U whole-turn fuse (200 tool calls);
+# since each continuing iteration costs >=1 tool call, the loop stays
+# bounded regardless. Override via env CAIRN_MAX_TOOL_ITERATIONS.
+MAX_TOOL_ITERATIONS = int(os.environ.get("CAIRN_MAX_TOOL_ITERATIONS", "200"))
 HOST = os.environ.get("CAIRN_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CAIRN_PORT", "8470"))
 # P3.3 S3: daemon-level tools kill switch (lite instance runs CAIRN_TOOLS=off
