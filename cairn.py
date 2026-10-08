@@ -10288,6 +10288,26 @@ def _build_cairn_export(username):
     sp_entry = {"id": sp_id, "title": "Cairn " + INSTANCE_SLUG,
                 "systemItems": [{"id": "cairn-main", "type": "CUSTOM", "value": sp_text}],
                 "userItems": [], "assistantItems": []}
+    # PATCH49/U32 (K80 bench #4): the prompts table is now the source of
+    # truth - export EVERY prompt for this account, not just the synthesized
+    # legacy entry. Shape matches what the u21 importer reads (id/title/
+    # systemItems). Synthesized entry stays as the empty-table fallback so a
+    # fresh box's persona still travels.
+    sp_list = []
+    try:
+        with sqlite3.connect(DB_PATH) as _pdb49:
+            _pdb49.row_factory = sqlite3.Row
+            for _pr49 in _pdb49.execute(
+                    "SELECT id, name, body FROM prompts WHERE username=? ORDER BY updated",
+                    (username,)).fetchall():
+                sp_list.append({"id": str(_pr49["id"]), "title": str(_pr49["name"])[:120],
+                                "systemItems": [{"id": "cairn-body", "type": "CUSTOM",
+                                                 "value": str(_pr49["body"] or "")}],
+                                "userItems": [], "assistantItems": []})
+    except Exception:
+        sp_list = []
+    if not sp_list:
+        sp_list = [sp_entry]
     with os.fdopen(_tmp_fd, "wb") as _tmp_fh, zipfile.ZipFile(_tmp_fh, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("manifest.json", json.dumps({
             "agora_export_version": CAIRN_EXPORT_VERSION,
@@ -10304,7 +10324,7 @@ def _build_cairn_export(username):
                 z.write(str(MEMORY_DIR / ns / name), "memories/memory_db/%s/%s" % (ns, name))
         z.writestr("memories/memory_db/memory_meta.json", json.dumps(
             {("%s/%s" % (ns, n2)): "" for ns in mem_ns for n2 in mem_ns[ns]}))
-        z.writestr("system_prompts.json", json.dumps([sp_entry], ensure_ascii=False))
+        z.writestr("system_prompts.json", json.dumps(sp_list, ensure_ascii=False))  # PATCH49/U32
         z.writestr("settings.json", json.dumps(settings, ensure_ascii=False))
     # V20/T-B21: hard ceiling. An archive over EXPORT_MAX_BYTES is deleted
     # here so the caller never streams it; the handler surfaces a plain error.
