@@ -15132,13 +15132,31 @@ function relTime(ts) {
   return Math.floor(d / 86400) + 'd ago';
 }
 
+/* PATCH48/U31 (K80 2026-10-07): a service restart makes fetch REJECT
+   (connection refused). That means "server briefly down", NOT "logged out" -
+   sessions live server-side in users.db and survive restarts; only a real
+   401 is a logout. Old behavior: the drawer silently emptied during the
+   restart window and looked exactly like data loss. New: retry quietly,
+   and if the server is genuinely gone, SAY so instead of going blank. */
+async function _fetchRetry48(url, tries) {
+  let lastErr = null;
+  for (let i = 0; i < (tries || 1); i++) {
+    try { return await fetch(url); }
+    catch (e) { lastErr = e; await new Promise(function (res) { setTimeout(res, 2000); }); }
+  }
+  throw lastErr;
+}
 async function loadConversations() {
   let data = [];
   try {
-    const r = await fetch('api/conversations');
+    const r = await _fetchRetry48('api/conversations', 20);
     if (r.status === 401) { location.href = 'login'; return []; }
     data = await r.json();
-  } catch (e) { return []; }
+  } catch (e) {
+    // Retries exhausted = genuinely unreachable, not a logout. Be honest.
+    if (convList) convList.innerHTML = '<div class="conv-empty">Server unreachable - it may be restarting. <button onclick="loadConversations()">Retry</button></div>';
+    return [];
+  }
   if (convQuery) {
     data = data.filter((c) => String(c.title || '').toLowerCase().indexOf(convQuery) >= 0);
   }
@@ -15448,7 +15466,7 @@ var _pg47 = {conv: null, older: null, has: false, rows: []};
 async function loadMessages(id) {
   let o = null;
   try {
-    const r = await fetch('api/conversations/' + id + '/messages?limit=' + PAGE47);
+    const r = await _fetchRetry48('api/conversations/' + id + '/messages?limit=' + PAGE47, 4);
     o = await r.json();
   } catch (e) {
     chatCol.querySelectorAll('.msg, .toolrow, .thinking, .thinkcard').forEach((n) => n.remove());
