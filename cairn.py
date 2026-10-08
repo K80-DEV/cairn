@@ -14703,11 +14703,13 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 /* ── composer ────────────────────────────── */
 .composer{background:var(--surface);border-top:1px solid var(--border);padding:8px 10px calc(8px + env(safe-area-inset-bottom));z-index:20;position:relative}
 .composer-col{max-width:820px;margin:0 auto;display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px}
+#chatModelBar{flex:1;min-width:0}  /* PATCH51/U34: was inline flex:1;1 - same value, now overridable in expanded sheet */
 .composer.grabbable{padding-top:14px}
 .composer.grabbable::before{content:'';position:absolute;top:4px;left:50%;transform:translateX(-50%);width:44px;height:5px;border-radius:3px;background:var(--dim);opacity:.5;pointer-events:none}
 .composer.expanded{position:fixed;inset:0;z-index:96;padding-top:calc(14px + env(safe-area-inset-top));display:flex;flex-direction:column;animation:expin .22s cubic-bezier(.22,.9,.28,1)}
-.composer.expanded .composer-col{flex:1;align-items:stretch;min-height:0}
-.composer.expanded #msgInput{flex:1;max-height:none;height:auto;min-height:60px}
+.composer.expanded .composer-col{flex:1;flex-direction:column;flex-wrap:nowrap;align-items:stretch;min-height:0;overflow-y:auto}  /* PATCH51/U34: was row+wrap - basis-reset scatter (K80 screenshots) */
+.composer.expanded #msgInput{flex:1 1 auto;max-height:none;height:auto;min-height:120px}
+.composer.expanded #chatModelBar{flex:0 0 auto;max-width:100%}
 @keyframes expin{from{transform:translateY(30%)}to{transform:translateY(0)}}
 #cmpExpand svg{transition:transform .2s ease}
 .composer.expanded #cmpExpand svg{transform:rotate(180deg)}
@@ -14868,7 +14870,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
     <button id="qsBtn" class="icon-btn" title="Quick settings for this chat">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
     </button>
-    <div id="chatModelBar" style="flex:1;min-width:0;font-size:12px;color:var(--dim);display:flex;gap:6px;align-items:center;flex-wrap:wrap"><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><button id="chatModelEdit" class="btn" style="padding:0 9px;height:24px;font-size:11px;border-radius:999px;background:transparent;color:var(--dim);border:1px solid var(--border)" title="Change the model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span><span id="cmHits" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
+    <div id="chatModelBar" style="min-width:0;font-size:12px;color:var(--dim);display:flex;gap:6px;align-items:center;flex-wrap:wrap">  <!-- PATCH51/U34: flex:1 moved to #chatModelBar rule; inline flex:1 was un-overridable in the expanded sheet --><span id="chatModelLabel" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><button id="chatModelEdit" class="btn" style="padding:0 9px;height:24px;font-size:11px;border-radius:999px;background:transparent;color:var(--dim);border:1px solid var(--border)" title="Change the model for this chat">model</button><span id="chatModelNote" hidden><select id="cmProv" style="max-width:150px;font-size:12px"></select><input id="cmModel" list="cmModelList" placeholder="model id (blank = provider default)" style="max-width:230px;font-size:12px" autocomplete="off"><datalist id="cmModelList"></datalist><button id="cmApply" class="btn" style="padding:0 8px;height:22px;font-size:12px">Apply</button><button id="cmDefault" class="btn" style="padding:0 8px;height:22px;font-size:12px" title="Also save these as my account default">set as my default</button><span id="cmChips" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span><span id="cmHits" style="display:flex;gap:4px;flex-wrap:wrap;width:100%"></span></span></div>
     <input type="file" id="filePick" multiple hidden>
     <input type="file" id="camPick" accept="image/*" capture="environment" hidden>
     <textarea id="msgInput" rows="1" placeholder="Message your agent..." autocomplete="off"></textarea>
