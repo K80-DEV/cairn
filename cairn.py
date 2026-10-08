@@ -3294,7 +3294,21 @@ def run_compaction(conv_id: str, messages: list, model_cfg: dict, status=None, u
     # every call fits, and chain the parts through the prior-summary merge
     # lane F28/C2 already proved in production. Single-window conversations
     # build a byte-identical request to the pre-patch code.
-    _cap26 = max(20000, int((ctx_budget(username) if username else CONTEXT_BUDGET) * 0.55))
+    # PATCH55/U38b (K80 2026-10-08 "I think the 503s have to do with it
+    # trying to compact more than 256k" - she was right): the window must fit
+    # the COMPACTION MODEL's own context, not 55% of the chat budget. Two
+    # compounding bugs: estimate_tokens is len//4 (English-ish) and imported
+    # tool/JSON corpora tokenize ~2x denser, AND the chained prior summary
+    # (up to COMPACT_MAX_TOKENS) plus the compaction prompt ride the SAME
+    # request but were never subtracted. Observed: three identical-data folds
+    # on K80's "building me" conv died at 196/192/191s with HTTP 503 while
+    # normal turns succeeded minutes apart = deterministic, data-dependent.
+    # New cap: 35% of budget minus summary+prompt headroom (floor 15k).
+    # At her 262,144 budget: 57,750 est/chunk; even at 2x estimate density
+    # that lands ~115k real + 30k prior + prompt ~ 150k << 262,144.
+    # Assumes compaction model window == ctx budget (true on her BYOK setup;
+    # a smaller-window compaction model would need its own setting - backlog).
+    _cap26 = max(15000, int((ctx_budget(username) if username else CONTEXT_BUDGET) * 0.35) - (COMPACT_MAX_TOKENS + 4000))
     _chunks26, _cur26, _n26 = [], [], 0
     for _m26 in older:
         _t26 = estimate_tokens(_msg_text_repr(_m26) or "(no text)") + 8
@@ -3337,16 +3351,38 @@ def run_compaction(conv_id: str, messages: list, model_cfg: dict, status=None, u
             }
             # S4e: the provider layer builds the request (URL + auth + native
             # body conversion). The shared file key is not consulted.
-            req = build_model_request(model_cfg, payload)
-            with _provider_urlopen(model_cfg, req, timeout=300) as resp:  # P1-C/F2
-                result = json.loads(_p1h_read(resp, _P1H_PROVIDER_BODY_CAP, "provider"))  # P1-H/W
+            # U37c: transient provider weather (503 today) gets two patient
+            # retries before the old trim fallback; hard errors raise straight through.
+            for _t54 in range(3):
+                try:
+                    req = build_model_request(model_cfg, payload)
+                    with _provider_urlopen(model_cfg, req, timeout=300) as resp:  # P1-C/F2
+                        result = json.loads(_p1h_read(resp, _P1H_PROVIDER_BODY_CAP, "provider"))  # P1-H/W
+                    break
+                except urllib.error.URLError as _e54:  # HTTPError is a URLError subclass
+                    _c54 = getattr(_e54, "code", None)  # bare URLError (conn reset) has no code
+                    if _c54 is not None and _c54 not in (429, 500, 502, 503): raise
+                    if _t54 == 2: raise
+                    log.info("Compaction provider busy (%s) - retry %d of 2 in %ds",
+                             _c54 if _c54 is not None else _e54.reason, _t54 + 1, 15 * (_t54 + 1))
+                    time.sleep(15 * (_t54 + 1))
             if model_cfg["native"]:
                 result = _anthropic_to_oai(result)
             summary = (result.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
             if not summary:
                 raise RuntimeError("empty compaction summary")
     except Exception as e:
-        log.error("Compaction failed (%s) — falling back to trim", e)
+        # PATCH55/U38c: a bare "HTTP Error 503" cannot distinguish provider
+        # overload from a context-length refusal, and that distinction IS the
+        # diagnosis (this exact ambiguity cost a wrong "provider weather" call
+        # on 2026-10-08). Capture a capped slice of the provider error body.
+        _body38 = ""
+        try:
+            if hasattr(e, "read"):
+                _body38 = " | provider body: " + ((e.read() or b"")[:400]).decode("utf-8", "replace")
+        except Exception:
+            pass
+        log.error("Compaction failed (%s%s) — falling back to trim", e, _body38)
         return ""
 
     now = time.time()
@@ -3390,7 +3426,7 @@ def _u28_compact_worker(conv_id, username, job):
             db.row_factory = sqlite3.Row
             _rows = db.execute(
                 "SELECT id, role, content, attachments, stopped FROM messages WHERE conv_id=? "
-                "AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",
+                "AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts, rowid",  # U37a
                 (conv_id,)).fetchall()
         # Same row shape build_api_messages builds (STOPPED_SCAR + attachment
         # parts), so the manual fold sees exactly what a real turn would see.
@@ -7415,7 +7451,7 @@ def _f18_task_turn(t):
             db.row_factory = sqlite3.Row
             history = db.execute(
                 "SELECT id, role, content, attachments, stopped FROM messages "
-                "WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",  # F28/C1
+                "WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts, rowid",  # F28/C1 + U37a
                 (conv_id,)).fetchall()
             db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
             db.commit()
@@ -16807,6 +16843,7 @@ function send() {
         scrollBottom();
       }
     }
+    think.remove();  // U37b: zombie chip never survives a finished turn
     liveOff(); if (bubble && bubble.body.textContent) mdInto(bubble.body);
     if (bubble && !bubble.body.textContent && !bubble.thoughts.textContent) bubble.div.remove();
     if (bubble && bubble.thoughts.textContent === '') bubble.det.remove();
@@ -16940,6 +16977,7 @@ async function attachStream(id) {
     scrollBottom();
     setTimeout(() => { if (currentConv) loadMessages(currentConv); }, 800);
   }
+  think.remove();  // U37b: same zombie-chip guard on the reattach path
   liveOff(); if (bubble && bubble.body.textContent) mdInto(bubble.body);
     if (bubble && !bubble.body.textContent && !bubble.thoughts.textContent) bubble.div.remove();
   if (bubble && bubble.thoughts.textContent === '') bubble.det.remove();
@@ -20806,7 +20844,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                         (conv_id,)).fetchone()[0]
                 else:
                     rows = db.execute(
-                        "SELECT role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts",  # U10
+                        "SELECT role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts, rowid",  # U10 + U37a
                         (conv_id,)
                     ).fetchall()
                 out = []
@@ -20858,7 +20896,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             with sqlite3.connect(DB_PATH) as db:
                 _rows25 = db.execute(
                     "SELECT role, content FROM messages WHERE conv_id=? AND role IN ('user','assistant') "
-                    "AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",
+                    "AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts, rowid",  # U37a
                     (_cid25,)).fetchall()
                 _sum25 = db.execute(
                     "SELECT summary FROM compactions WHERE conv_id=? ORDER BY ts DESC LIMIT 1",
@@ -22723,7 +22761,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                         "INSERT INTO attachments (id, conv_id, name, stored_name, mime, size, source, kind, ts, user_id, folder) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (aid, new_cid, ar[1], ar[2], ar[3], ar[4], ar[5], ar[6], ar[7], u["username"], ar[8]))
                 for mr in db.execute(
-                        "SELECT role, content, tool_calls, ts, attachments, reasoning, stopped FROM messages WHERE conv_id=? ORDER BY ts",
+                        "SELECT role, content, tool_calls, ts, attachments, reasoning, stopped FROM messages WHERE conv_id=? ORDER BY ts, rowid",  # U37a2
                         (cid_in,)).fetchall():
                     att_col = mr[4]
                     if att_col and id_map:
@@ -23814,7 +23852,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                 # Load history
                 db.row_factory = sqlite3.Row
                 history = db.execute(
-                    "SELECT id, role, content, attachments, stopped FROM messages WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts",  # F28/C1
+                    "SELECT id, role, content, attachments, stopped FROM messages WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL AND length(trim(content)) > 0 ORDER BY ts, rowid",  # F28/C1 + U37a2
                     (conv_id,)
                 ).fetchall()
                 db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
@@ -23943,7 +23981,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                         if _f16_n == 1:
                             _f16_row = _f16_db.execute(
                                 "SELECT content FROM messages WHERE conv_id=? AND role='user'"
-                                " ORDER BY ts LIMIT 1", (conv_id,)).fetchone()
+                                " ORDER BY ts, rowid LIMIT 1", (conv_id,)).fetchone()  # U37a2
                             _f16_utext = (_f16_row[0] or "") if _f16_row else ""
                     if _f16_n == 1 and _f16_utext:
                         _f16_box = {}
@@ -24828,7 +24866,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             # today (_share_path_allowed), but this fence will not rely on that.
             if not c or c["user_id"] != username or not self._guest_can_conv(username, c["guest_id"]):
                 self._json(404, {"error": "conversation not found"}); return
-            rows = db.execute("SELECT role, content, ts, attachments FROM messages WHERE conv_id=? AND role IN ('user','assistant') AND content IS NOT NULL AND content != '' ORDER BY ts", (conv_id,)).fetchall()
+            rows = db.execute("SELECT role, content, ts, attachments FROM messages WHERE conv_id=? AND role IN ('user','assistant') AND content IS NOT NULL AND content != '' ORDER BY ts, rowid", (conv_id,)).fetchall()  # U37a2
         if fmt == "json":
             # P1-I/B05 (round-9 audit): sqlite3.Row refuses item assignment,
             # and the old except-pass SWALLOWED that TypeError - exported
