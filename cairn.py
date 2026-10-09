@@ -7790,9 +7790,49 @@ def _f18_guard(h):
 
 
 def _f18_api_get(h):
+    # U46 (PATCH63): thin adapter over _u46_list_core - same codes/messages.
     u = _f18_guard(h)
     if u is None:
         return
+    code, payload = _u46_list_core(u)
+    h._json(code, payload)
+def _f18_api_post(h):
+    # U46 (PATCH63): thin adapter over _u46_post_core - same codes/messages.
+    u = _f18_guard(h)
+    if u is None:
+        return
+    body = h._json_object_body()
+    if body is None:
+        return
+    code, payload = _u46_post_core(u, body)
+    h._json(code, payload)
+def _f18_api_delete(h):
+    # U46 (PATCH63): thin adapter over _u46_delete_core - same codes/messages.
+    u = _f18_guard(h)
+    if u is None:
+        return
+    body = h._json_object_body()
+    if body is None:
+        return
+    code, payload = _u46_delete_core(u, body.get("id"))
+    h._json(code, payload)
+# F18-END
+# U46-BEGIN  (PATCH63: agent-facing task tools — Agora parity, K80 2026-10-09)
+# ---------------------------------------------------------------------------
+# U46 (PATCH63, K80 blanket parity greenlight 2026-10-09): agents can manage
+# their OWN scheduled tasks. Agora ships create_task / list_tasks / delete_task
+# in its AutomationToolProvider; CAIRN had the F18 UI + REST but the agent
+# could only reach them by curling itself. Same discipline as U45: the proven
+# F18 validation now lives in PURE CORES below (identical codes and messages —
+# REST handlers became thin adapters), and three agent tools ride those cores.
+# The fence is F18's own admin/owner-active rule, mirrored from _f18_guard via
+# the registry; share principals never receive these names (grants predate
+# them) and would fail the role gate anyway. list_tasks carries tz_display +
+# now_local so a cron written by the agent lands in the owner's wall clock.
+def _u46_list_core(u):
+    """Pure core (U46): exact _f18_api_get body, payload instead of h._json.
+    u is the user dict _f18_guard already approved (REST) or the registry
+    row the task-tool gate approved (agent) — one validation source, no drift."""
     with sqlite3.connect(DB_PATH) as db:
         db.row_factory = sqlite3.Row
         _f18_ensure_tasks(db)
@@ -7808,17 +7848,11 @@ def _f18_api_get(h):
     nowl = _f18_dt.now(z) if z else _f18_dt.now()
     tz_disp = ((zn + " (" + nowl.strftime("%Z") + ")") if z
                else "system-local (" + (time.strftime("%Z") or "?") + ")")
-    h._json(200, {"tasks": out, "tz": zn, "tz_display": tz_disp,
-                  "now_local": nowl.strftime("%Y-%m-%d %H:%M %Z").strip()})
-
-
-def _f18_api_post(h):
-    u = _f18_guard(h)
-    if u is None:
-        return
-    body = h._json_object_body()
-    if body is None:
-        return
+    return 200, {"tasks": out, "tz": zn, "tz_display": tz_disp,
+                 "now_local": nowl.strftime("%Y-%m-%d %H:%M %Z").strip()}
+def _u46_post_core(u, body):
+    """Pure core (U46): exact _f18_api_post validations + writes, in the
+    original order, returning (code, payload) instead of answering HTTP."""
     name = str(body.get("name") or "").strip()[:60]
     cron = str(body.get("cron") or "").strip()
     prompt = str(body.get("prompt") or "").strip()
@@ -7827,28 +7861,24 @@ def _f18_api_post(h):
     dm = str(body.get("dst_missing") or "").strip().lower() or None   # V16
     dr = str(body.get("dst_repeat") or "").strip().lower() or None    # V16
     if dm is not None and dm not in ("skip", "move"):
-        h._json(400, {"error": "dst_missing must be 'skip' or 'move'"}); return
+        return 400, {"error": "dst_missing must be 'skip' or 'move'"}
     if dr is not None and dr not in ("first", "second", "both"):
-        h._json(400, {"error": "dst_repeat must be 'first', 'second' or 'both'"}); return
+        return 400, {"error": "dst_repeat must be 'first', 'second' or 'both'"}
     if not name:
-        h._json(400, {"error": "name required (1-60 chars)"})
-        return
+        return 400, {"error": "name required (1-60 chars)"}
     if _f18_cron_parse(cron) is None:
-        h._json(400, {"error": "cron must be 5 space-separated fields "
+        return 400, {"error": "cron must be 5 space-separated fields "
                                 "(minute hour day-of-month month day-of-week); "
-                                "numbers, ranges, comma lists, and */n steps only"})
-        return
+                                "numbers, ranges, comma lists, and */n steps only"}
     if not prompt or len(prompt) > 4000:
-        h._json(400, {"error": "prompt required (1-4000 chars)"})
-        return
+        return 400, {"error": "prompt required (1-4000 chars)"}
     with sqlite3.connect(DB_PATH) as db:
         _f18_ensure_tasks(db)
         if tid:
             row = db.execute("SELECT id, dst_missing, dst_repeat FROM tasks WHERE id=? AND owner=?",
                              (tid, u["username"],)).fetchone()
             if row is None:
-                h._json(404, {"error": "task not found"})
-                return
+                return 404, {"error": "task not found"}
             dm = dm if dm is not None else (row[1] or "skip")     # V16: absent key = keep existing
             dr = dr if dr is not None else (row[2] or "first")    # V16
             db.execute("UPDATE tasks SET name=?, cron=?, prompt=?, enabled=?, dst_missing=?, dst_repeat=? WHERE id=? AND owner=?",
@@ -7857,39 +7887,94 @@ def _f18_api_post(h):
             n = db.execute("SELECT COUNT(*) FROM tasks WHERE owner=?",
                            (u["username"],)).fetchone()[0]
             if n >= F18_MAX_TASKS:
-                h._json(400, {"error": "task cap is %d" % F18_MAX_TASKS})
-                return
+                return 400, {"error": "task cap is %d" % F18_MAX_TASKS}
             tid = str(uuid.uuid4())
             db.execute("INSERT INTO tasks (id, owner, name, cron, prompt, enabled, created_at, dst_missing, dst_repeat) VALUES (?,?,?,?,?,?,?,?,?)",
                        (tid, u["username"], name, cron, prompt, enabled, time.time(),
                         dm or "skip", dr or "first"))  # V16 defaults = old implicit behavior
         db.commit()
     log_event(u["username"], "task.save", task_id=tid, name=name, cron=cron)
-    h._json(200, {"ok": True, "id": tid})
-
-
-def _f18_api_delete(h):
-    u = _f18_guard(h)
-    if u is None:
-        return
-    body = h._json_object_body()
-    if body is None:
-        return
-    tid = str(body.get("id") or "").strip()
+    return 200, {"ok": True, "id": tid}
+def _u46_delete_core(u, tid):
+    """Pure core (U46): exact _f18_api_delete body; frees the V16 in-flight
+    slot on success. Owner-fenced DELETE — same statement the REST lane uses."""
+    tid = str(tid or "").strip()
     if not tid:
-        h._json(400, {"error": "id required"})
-        return
+        return 400, {"error": "id required"}
     with sqlite3.connect(DB_PATH) as db:
         _f18_ensure_tasks(db)
         cur = db.execute("DELETE FROM tasks WHERE id=? AND owner=?", (tid, u["username"]))
         db.commit()
         if cur.rowcount == 0:
-            h._json(404, {"error": "task not found"})
-            return
+            return 404, {"error": "task not found"}
     with _f18_inflight_lock:
-        _f18_inflight.pop(tid, None)   # V16: deleted task frees its slot (a live worker's record write becomes a harmless rowcount 0)
-    h._json(200, {"ok": True})  # the task's conversation stays — history is sacred
-# F18-END
+        _f18_inflight.pop(tid, None)   # V16: deleted task frees its slot
+    return 200, {"ok": True}   # the task's conversation stays — history is sacred
+def _u46_json(payload):
+    return json.dumps(payload, separators=(",", ":"))
+def _u46_err(code, payload):
+    return "Error (HTTP %d): %s" % (code, (payload or {}).get("error", "failed"))
+def _u46_user_gate(username):
+    """Mirror of _f18_guard for principals with no HTTP request: same rules,
+    same message, same direction — deny by default. Returns (u, None) or
+    (None, error-string). Registry read is the same one _auth_user rides."""
+    if not username:
+        return None, "Error: task tools need a signed-in principal"
+    try:
+        u = registry_get_user(username)
+    except Exception:
+        return None, "Error: user registry unavailable"
+    if u is None or (u["role"] or "") not in ("admin", "owner") or (u["status"] or "") != "active":
+        return None, "Error (HTTP 403): scheduled tasks are admin/owner only"
+    return u, None
+def _u46_resolve_task(u, id_or_name):
+    """delete_task takes Agora's id_or_name. Ids are exact owner-matched; a
+    name must be unique among the owner's tasks or we refuse to guess."""
+    tid = str(id_or_name or "").strip()
+    if not tid:
+        return None, "Error: id_or_name required (task id or exact name)"
+    with sqlite3.connect(DB_PATH) as db:
+        _f18_ensure_tasks(db)
+        if db.execute("SELECT 1 FROM tasks WHERE id=? AND owner=?",
+                      (tid, u["username"])).fetchone():
+            return tid, None
+        rows = db.execute("SELECT id FROM tasks WHERE owner=? AND name=?",
+                          (u["username"], tid)).fetchall()
+    if len(rows) == 1:
+        return rows[0][0], None
+    if len(rows) > 1:
+        return None, ("Error: %d tasks share that name — delete by id "
+                      "(list_tasks shows ids)" % len(rows))
+    return None, "Error (HTTP 404): task not found"
+def _u46_task_tool(name, args, username):
+    """Agent tool front for the F18 task surface (Agora parity). Every failure
+    returns a clean string — the turn survives, the fence stays shut."""
+    u, err = _u46_user_gate(username)
+    if u is None:
+        return err
+    args = args if isinstance(args, dict) else {}
+    if name == "create_task":
+        code, payload = _u46_post_core(u, {
+            "name": args.get("name"), "cron": args.get("cron"),
+            "prompt": args.get("prompt"), "enabled": args.get("enabled", 1)})
+        # schema honesty: CAIRN tasks run the owner's default model — an
+        # Agora-shaped model override is accepted but noted, never pretended.
+        if code < 400 and str(args.get("model") or "").strip():
+            payload = dict(payload)
+            payload["note"] = "CAIRN tasks run the conversation owner's default model; the model override was not applied"
+    elif name == "list_tasks":
+        code, payload = _u46_list_core(u)
+    elif name == "delete_task":
+        tid, err = _u46_resolve_task(u, args.get("id_or_name"))
+        if err:
+            return err
+        code, payload = _u46_delete_core(u, tid)
+    else:
+        return "Error: unknown task tool " + str(name)
+    if code >= 400:
+        return _u46_err(code, payload)
+    return _u46_json(payload)
+# U46-END
 # U44-BEGIN  (PATCH61: conversation loops — Agora parity, K80 2026-10-08)
 # ---------------------------------------------------------------------------
 # U44: conversation LOOPS. An owner starts a loop on ONE conversation; every
@@ -12258,7 +12343,46 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "send_file",
+            "name": "create_task",
+            "description": "Create an enabled background task with a 5-field cron schedule. Use only when the user explicitly asks to create a recurring task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "A short, descriptive task name."},
+                    "prompt": {"type": "string", "description": "The complete prompt to run on every occurrence."},
+                    "cron": {"type": "string", "description": "A valid 5-field cron expression: minute hour day-of-month month day-of-week."},
+                    "model": {"type": "string", "description": "Optional provider-prefixed model id. Omit to use the app default model."}
+                },
+                "required": ["name", "prompt", "cron"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "List all saved background tasks, including ids, schedules, enabled state, and next run times.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_task",
+            "description": "Delete one saved task by exact id or unique task name. This is destructive; use only when the user explicitly asks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id_or_name": {"type": "string", "description": "The exact task id or a unique task name."}
+                },
+                "required": ["id_or_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+"name": "send_file",
             "description": "Deliver a completed file INTO this chat as an attachment the user can see and download (images render inline on the chip). Use after producing output files: transcripts, OCR text, exports, generated images. Max 12 MB, up to 8 files per reply.",
             "parameters": {
                 "type": "object",
@@ -13089,6 +13213,11 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
             return execute_f15_tool(name, args, username, conv_id=conv_id, files_sink=files_sink)
         elif name in ("generate_image", "generate_speech"):
             return execute_f17_tool(name, args, username, conv_id=conv_id, files_sink=files_sink)
+        elif name in ("create_task", "list_tasks", "delete_task"):
+            # U46 (PATCH63): agent-facing task tools (Agora parity). Every
+            # fence lives in the cores/gate — the same rules the REST API has
+            # always used. Unknown principals fail closed inside.
+            return _u46_task_tool(name, args, username)
         elif name in ("start_loop", "stop_loop", "list_loops"):
             # U45 (PATCH62): agent-facing loop tools (Agora parity). Every
             # fence lives in the cores - the same ones the REST API has
