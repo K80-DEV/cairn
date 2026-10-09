@@ -1105,7 +1105,7 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS prompts_user ON prompts(username);
         CREATE TABLE IF NOT EXISTS msg_vec (
-            message_id INTEGER PRIMARY KEY,
+            message_id TEXT PRIMARY KEY,
             username TEXT NOT NULL,
             conv_id TEXT NOT NULL,
             model TEXT NOT NULL,
@@ -1120,6 +1120,29 @@ def init_db():
         if "compacted_at" not in cols:
             if _add_col(db, "messages", "compacted_at", "REAL"):
                 log.info("DB migration: added messages.compacted_at")
+        # U40 (patch57, K80 2026-10-08): msg_vec was born with
+        # message_id INTEGER PRIMARY KEY but messages.id is TEXT (UUID).
+        # SQLite treats INTEGER PK as rowid alias (implicit NOT NULL), so
+        # every UUID embed insert coerced to NULL and failed -> semantic
+        # recall dead on any DB created before this patch. msg_vec is a
+        # pure cache (embed top-up rebuilds it), so heal-in-place is safe:
+        # drop the old-shape table and recreate with the correct TEXT PK
+        # in the same init pass. Already-correct DBs: zero-op.
+        _mv40 = {r[1]: r[2] for r in db.execute("PRAGMA table_info(msg_vec)")}
+        if _mv40 and str(_mv40.get("message_id", "")).upper() == "INTEGER":
+            db.execute("DROP TABLE IF EXISTS msg_vec")
+            db.execute("""
+                CREATE TABLE msg_vec (
+                    message_id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    conv_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dim INTEGER NOT NULL,
+                    vec BLOB NOT NULL,
+                    ts REAL NOT NULL
+                )""")
+            db.execute("CREATE INDEX IF NOT EXISTS msg_vec_user ON msg_vec(username, model)")
+            log.info("DB migration: msg_vec rebuilt with TEXT message_id (U40)")
         # One-time P3.2 migration: attachment metadata column (older DBs lack it)
         if "attachments" not in cols:
             if _add_col(db, "messages", "attachments", "TEXT"):
@@ -12065,7 +12088,7 @@ def _vec_pending(username, conf, cap):
     if not rows:
         return 0
     try:
-        vecs = _embed_texts(conf, [(e or "").strip()[:4000] for (a, b, c_, d, e) in rows])
+        vecs = _embed_texts(conf, [(e or "").strip()[:4000] for (a, b, e) in rows])
     except Exception as e:
         log.info("U11: %s top-up embed failed: %.140s", username, str(e))
         return -1
@@ -12147,6 +12170,7 @@ def _semantic_recall(username, q, limit, conv_id=None):
             break
     return lines
 
+def _tool_recall(args: dict, username=None, conv_id=None) -> str:
     if not username:
         return "Error: no user context for recall."
     q = (args.get("query") or "").strip()
