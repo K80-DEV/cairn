@@ -8149,6 +8149,7 @@ def _u44_guard(h):
     return u
 
 def _u44_api_get(h):
+    # U45 (PATCH62): thin adapter over _u45_get_core - same codes/messages.
     u = _u44_guard(h)
     if u is None:
         return
@@ -8159,6 +8160,103 @@ def _u44_api_get(h):
             conv = (_up.parse_qs(_up.urlparse(h.path).query).get("conv") or [""])[0].strip()
         except Exception:
             conv = ""
+    code, payload = _u45_get_core(u["username"], conv)
+    h._json(code, payload)
+def _u44_api_start(h):
+    # U45 (PATCH62): thin adapter over the cores - same codes/messages.
+    u = _u44_guard(h)
+    if u is None:
+        return
+    body = h._json_object_body()
+    if body is None:
+        return
+    action = str(body.get("action") or "start").strip().lower()
+    if action == "stop":
+        code, payload = _u45_stop_core(u["username"], body.get("conv_id"))
+    else:
+        code, payload = _u45_start_core(u["username"], body)
+    h._json(code, payload)
+# U44-END
+# U45-BEGIN
+# ---------------------------------------------------------------------------
+# U45 (PATCH62, K80 blanket parity greenlight 2026-10-09): agent-facing loop
+# tools. Agora's agent can start/stop/inspect its own loops; until now the
+# U44 engine was UI-only. The proven _u44_api_* validation now lives in the
+# PURE CORES below (identical codes and messages - the REST handlers became
+# thin adapters, re-proven every run by the u44-http suite), and three agent
+# tools ride the same cores: start_loop / stop_loop / list_loops.
+# Fences unchanged: loop owner = conversation user_id = the principal running
+# the turn (share principals fail that match by construction); the cycle then
+# runs on the conversation owner's model/tools via the same scheduler tick.
+# conv_id defaults to the conversation the turn came from - the agent loops
+# ITSELF by default, never a stranger's chat.
+def _u45_start_core(username, body):
+    """Pure core: validation + fences + insert. Returns (http_code, payload).
+    Messages are byte-for-byte the ones the REST API has always returned."""
+    conv = str((body or {}).get("conv_id") or "").strip()
+    if not conv:
+        return 400, {"error": "conv_id required"}
+    try:
+        iv = int((body or {}).get("interval_secs"))
+    except (TypeError, ValueError):
+        return 400, {"error": "interval_secs must be a whole number of seconds"}
+    try:
+        mc = int((body or {}).get("max_cycles", 10))
+    except (TypeError, ValueError):
+        return 400, {"error": "max_cycles must be a whole number"}
+    prompt = str((body or {}).get("prompt") or "").strip() or "Continue."
+    if not (U44_MIN_INTERVAL <= iv <= U44_MAX_INTERVAL):
+        return 400, {"error": "interval_secs must be between %d and %d" % (U44_MIN_INTERVAL, U44_MAX_INTERVAL)}
+    if not (1 <= mc <= U44_MAX_CYCLES):
+        return 400, {"error": "max_cycles must be between 1 and %d" % U44_MAX_CYCLES}
+    if len(prompt) > U44_PROMPT_CHARS:
+        return 400, {"error": "prompt too long (max %d chars)" % U44_PROMPT_CHARS}
+    now_e = time.time()
+    with sqlite3.connect(DB_PATH) as db:
+        _u44_ensure(db)
+        crow = db.execute("SELECT user_id FROM conversations WHERE id=?", (conv,)).fetchone()
+        if crow is None:
+            return 404, {"error": "conversation not found"}
+        if crow[0] != username:
+            return 403, {"error": "loops run on the conversation owner's model and tools - only they may start one"}
+        nrow = db.execute("SELECT COUNT(*) FROM loops WHERE conv_id=? AND status='active'",
+                          (conv,)).fetchone()
+        if nrow and nrow[0] > 0:
+            return 409, {"error": "this chat is already looping - stop it first"}
+        mrow = db.execute("SELECT COUNT(*) FROM loops WHERE owner=? AND status='active'",
+                          (username,)).fetchone()
+        if mrow and mrow[0] >= U44_MAX_LOOPS:
+            return 400, {"error": "loop cap is %d" % U44_MAX_LOOPS}
+        lid = str(uuid.uuid4())
+        try:
+            db.execute(
+                "INSERT INTO loops (id, owner, conv_id, prompt, interval_secs,"
+                " max_cycles, cycles_done, next_fire, status, created_at)"
+                " VALUES (?,?,?,?,?,?,0,?,'active',?)",
+                (lid, username, conv, prompt, iv, mc, now_e + iv, now_e))
+            db.commit()
+        except sqlite3.IntegrityError:
+            # the one-active-per-chat partial index beat us to it (double-
+            # tap race) - the count check above just lost a coin flip.
+            return 409, {"error": "this chat is already looping - stop it first"}
+    log_event(username, "loop.start", conv_id=conv, interval_secs=iv, max_cycles=mc)
+    return 200, {"ok": True, "id": lid}
+def _u45_stop_core(username, conv):
+    conv = str(conv or "").strip()
+    if not conv:
+        return 400, {"error": "conv_id required"}
+    with sqlite3.connect(DB_PATH) as db:
+        _u44_ensure(db)
+        cur = db.execute(
+            "UPDATE loops SET status='stopped', next_fire=0, lease_until=NULL"
+            " WHERE conv_id=? AND owner=? AND status='active'",
+            (conv, username))
+        db.commit()
+        if cur.rowcount == 0:
+            return 404, {"error": "no active loop on this conversation"}
+    log_event(username, "loop.stop", conv_id=conv)
+    return 200, {"ok": True, "stopped": cur.rowcount}
+def _u45_get_core(username, conv):
     with sqlite3.connect(DB_PATH) as db:
         db.row_factory = sqlite3.Row
         _u44_ensure(db)
@@ -8166,97 +8264,37 @@ def _u44_api_get(h):
             "SELECT id, owner, conv_id, prompt, interval_secs, max_cycles,"
             " cycles_done, next_fire, status, created_at, last_fire, last_result"
             " FROM loops WHERE conv_id=? AND owner=?"
-            " ORDER BY created_at DESC LIMIT 5", (conv, u["username"])).fetchall()
+            " ORDER BY created_at DESC LIMIT 5", (conv, username)).fetchall()
     out = []
     for r in rows:
         d = dict(r)
         d["last_result"] = (d["last_result"] or "")[:200]
         d["prompt"] = (d["prompt"] or "")[:200]
         out.append(d)
-    h._json(200, {"loops": out, "now": time.time()})
-
-def _u44_api_start(h):
-    u = _u44_guard(h)
-    if u is None:
-        return
-    body = h._json_object_body()
-    if body is None:
-        return
-    conv = str(body.get("conv_id") or "").strip()
-    action = str(body.get("action") or "start").strip().lower()
+    return 200, {"loops": out, "now": time.time()}
+def _u45_loop_tool(name, args, username, conv_id):
+    """Agent tool front for the U44 engine (Agora parity). Every failure
+    returns a clean string - the turn survives, the fence stays shut."""
+    if not username:
+        return "Error: loop tools need a signed-in principal"
+    args = args if isinstance(args, dict) else {}
+    conv = str(args.get("conv_id") or conv_id or "").strip()
     if not conv:
-        h._json(400, {"error": "conv_id required"})
-        return
-    if action == "stop":
-        with sqlite3.connect(DB_PATH) as db:
-            _u44_ensure(db)
-            cur = db.execute(
-                "UPDATE loops SET status='stopped', next_fire=0, lease_until=NULL"
-                " WHERE conv_id=? AND owner=? AND status='active'",
-                (conv, u["username"]))
-            db.commit()
-            if cur.rowcount == 0:
-                h._json(404, {"error": "no active loop on this conversation"})
-                return
-        log_event(u["username"], "loop.stop", conv_id=conv)
-        h._json(200, {"ok": True, "stopped": cur.rowcount})
-        return
-    try:
-        iv = int(body.get("interval_secs"))
-    except (TypeError, ValueError):
-        h._json(400, {"error": "interval_secs must be a whole number of seconds"})
-        return
-    try:
-        mc = int(body.get("max_cycles", 10))
-    except (TypeError, ValueError):
-        h._json(400, {"error": "max_cycles must be a whole number"})
-        return
-    prompt = str(body.get("prompt") or "").strip() or "Continue."
-    if not (U44_MIN_INTERVAL <= iv <= U44_MAX_INTERVAL):
-        h._json(400, {"error": "interval_secs must be between %d and %d" % (U44_MIN_INTERVAL, U44_MAX_INTERVAL)})
-        return
-    if not (1 <= mc <= U44_MAX_CYCLES):
-        h._json(400, {"error": "max_cycles must be between 1 and %d" % U44_MAX_CYCLES})
-        return
-    if len(prompt) > U44_PROMPT_CHARS:
-        h._json(400, {"error": "prompt too long (max %d chars)" % U44_PROMPT_CHARS})
-        return
-    now_e = time.time()
-    with sqlite3.connect(DB_PATH) as db:
-        _u44_ensure(db)
-        crow = db.execute("SELECT user_id FROM conversations WHERE id=?", (conv,)).fetchone()
-        if crow is None:
-            h._json(404, {"error": "conversation not found"})
-            return
-        if crow[0] != u["username"]:
-            h._json(403, {"error": "loops run on the conversation owner's model and tools - only they may start one"})
-            return
-        nrow = db.execute("SELECT COUNT(*) FROM loops WHERE conv_id=? AND status='active'",
-                          (conv,)).fetchone()
-        if nrow and nrow[0] > 0:
-            h._json(409, {"error": "this chat is already looping - stop it first"})
-            return
-        mrow = db.execute("SELECT COUNT(*) FROM loops WHERE owner=? AND status='active'",
-                          (u["username"],)).fetchone()
-        if mrow and mrow[0] >= U44_MAX_LOOPS:
-            h._json(400, {"error": "loop cap is %d" % U44_MAX_LOOPS})
-            return
-        lid = str(uuid.uuid4())
-        try:
-            db.execute(
-                "INSERT INTO loops (id, owner, conv_id, prompt, interval_secs,"
-                " max_cycles, cycles_done, next_fire, status, created_at)"
-                " VALUES (?,?,?,?,?,?,0,?,'active',?)",
-                (lid, u["username"], conv, prompt, iv, mc, now_e + iv, now_e))
-            db.commit()
-        except sqlite3.IntegrityError:
-            # the one-active-per-chat partial index beat us to it (double-
-            # tap race) - the count check above just lost a coin flip.
-            h._json(409, {"error": "this chat is already looping - stop it first"})
-            return
-    log_event(u["username"], "loop.start", conv_id=conv, interval_secs=iv, max_cycles=mc)
-    h._json(200, {"ok": True, "id": lid})
-# U44-END
+        return "Error: no conversation to loop - pass conv_id or call from a chat"
+    if name == "start_loop":
+        code, payload = _u45_start_core(username, {
+            "conv_id": conv,
+            "interval_secs": args.get("interval_secs"),
+            "max_cycles": args.get("max_cycles", 10),
+            "prompt": args.get("prompt") or ""})
+    elif name == "stop_loop":
+        code, payload = _u45_stop_core(username, conv)
+    else:
+        code, payload = _u45_get_core(username, conv)
+    if code >= 400:
+        return "Error (HTTP %d): %s" % (code, payload.get("error", "failed"))
+    return json.dumps(payload, separators=(",", ":"))
+# U45-END
 # F22-BEGIN  (E2E extracts this block verbatim: shipped code, not a reimplementation)
 # ---------------------------------------------------------------------------
 # F22: full-box backup export/import (canon: MaraDen/f22-backup-installer-
@@ -12177,6 +12215,49 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "start_loop",
+            "description": "Start a self-running loop on a conversation: every interval an agent turn posts in that chat and continues the prompt's work, on the conversation owner's model and tools. Runs while everyone is away; stop anytime. One active loop per chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conv_id": {"type": "string", "description": "Conversation to loop (default: the current chat). Only its owner can loop it."},
+                    "interval_secs": {"type": "integer", "description": "Seconds between cycles, 10 - 604800."},
+                    "max_cycles": {"type": "integer", "description": "Stop automatically after this many cycles, 1 - 100 (default 10)."},
+                    "prompt": {"type": "string", "description": "Instruction posted with every cycle (default \"Continue.\")."}
+                },
+                "required": ["interval_secs"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_loop",
+            "description": "Stop the active loop on a conversation (default: the current chat). Only the loop's owner can stop it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conv_id": {"type": "string", "description": "Conversation whose loop to stop (default: the current chat)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_loops",
+            "description": "List recent loops on a conversation (default: the current chat) with status, cycle progress, next fire time, and last result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conv_id": {"type": "string", "description": "Conversation to inspect (default: the current chat)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_file",
             "description": "Deliver a completed file INTO this chat as an attachment the user can see and download (images render inline on the chip). Use after producing output files: transcripts, OCR text, exports, generated images. Max 12 MB, up to 8 files per reply.",
             "parameters": {
@@ -13008,6 +13089,11 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
             return execute_f15_tool(name, args, username, conv_id=conv_id, files_sink=files_sink)
         elif name in ("generate_image", "generate_speech"):
             return execute_f17_tool(name, args, username, conv_id=conv_id, files_sink=files_sink)
+        elif name in ("start_loop", "stop_loop", "list_loops"):
+            # U45 (PATCH62): agent-facing loop tools (Agora parity). Every
+            # fence lives in the cores - the same ones the REST API has
+            # always used. Unknown principals fail closed inside.
+            return _u45_loop_tool(name, args, username, conv_id)
         elif name.startswith("mcp__"):
             # U14 (patch22): MCP call. Every failure inside returns a clean
             # string - the turn survives a dead or rude server.
