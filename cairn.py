@@ -6959,7 +6959,12 @@ F17_UA = "okhttp/4.12.0"  # CF guards api.* hosts against bare python UAs
 F17_MEDIA_MAX = 25 * 1024 * 1024    # default transport cap (K80 10:10 CDT:
 F17_MEDIA_CEIL = 512 * 1024 * 1024  # "limit for broken provider, nothing a
                                     # reasonable generation falls into")
-F17_IMAGE_TIMEOUT = 180
+F17_IMAGE_TIMEOUT = 600   # U48/P65: Agora parity — Constants.
+                                    # IMAGE_GENERATION_TIMEOUT_MS is
+                                    # 600_000L; gpt-image-1 high quality
+                                    # legitimately runs minutes. 180s cut
+                                    # off slow-but-valid generations.
+                                    # P26 heartbeats keep the chain warm.
 F17_SPEECH_TIMEOUT = 90
 F17_DL_TIMEOUT = 60
 F17_CF_BASE = "https://api.cloudflare.com/client/v4"
@@ -12792,7 +12797,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "Generate an image from a text prompt using the media provider configured in Settings > Media generation (only offered when image generation is enabled). The finished image lands in this chat as an attachment automatically - do not describe raw bytes.",
+            "description": "Generate an image from a text prompt using the media provider configured in Settings > Media generation (only offered when image generation is enabled). The finished image lands in this chat as an attachment automatically - do not describe raw bytes. Use this whenever the user asks to create, draw, paint, or generate a picture.",
             "parameters": {
                 "type": "object",
                 "properties": {
