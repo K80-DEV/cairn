@@ -218,7 +218,8 @@ TOOLS_ENABLED = os.environ.get("CAIRN_TOOLS", "on").strip().lower() != "off"
 # Unknown tier fails closed to the web-only set. The hand-provisioned owner
 # instance has no env file -> defaults to "owner" (its historical behavior).
 TIER = os.environ.get("CAIRN_TIER", "owner").strip().lower()
-TIER_TOOLS = {"owner": None, "admin": None, "user": frozenset(("web_search", "web_fetch", "memory", "recall"))}
+TIER_TOOLS = {"owner": None, "admin": None, "user": frozenset(("web_search", "web_fetch", "memory", "recall",
+                           "list_conversations", "read_conversation"))}
 # ─── Uploads & attachments (P3.2) ─────────────────────────────────────────────
 UPLOAD_MAX_BYTES = 15 * 1024 * 1024   # 15 MB per file (decoded)
 UPLOAD_BODY_MAX = 24 * 1024 * 1024    # hard JSON body cap (15 MB decodes to ~20 MB b64)
@@ -12312,6 +12313,37 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_conversations",
+            "description": "List your past conversations - browse your own history to find something to read. Returns conversation IDs, titles, and last-updated timestamps. Use this alongside recall; read the full exchange with read_conversation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order": {"type": "string", "description": "Sort by last updated: 'asc' (oldest first) or 'desc' (newest first). Default: 'desc'."},
+                    "limit": {"type": "integer", "description": "Maximum conversations per page (1-50, default 20)."},
+                    "offset": {"type": "integer", "description": "Number of conversations to skip for pagination (default 0)."}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_conversation",
+            "description": "Read one of your past conversations by ID as a linear transcript (user and assistant messages only - tool traffic is excluded), with pagination. Use after recall or list_conversations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "The conversation ID to read (from recall results or list_conversations)."},
+                    "offset": {"type": "integer", "description": "Number of messages to skip for pagination (default 0)."},
+                    "limit": {"type": "integer", "description": "Maximum messages per page (1-100, default 50)."}
+                },
+                "required": ["conversation_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "nextcloud_list",
             "description": "List a folder on your Nextcloud share. Path is relative to the user's files root; omit or empty for root.",
             "parameters": {
@@ -13410,6 +13442,16 @@ def _share_memory_tool(args, action, name, username, conv_id):
 # structurally impossible (S3n design line, same class as memory).
 RECALL_DEFAULT_LIMIT = 8
 RECALL_MAX_LIMIT = 20
+# U51 (patch68): Agora RagToolProvider parity - browse caps mirror the
+# schema (list 1-50 default 20, read 1-100 default 50). The char ceilings
+# are CAIRN house style (Agora returns raw text; we protect the context
+# window): 4000 chars per message, 24000 chars per page.
+LISTCONV_DEFAULT_LIMIT = 20
+LISTCONV_MAX_LIMIT = 50
+READCONV_DEFAULT_LIMIT = 50
+READCONV_MAX_LIMIT = 100
+READCONV_MSG_CAP = 4000
+READCONV_PAGE_CAP = 24000
 # ── U11 (patch19, K80 ask 2026-10-05): semantic conversation search ──
 # Embeddings-backed recall (Agora Conversation Search parity). Vector cache
 # lives in msg_vec (normalized float32, one row per message per model). The
@@ -13528,7 +13570,7 @@ def _semantic_recall(username, q, limit, conv_id=None):
         want = min(limit * 4, 400)
         with sqlite3.connect(DB_PATH) as db:
             rows = db.execute(
-                "SELECT v.message_id, v.vec, c.title, m.role, m.ts, m.compacted_at, m.content "
+                "SELECT v.conv_id, v.message_id, v.vec, c.title, m.role, m.ts, m.compacted_at, m.content "
                 "FROM msg_vec v JOIN messages m ON m.id = v.message_id "
                 "JOIN conversations c ON c.id = v.conv_id "
                 "WHERE v.username=? AND v.model=?" + _gf11,
@@ -13541,7 +13583,7 @@ def _semantic_recall(username, q, limit, conv_id=None):
     except (TypeError, ValueError):
         minv = 0.50
     scored = []
-    for (mid, vb, title, role, ts, compacted, content) in rows:
+    for (cid, mid, vb, title, role, ts, compacted, content) in rows:
         v = _vec_unpack(vb)
         if len(v) != len(qv):
             continue
@@ -13549,17 +13591,17 @@ def _semantic_recall(username, q, limit, conv_id=None):
         for a, b in zip(v, qv):
             d += a * b
         if d >= minv:
-            scored.append((d, mid, title, role, ts, compacted, content))
+            scored.append((d, cid, mid, title, role, ts, compacted, content))
     scored.sort(key=lambda t: -t[0])
     scored = scored[:want]
     lines = []
     total = 0
-    for i, (d, mid, title, role, ts, compacted, content) in enumerate(scored[:limit], 1):
+    for i, (d, cid, mid, title, role, ts, compacted, content) in enumerate(scored[:limit], 1):
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "?"
         mark = " (older - compacted)" if compacted else ""
         snippet = re.sub(r"\s+", " ", (content or "").strip())[:280]
-        line = "%d. [%s] %r (%s)%s sim=%.2f - %s" % (
-            i, when, (title or "New chat")[:60], role, mark, d, snippet)
+        line = "%d. [%s] %r (%s) id=%s%s sim=%.2f - %s" % (
+            i, when, (title or "New chat")[:60], role, cid, mark, d, snippet)
         lines.append(line)
         total += len(line)
         if total > 6000:
@@ -13604,7 +13646,7 @@ def _tool_recall(args: dict, username=None, conv_id=None) -> str:
     with sqlite3.connect(DB_PATH) as db:
         try:
             rows = db.execute(
-                "SELECT c.title, m.role, m.ts, m.compacted_at, "
+                "SELECT c.id, c.title, m.role, m.ts, m.compacted_at, "
                 "snippet(messages_fts, 2, ' [', '] ', '...', 12) AS snip, rank "
                 "FROM messages_fts "
                 "JOIN messages m ON m.rowid = messages_fts.rowid "
@@ -13620,10 +13662,10 @@ def _tool_recall(args: dict, username=None, conv_id=None) -> str:
         return "No matches for %r in your conversations." % q
     lines = ["Recall: %d match(es) for %r (most relevant first):" % (len(rows), q)]
     total = 0
-    for i, (title, role, ts, compacted, snip, rank) in enumerate(rows, 1):
+    for i, (cid, title, role, ts, compacted, snip, rank) in enumerate(rows, 1):
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "?"
         mark = " (older - compacted)" if compacted else ""
-        line = "%d. [%s] %r (%s)%s - %s" % (i, when, (title or "New chat")[:60], role, mark, (snip or "")[:300])
+        line = "%d. [%s] %r (%s) id=%s%s - %s" % (i, when, (title or "New chat")[:60], role, cid, mark, (snip or "")[:300])
         lines.append(line)
         total += len(line)
         if total > 6000:
@@ -13632,6 +13674,112 @@ def _tool_recall(args: dict, username=None, conv_id=None) -> str:
     return chr(10).join(lines)
 
 
+# ---------------------------------------------------------------------------
+# U51 (patch68): CONVERSATION BROWSING PARITY (Agora RagToolProvider).
+# recall = search; these two close the drill-down gap Agora has and CAIRN
+# lacked: list_conversations (paged browse, newest-first) and
+# read_conversation (paged linear transcript, user/assistant only).
+# Rulings, plainly:
+#  (1) SHARE CLONES DO NOT GET THESE IN v1. The share tool floor
+#      (_share_safe_set) stays exactly {web_search, web_fetch, memory,
+#      recall}, so live shares are untouched BY CONSTRUCTION - and both
+#      tools fail closed on a share principal anyway (belt AND suspenders).
+#      A follow-up can widen the floor behind explicit per-share grants.
+#  (2) recall keeps its snippet format (the 6000-char house cap stays) but
+#      its lines now carry "id=<conv id>" so search -> read chains exactly
+#      like Agora's windowed search. Window expansion itself is the owned
+#      deviation: the chain returns the same data in one extra turn.
+#  (3) Everything CAIRN-capped: per-message and per-page char ceilings
+#      protect the context window; Agora returns raw text. Owned deviation.
+#  (4) Ordering is (ts, rowid) - CAIRN conversations are linear; Agora's
+#      branch-topology walk has no CAIRN analog and was NOT reimplemented.
+# ---------------------------------------------------------------------------
+def _page_offset(raw):
+    try:
+        off = int(raw)
+    except (TypeError, ValueError):
+        off = 0
+    return max(0, off)
+def _tool_list_conversations(args: dict, username=None) -> str:
+    if not username:
+        return "Error: no user context for list_conversations."
+    if _is_share_principal(username):
+        return "Error: conversation browsing is not available on share clones."
+    order = str(args.get("order") or "desc").strip().lower()
+    desc = 0 if order == "asc" else 1
+    try:
+        limit = _p1i_bint(args.get("limit"), 1, LISTCONV_MAX_LIMIT, LISTCONV_DEFAULT_LIMIT)
+    except (TypeError, ValueError):
+        limit = LISTCONV_DEFAULT_LIMIT
+    offset = _page_offset(args.get("offset"))
+    with sqlite3.connect(DB_PATH) as db:
+        total = db.execute("SELECT count(*) FROM conversations WHERE user_id=?",
+                           (username,)).fetchone()[0]
+        rows = db.execute(
+            "SELECT id, title, updated_at FROM conversations WHERE user_id=? "
+            "ORDER BY updated_at %s, id LIMIT ? OFFSET ?" % ("DESC" if desc else "ASC"),
+            (username, limit, offset)).fetchall()
+    if not rows:
+        return "Conversations: %d total - nothing to show at offset %d." % (total, offset)
+    lines = ["Conversations: %d total, showing %d-%d (%s):" % (
+        total, offset + 1, offset + len(rows),
+        "newest first" if desc else "oldest first")]
+    for i, (cid, title, upd) in enumerate(rows, 1):
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(upd)) if upd else "?"
+        lines.append("%d. [%s] %r id=%s" % (offset + i, when, (title or "New chat")[:80], cid))
+    lines.append("has_more=%s - read the full exchange with read_conversation(conversation_id=...)."
+                 % ("yes" if offset + len(rows) < total else "no"))
+    return "\n".join(lines)
+def _tool_read_conversation(args: dict, username=None) -> str:
+    if not username:
+        return "Error: no user context for read_conversation."
+    if _is_share_principal(username):
+        return "Error: conversation browsing is not available on share clones."
+    cid = str(args.get("conversation_id") or "").strip()
+    if not cid or len(cid) > 100:
+        return "Error: conversation_id required (from recall or list_conversations)."
+    try:
+        limit = _p1i_bint(args.get("limit"), 1, READCONV_MAX_LIMIT, READCONV_DEFAULT_LIMIT)
+    except (TypeError, ValueError):
+        limit = READCONV_DEFAULT_LIMIT
+    offset = _page_offset(args.get("offset"))
+    with sqlite3.connect(DB_PATH) as db:
+        crow = db.execute("SELECT title FROM conversations WHERE id=? AND user_id=?",
+                          (cid, username)).fetchone()
+        if crow is None:
+            return "Error: conversation %r not found (or not yours)." % cid[:64]
+        total = db.execute(
+            "SELECT count(*) FROM messages WHERE conv_id=? AND role IN ('user','assistant')",
+            (cid,)).fetchone()[0]
+        rows = db.execute(
+            "SELECT role, content, ts, compacted_at FROM messages "
+            "WHERE conv_id=? AND role IN ('user','assistant') "
+            "ORDER BY ts, rowid LIMIT ? OFFSET ?", (cid, limit, offset)).fetchall()
+    lines = ["Conversation %r (id=%s): %d messages, showing %d-%d:" % (
+        (crow[0] or "New chat")[:80], cid, total,
+        offset + 1 if rows else 0, offset + len(rows) if rows else 0)]
+    used = 0
+    cut = False
+    next_off = offset + len(rows)
+    for i, (role, content, ts, compacted) in enumerate(rows, 1):
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
+        mark = " (older - compacted)" if compacted else ""
+        body = (content or "").strip()
+        if len(body) > READCONV_MSG_CAP:
+            body = body[:READCONV_MSG_CAP] + " [...message truncated]"
+        line = "%d. [%s] %s%s: %s" % (offset + i, when, role, mark, body)
+        lines.append(line)
+        used += len(line)
+        if used > READCONV_PAGE_CAP:
+            lines.append("(page truncated at %d chars - continue with offset=%d)"
+                         % (READCONV_PAGE_CAP, offset + i))
+            cut = True
+            next_off = offset + i
+            break
+    lines.append("has_more=%s - next page offset=%d."
+                 % ("yes" if ((cut and next_off < total) or offset + len(rows) < total)
+                    else "no", next_off))
+    return "\n".join(lines)
 # ---------------------------------------------------------------------------
 # U14 (patch22): MCP client integration - Model Context Protocol servers on
 # the stdio transport (newline-delimited JSON-RPC 2.0), npx/uvx style.
@@ -13989,6 +14137,10 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
             return _tool_memory(args, username, conv_id=conv_id)
         elif name == "recall":
             return _tool_recall(args, username, conv_id=conv_id)
+        elif name == "list_conversations":
+            return _tool_list_conversations(args, username)
+        elif name == "read_conversation":
+            return _tool_read_conversation(args, username)
         elif name in ("nextcloud_list", "nextcloud_read"):
             return execute_connector_tool(name, args, username)
         elif name in ("google_connect", "gmail_search", "gmail_read", "calendar_today", "drive_list"):
