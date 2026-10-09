@@ -12277,13 +12277,18 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "memory",
-            "description": "Read or append to your own memory files (markdown). Each principal's memory is private to them - other accounts on this instance can never see or write it. In a share clone, memory is layered: the copied seed is read-only, each guest visit files into its own private partition while the history box is off, and one shared room layer applies while it is on. They live in your system prompt, persist across conversations, and are visible to your principal in Settings. Actions: list (see your files), read (one file), append (add a fact). Files over 32KB trigger a warning: they ship in every request and eat the context budget. 256KB per-file ceiling.",
+            "description": "Read and maintain your own memory files (markdown). Each principal's memory is private to them - other accounts on this instance can never see or write it. In a share clone, memory is layered: the copied seed is read-only forever, each guest visit files into its own private partition while the history box is off, and one shared room layer applies while it is on; the edit actions apply to your writable layer only. They live in your system prompt, persist across conversations, and are visible to your principal in Settings. Actions: list (files with sizes and descriptions), read (one file, or several via names), append (add a fact), create (new file, refuses if it exists, optional description), replace (rewrite a whole file - the way to trim), prepend, patch (old_string must match exactly once, new_string may be empty to delete the match), rename, describe (set a catalog label; empty clears), delete. Files over 32KB trigger a warning: they ship in every request and eat the context budget. 256KB per-file ceiling.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "description": "list | read | append"},
-                    "name": {"type": "string", "description": "File name with .md (e.g. principal.md). Required for read and append."},
-                    "content": {"type": "string", "description": "Text to append (append action only)"}
+                    "action": {"type": "string", "description": "list | read | append | create | replace | prepend | patch | rename | describe | delete"},
+                    "name": {"type": "string", "description": "File name with .md (e.g. principal.md). Required for every action except list."},
+                    "names": {"type": "array", "items": {"type": "string"}, "description": "Multiple file names to read in one call (read action only)."},
+                    "content": {"type": "string", "description": "Full text for create/replace/prepend; text to append for append."},
+                    "old_string": {"type": "string", "description": "Exact text to find for patch. Must match exactly once."},
+                    "new_string": {"type": "string", "description": "Replacement for patch. May be empty to delete the match."},
+                    "new_name": {"type": "string", "description": "Target file name for rename (must not exist yet)."},
+                    "description": {"type": "string", "description": "Catalog label for create/describe (not injected into the prompt; shown in list). Empty clears."}
                 },
                 "required": ["action"]
             }
@@ -12886,9 +12891,61 @@ def _memory_warn(size):
             "conversation and push older history into compaction sooner. "
             "Keep it signal, not transcript." % (size, size // 4))
 
+# U50 (Agora MemoryManager parity): per-directory description sidecar, same
+# file name Agora uses (memory_meta.json, sits beside the .md files). It NEVER
+# rides the system prompt - every projection/import/list path globs *.md only,
+# so a .json beside the files is invisible to them by construction. Corrupt or
+# missing meta reads as {} and the next write starts a clean sidecar. Callers
+# hold _MEMORY_LOCK. Descriptions are capped at 512 chars (Agora has no cap;
+# they never enter a prompt budget, but a sidecar still shouldn't grow teeth).
+DESC_MAX = 512
+def _mem_meta_read(d):
+    try:
+        v = json.loads((d / "memory_meta.json").read_text())
+        return {str(k): str(x) for k, x in v.items()} if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+def _mem_meta_write(d, values):
+    try:
+        tmp = d / "memory_meta.json.tmp"
+        tmp.write_text(json.dumps(values, sort_keys=True))
+        os.replace(str(tmp), str(d / "memory_meta.json"))
+    except Exception as e:
+        log.warning("memory meta write failed in %s: %s", d, e)
+def _mem_count(hay, needle):
+    """U50: Agora's countOccurrences - NON-OVERLAPPING exact matches. Empty
+    needle returns 0 by contract (callers must refuse it; an unguarded find
+    would loop forever)."""
+    if not needle:
+        return 0
+    n = 0
+    start = 0
+    while True:
+        i = hay.find(needle, start)
+        if i < 0:
+            return n
+        n += 1
+        start = i + len(needle)
+def _mem_layer_bytes(d, exclude=None):
+    """U50: summed *.md bytes in one active share layer (the append-path
+    ceiling loop lifted verbatim, plus exclude for whole-file rewrites)."""
+    used = 0
+    if d.is_dir():
+        for f in d.glob("*.md"):
+            if exclude is not None and f.name == exclude:
+                continue
+            try:
+                used += f.stat().st_size
+            except Exception:
+                pass
+    return used
 def _tool_memory(args: dict, username=None, conv_id=None) -> str:
     """S4f5 + R7a: the agent's own memory files, NAMESPACED PER PRINCIPAL.
-    list | read | append. Every action is scoped to that principal's
+    list | read | append | create | replace | prepend | patch | rename |
+    describe | delete (U50, Agora MemoryToolProvider parity - CAIRN keeps its
+    proven single-tool dispatch instead of Agora's six definitions; the
+    operations are Agora's, the fences are CAIRN's). Every action is scoped
+    to that principal's
     directory - a resident's Mara can neither read nor write the owner's
     memory, and the owner's Mara cannot reach into a resident's."""
     action = str(args.get("action") or "list").strip().lower()
@@ -12897,8 +12954,10 @@ def _tool_memory(args: dict, username=None, conv_id=None) -> str:
     # plane at all - not the projection (gated in load_system_prompt), not
     # reads, not writes. Polite in-band decline, not a schema error, so the
     # agent can tell the guest instead of hallucinating a memory.
-    if action in ("list", "read", "append") and _is_share_principal(username) \
-            and not _share_memory_allowed(username):
+    # U50: the fence stopped enumerating actions - a share clone with memory
+    # OFF gets NO memory plane for ANY action, present or future. Fail-closed
+    # by shape, not by list membership.
+    if _is_share_principal(username) and not _share_memory_allowed(username):
         return ("Memory is turned off for this share. Chat stays private in "
                 "both directions, but nothing is remembered between "
                 "conversations here.")
@@ -12915,8 +12974,30 @@ def _tool_memory(args: dict, username=None, conv_id=None) -> str:
         if md.exists():
             files = sorted(md.glob("*.md"))
             if files:
-                return "\n".join("%s (%d bytes)" % (f.name, f.stat().st_size) for f in files)
+                _mm50 = _mem_meta_read(md)
+                return "\n".join("%s (%d bytes)%s" % (
+                    f.name, f.stat().st_size,
+                    (" - " + _mm50[f.name]) if _mm50.get(f.name) else "") for f in files)
         return "No memory files yet. Create one with action=append."
+    # U50 (Agora read_memory_file parity): names[] multi-read does NOT require
+    # a single 'name' (Agora: name optional when names is present) - resolved
+    # ahead of the single-name guard. A bad or missing entry is reported in
+    # place; the rest still ships.
+    if action == "read" and isinstance(args.get("names"), list) \
+            and any(str(x).strip() for x in args["names"]):
+        _out50 = []
+        for _n50 in args["names"]:
+            _n50 = str(_n50).strip()
+            if not _n50:
+                continue
+            _pp50 = _memory_file_path(_n50, username)
+            if _pp50 is None:
+                _out50.append("--- %s ---\nError: invalid memory file name (basename only, must end in .md)" % _n50)
+            elif not _pp50.exists():
+                _out50.append("--- %s ---\nMemory file not found: %s" % (_n50, _n50))
+            else:
+                _out50.append("--- %s ---\n%s" % (_n50, _pp50.read_text()))
+        return "\n\n".join(_out50)
     p = _memory_file_path(name, username)
     if not p:
         return "Error: invalid memory file name %r (basename only, must end in .md)" % name
@@ -12938,8 +13019,10 @@ def _tool_memory(args: dict, username=None, conv_id=None) -> str:
             size = len(merged.encode("utf-8"))
             if size > MEMORY_FILE_CAP:
                 return ("Error: append refused - %s would be %d bytes and the "
-                        "per-file ceiling is %d bytes. Read it and trim what "
-                        "no longer matters, then append the rest." % (name, size, MEMORY_FILE_CAP))
+                        "per-file ceiling is %d bytes. Read it, trim what no "
+                        "longer matters, and write the result back with "
+                        "action=replace (or action=patch to edit in place)."
+                        % (name, size, MEMORY_FILE_CAP))
             # R11-03 (M26): per-principal total ceiling across all memory files.
             if _store_total_bytes(md, exclude=name) + size > MEMORY_TOTAL_CAP:
                 return ("Error: append refused - your memory store would top %d "
@@ -12951,7 +13034,146 @@ def _tool_memory(args: dict, username=None, conv_id=None) -> str:
             reload_identity()
             return ("Appended %d bytes to %s (%d bytes total). It is now part of "
                     "your system prompt.%s" % (len(content), name, size, _memory_warn(size)))
-    return "Error: unknown action %r (use list, read, or append)" % action
+    # U50 (Agora MemoryToolProvider parity): the full edit plane. Agora's
+    # agent got create/edit(replace|patch|rename|describe)/delete from day
+    # one; CAIRN's had APPEND ONLY - the cap-error text told it to "trim what
+    # no longer matters" with no way to obey. Same fences as append:
+    # _MEMORY_LOCK, per-file cap, per-principal total cap, 0600, mkdir 0700,
+    # reload_identity, consequence warning. PATCH REQUIRES A UNIQUE MATCH
+    # (Agora's rule; the error reports the count; nothing is written unless
+    # exactly one match exists).
+    if action == "create":
+        content = str(args.get("content") or "")
+        size = len(content.encode("utf-8"))
+        if size > MEMORY_FILE_CAP:
+            return ("Error: create refused - %d bytes over the %d-byte per-file "
+                    "ceiling." % (size, MEMORY_FILE_CAP))
+        with _MEMORY_LOCK:
+            if p.exists():
+                return ("Error: create refused - %s already exists (use replace "
+                        "to rewrite it or patch to edit it)." % name)
+            if _store_total_bytes(md) + size > MEMORY_TOTAL_CAP:
+                return ("Error: create refused - your memory store would top %d "
+                        "bytes total." % MEMORY_TOTAL_CAP)
+            md.mkdir(parents=True, exist_ok=True)
+            md.chmod(0o700)
+            p.write_text(content)
+            p.chmod(0o600)
+            _d50 = str(args.get("description") or "").strip()[:DESC_MAX]
+            if _d50:
+                _m50 = _mem_meta_read(md)
+                _m50[name] = _d50
+                _mem_meta_write(md, _m50)
+            reload_identity()
+        return ("Created %s (%d bytes). It is now part of your system prompt.%s"
+                % (name, size, _memory_warn(size)))
+    if action == "replace":
+        content = str(args.get("content") or "")
+        size = len(content.encode("utf-8"))
+        if size > MEMORY_FILE_CAP:
+            return ("Error: replace refused - %d bytes over the %d-byte per-file "
+                    "ceiling." % (size, MEMORY_FILE_CAP))
+        with _MEMORY_LOCK:
+            if not p.exists():
+                return "Error: replace refused - %s not found (use create for a new file)." % name
+            if _store_total_bytes(md, exclude=name) + size > MEMORY_TOTAL_CAP:
+                return ("Error: replace refused - your memory store would top %d "
+                        "bytes total." % MEMORY_TOTAL_CAP)
+            p.write_text(content)
+            p.chmod(0o600)
+            reload_identity()
+        return ("Replaced %s (%d bytes). Your system prompt carries the new "
+                "version from the next request.%s" % (name, size, _memory_warn(size)))
+    if action == "prepend":
+        content = str(args.get("content") or "")
+        if not content.strip():
+            return "Error: nothing to prepend (content is empty)."
+        if not content.endswith("\n"):
+            content += "\n"
+        with _MEMORY_LOCK:
+            existing = p.read_text() if p.exists() else ""
+            merged = content + existing
+            size = len(merged.encode("utf-8"))
+            if size > MEMORY_FILE_CAP:
+                return ("Error: prepend refused - %s would be %d bytes and the "
+                        "per-file ceiling is %d bytes." % (name, size, MEMORY_FILE_CAP))
+            if _store_total_bytes(md, exclude=name) + size > MEMORY_TOTAL_CAP:
+                return ("Error: prepend refused - your memory store would top %d "
+                        "bytes total." % MEMORY_TOTAL_CAP)
+            md.mkdir(parents=True, exist_ok=True)
+            md.chmod(0o700)
+            p.write_text(merged)
+            p.chmod(0o600)
+            reload_identity()
+        return ("Prepended %d bytes to %s (%d bytes total). It is now part of "
+                "your system prompt.%s" % (len(content), name, size, _memory_warn(size)))
+    if action == "patch":
+        old50 = str(args.get("old_string") or "")
+        new50 = str(args.get("new_string") or "")
+        if not old50:
+            return "Error: patch requires a non-empty old_string."
+        with _MEMORY_LOCK:
+            if not p.exists():
+                return "Memory file not found: %s" % name
+            existing = p.read_text()
+            _hits50 = _mem_count(existing, old50)
+            if _hits50 != 1:
+                if _hits50 == 0:
+                    return "Error: old_string not found in %s - patch refused (nothing changed)." % name
+                return ("Error: old_string matches %d times in %s; it must be "
+                        "unique - patch refused (nothing changed)." % (_hits50, name))
+            merged = existing.replace(old50, new50)
+            size = len(merged.encode("utf-8"))
+            if size > MEMORY_FILE_CAP:
+                return ("Error: patch refused - result would be %d bytes, over "
+                        "the per-file ceiling." % size)
+            p.write_text(merged)
+            p.chmod(0o600)
+            reload_identity()
+        return "Patched %s (%d bytes total).%s" % (name, size, _memory_warn(size))
+    if action == "rename":
+        nn50 = str(args.get("new_name") or "").strip()
+        np50 = _memory_file_path(nn50, username)
+        if np50 is None:
+            return "Error: rename requires a valid new_name (basename only, must end in .md)."
+        if nn50 == name:
+            return "Error: rename refused - new_name equals the current name."
+        with _MEMORY_LOCK:
+            if not p.exists():
+                return "Memory file not found: %s" % name
+            if np50.exists():
+                return "Error: rename refused - %s already exists." % nn50
+            p.rename(np50)
+            _m50 = _mem_meta_read(md)
+            if name in _m50:
+                _m50[nn50] = _m50.pop(name)
+            _mem_meta_write(md, _m50)
+            reload_identity()
+        return ("Renamed %s to %s. Your system prompt carries it under the new "
+                "name from the next request." % (name, nn50))
+    if action == "describe":
+        _d50 = str(args.get("description") or "").strip()[:DESC_MAX]
+        with _MEMORY_LOCK:
+            if not p.exists():
+                return "Memory file not found: %s" % name
+            _m50 = _mem_meta_read(md)
+            if _d50:
+                _m50[name] = _d50
+            else:
+                _m50.pop(name, None)
+            _mem_meta_write(md, _m50)
+        return ("Description set for %s." % name) if _d50 else "Description cleared for %s." % name
+    if action == "delete":
+        with _MEMORY_LOCK:
+            if not p.exists():
+                return "Memory file not found: %s" % name
+            p.unlink()
+            _m50 = _mem_meta_read(md)
+            if _m50.pop(name, None) is not None:
+                _mem_meta_write(md, _m50)
+            reload_identity()
+        return "Deleted %s. It is out of your system prompt from the next request." % name
+    return "Error: unknown action %r (use list, read, append, create, replace, prepend, patch, rename, describe, or delete)" % action
 def _share_memory_tool(args, action, name, username, conv_id):
     """B5: the memory tool for SHARE principals. Layers (see
     _share_mem_read_dirs): seed (the creation-time copy, read-only FOREVER -
@@ -12969,27 +13191,48 @@ def _share_memory_tool(args, action, name, username, conv_id):
         lines = []
         for d, lab in _share_mem_read_dirs(username, gid):
             if d.is_dir():
+                _mm50 = _mem_meta_read(d)
                 for f in sorted(d.glob("*.md")):
                     try:
                         size = f.stat().st_size
                     except Exception:
                         size = 0
-                    lines.append("%s%s (%d bytes)" % (lab, f.name, size))
+                    lines.append("%s%s (%d bytes)%s" % (
+                        lab, f.name, size,
+                        (" - " + _mm50[f.name]) if _mm50.get(f.name) else ""))
         if lines:
             return "\n".join(lines)
         return "No memory files yet. Create one with action=append."
+    def _read_one50(nm):
+        # seed first (a copied original wins a name clash), then the layer
+        # this conversation actively writes to. No other layer is readable.
+        pp = base / nm
+        if not pp.is_file() and wdir is not None:
+            pp = wdir / nm
+        if not pp.is_file():
+            return "Memory file not found: %s" % nm
+        return pp.read_text()
+    # U50: Agora names[] multi-read needs no single 'name' (Agora: name
+    # optional when names is present) - resolved ahead of the single-name
+    # guard; per-entry shape validation applies. Seed-first per file.
+    if action == "read" and isinstance(args.get("names"), list) \
+            and any(str(x).strip() for x in args["names"]):
+        _out50 = []
+        for _n50 in args["names"]:
+            _n50 = str(_n50).strip()
+            if not _n50:
+                continue
+            if not _n50 or len(_n50) > 100 or _n50 != _n50.strip() or _n50.startswith(".") \
+                    or "/" in _n50 or not _n50.endswith(".md"):
+                _out50.append("--- %s ---\nError: invalid memory file name (basename only, must end in .md)" % _n50)
+                continue
+            _out50.append("--- %s ---\n%s" % (_n50, _read_one50(_n50)))
+        return "\n\n".join(_out50)
     if not name or len(name) > 100 or name != name.strip() or name.startswith(".") \
             or "/" in name or not name.endswith(".md"):
         return "Error: invalid memory file name %r (basename only, must end in .md)" % name
     if action == "read":
-        # seed first (a copied original wins a name clash), then the layer
-        # this conversation actively writes to. No other layer is readable.
-        p = base / name
-        if not p.is_file() and wdir is not None:
-            p = wdir / name
-        if not p.is_file():
-            return "Memory file not found: %s" % name
-        return p.read_text()
+        return _read_one50(name)
     if action == "append":
         if wdir is None:
             return ("Memory can't be filed right now: this conversation has no "
@@ -13009,8 +13252,10 @@ def _share_memory_tool(args, action, name, username, conv_id):
             size = len(merged.encode("utf-8"))
             if size > MEMORY_FILE_CAP:
                 return ("Error: append refused - %s would be %d bytes and the "
-                        "per-file ceiling is %d bytes. Read it and trim what "
-                        "no longer matters, then append the rest." % (name, size, MEMORY_FILE_CAP))
+                        "per-file ceiling is %d bytes. Read it, trim what no "
+                        "longer matters, and write the result back with "
+                        "action=replace (or action=patch to edit in place)."
+                        % (name, size, MEMORY_FILE_CAP))
             # B5 seed immutability: the write layer is room/ or visits/<gid>/
             # - NEVER the seed base. A same-name append beside a seed file
             # lands in the active layer; the seed copy keeps its bytes.
@@ -13034,7 +13279,128 @@ def _share_memory_tool(args, action, name, username, conv_id):
             reload_identity()
             return ("Appended %d bytes to %s (%d bytes total). It is now part of "
                     "your system prompt.%s" % (len(content), name, size, _memory_warn(size)))
-    return "Error: unknown action %r (use list, read, or append)" % action
+    # U50 (Agora edit plane, share shape): the writable surface is the ACTIVE
+    # LAYER only. The seed stays read-only FOREVER - replace/patch/rename/
+    # describe/delete refuse seed-only files; a layer file (even one shadowing
+    # a seed name) is fully yours. Fail-closed on no active layer, exactly how
+    # append already does it. VISIT_MAX_BYTES + MEMORY_FILE_CAP enforced under
+    # _MEMORY_LOCK like append does.
+    if action in ("create", "replace", "prepend", "patch", "rename", "describe", "delete"):
+        if wdir is None:
+            return ("Memory can't be filed right now: this conversation has no "
+                    "private visit partition to write under. Facts stay in the "
+                    "chat itself.")
+        p50 = wdir / name
+        if action == "delete":
+            if not p50.is_file():
+                if (base / name).is_file():
+                    return ("Error: %s lives in the seed layer - the seed is "
+                            "read-only FOREVER and cannot be deleted from a "
+                            "clone." % name)
+                return "Memory file not found in your writable layer: %s" % name
+            with _MEMORY_LOCK:
+                p50.unlink()
+                _m50 = _mem_meta_read(wdir)
+                if _m50.pop(name, None) is not None:
+                    _mem_meta_write(wdir, _m50)
+                reload_identity()
+            return ("Deleted %s from this clone's active layer. The seed copy "
+                    "(if any) keeps its bytes." % name)
+        if action == "describe":
+            _d50 = str(args.get("description") or "").strip()[:DESC_MAX]
+            if not p50.is_file():
+                if (base / name).is_file():
+                    return ("Error: %s is a seed file - describe applies to files "
+                            "in your own writable layer." % name)
+                return "Memory file not found in your writable layer: %s" % name
+            with _MEMORY_LOCK:
+                _m50 = _mem_meta_read(wdir)
+                if _d50:
+                    _m50[name] = _d50
+                else:
+                    _m50.pop(name, None)
+                _mem_meta_write(wdir, _m50)
+            return ("Description set for %s." % name) if _d50 else "Description cleared for %s." % name
+        if action == "rename":
+            nn50 = str(args.get("new_name") or "").strip()
+            if not nn50 or len(nn50) > 100 or nn50 != nn50.strip() or nn50.startswith(".") \
+                    or "/" in nn50 or not nn50.endswith(".md"):
+                return "Error: rename requires a valid new_name (basename only, must end in .md)"
+            if not p50.is_file():
+                if (base / name).is_file():
+                    return ("Error: %s is a seed file - the seed is read-only "
+                            "FOREVER and cannot be renamed from a clone." % name)
+                return "Memory file not found in your writable layer: %s" % name
+            q50 = wdir / nn50
+            if q50.exists():
+                return "Error: rename refused - %s already exists in your active layer." % nn50
+            with _MEMORY_LOCK:
+                p50.rename(q50)
+                _m50 = _mem_meta_read(wdir)
+                if name in _m50:
+                    _m50[nn50] = _m50.pop(name)
+                _mem_meta_write(wdir, _m50)
+                reload_identity()
+            return "Renamed %s to %s within this clone's active layer." % (name, nn50)
+        # content-bearing actions: create/replace/prepend/patch share ONE
+        # ceiling routine (per-file + per-active-layer).
+        if action in ("replace", "prepend", "patch") and not p50.is_file():
+            if (base / name).is_file():
+                return ("Error: %s is a seed file - read-only FOREVER. append (or "
+                        "create) lands a copy in your own writable layer instead." % name)
+            return "Memory file not found in your writable layer: %s" % name
+        if action == "create" and p50.is_file():
+            return ("Error: create refused - %s already exists in your active "
+                    "layer (use replace)." % name)
+        _ex50 = p50.read_text() if p50.is_file() else ""
+        if action in ("create", "replace"):
+            merged = str(args.get("content") or "")
+        elif action == "prepend":
+            c50 = str(args.get("content") or "")
+            if not c50.strip():
+                return "Error: nothing to prepend (content is empty)."
+            if not c50.endswith("\n"):
+                c50 += "\n"
+            merged = c50 + _ex50
+        else:
+            old50 = str(args.get("old_string") or "")
+            new50 = str(args.get("new_string") or "")
+            if not old50:
+                return "Error: patch requires a non-empty old_string."
+            _hits50 = _mem_count(_ex50, old50)
+            if _hits50 != 1:
+                if _hits50 == 0:
+                    return "Error: old_string not found in your active layer's %s - patch refused (nothing changed)." % name
+                return ("Error: old_string matches %d times in %s; it must be "
+                        "unique - patch refused (nothing changed)." % (_hits50, name))
+            merged = _ex50.replace(old50, new50)
+        size = len(merged.encode("utf-8"))
+        if size > MEMORY_FILE_CAP:
+            return ("Error: %s refused - %d bytes over the %d-byte per-file "
+                    "ceiling." % (action, size, MEMORY_FILE_CAP))
+        with _MEMORY_LOCK:
+            old = p50.stat().st_size if p50.is_file() else 0
+            if _mem_layer_bytes(wdir, exclude=name) + size > VISIT_MAX_BYTES:
+                return ("Error: %s refused - this share's active memory layer "
+                        "would top %d bytes (the per-visit ceiling). Read what "
+                        "you wrote and keep only signal." % (action, VISIT_MAX_BYTES))
+            wdir.mkdir(parents=True, exist_ok=True)
+            wdir.chmod(0o700)
+            p50.write_text(merged)
+            p50.chmod(0o600)
+            if action == "create":
+                _d50 = str(args.get("description") or "").strip()[:DESC_MAX]
+                if _d50:
+                    _m50 = _mem_meta_read(wdir)
+                    _m50[name] = _d50
+                    _mem_meta_write(wdir, _m50)
+            reload_identity()
+        return ("%s %s (%d bytes) in this clone's active layer. It is part of "
+                "your system prompt from the next request.%s"
+                % ({"create": "Created", "replace": "Replaced",
+                    "prepend": "Prepended", "patch": "Patched"}[action],
+                   name, size, _memory_warn(size)))
+    return "Error: unknown action %r (use list, read, append, create, replace, prepend, patch, rename, describe, or delete)" % action
 
 
 # ─── S4f6: recall tool (FTS5 over the principal's own chat history) ──
