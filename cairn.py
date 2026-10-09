@@ -7744,6 +7744,10 @@ def _f18_loop():
         except Exception:
             log.exception("F18 scheduler tick failed (continuing)")
         try:
+            _u44_tick()  # PATCH61/U44: conversation loops (own fence, same thread)
+        except Exception:
+            log.exception("U44 loop tick failed (continuing)")
+        try:
             _p1c_session_purge()  # P1-C/N7: hourly, self-gated, idempotent
         except Exception:
             log.debug("session purge skipped", exc_info=True)
@@ -7759,6 +7763,7 @@ def _f18_start():
         log.info("F18 scheduler armed (tick %ss, host tz %s, per-user zones %s)",
                  F18_TICK_SECONDS, time.strftime("%Z") or "local",
                  "on" if _f18_zi else "unavailable (zoneinfo missing)")
+        _u44_start(_f18_pool)  # PATCH61/U44: loops share this thread + pool
     except Exception:
         log.exception("F18 scheduler failed to start - tasks will NOT fire")
         # P1-D/N7 (round-3 audit): the hourly session purge rides this
@@ -7885,6 +7890,373 @@ def _f18_api_delete(h):
         _f18_inflight.pop(tid, None)   # V16: deleted task frees its slot (a live worker's record write becomes a harmless rowcount 0)
     h._json(200, {"ok": True})  # the task's conversation stays — history is sacred
 # F18-END
+# U44-BEGIN  (PATCH61: conversation loops — Agora parity, K80 2026-10-08)
+# ---------------------------------------------------------------------------
+# U44: conversation LOOPS. An owner starts a loop on ONE conversation; every
+# interval the daemon posts a labeled turn INTO THAT CONVERSATION and runs it
+# as a real agent turn (blocks included, so U42 chronology replays). NOT F18
+# tasks: those are cron/minute-latched and admin/owner-managed; loops are
+# epoch-interval (10s..7d), conversation-scoped, and owner-of-the-chat run
+# them. The tick rides the f18-scheduler thread (one daemon thread, already
+# fenced); cycles run on the F18 worker pool — the lease fences a busy loop,
+# so the pools may be shared. Claim-before-effect: the claim advances
+# next_fire + cycles_done + takes the lease, so a crash cannot refire a
+# cycle, and a lost result only expires the lease (the cycle stays spent —
+# identical philosophy to F18/V16).
+U44_MIN_INTERVAL = 10          # seconds (spec floor)
+U44_MAX_INTERVAL = 604800      # seconds = 7 days (spec ceiling)
+U44_MAX_CYCLES = 100           # per-loop sanity ceiling (matches the client)
+U44_MAX_LOOPS = 20             # active loops per account
+U44_LEASE_SECS = 1800          # one agent turn with a tool chain can be long
+U44_PROMPT_CHARS = 4000        # same prompt budget as a scheduled task
+import threading as _u44_threading  # block owns its import (F4 threading scar)
+_u44_pool = None               # armed = _f18_pool; None = serial (unit tests)
+_u44_inflight = set()
+_u44_inflight_lock = _u44_threading.Lock()
+
+def _u44_ensure(db):
+    """Idempotent create (every call, like _f18_ensure_tasks' first line —
+    no ALTER migrations here, so no module flag is needed; IF NOT EXISTS +
+    IF NOT EXISTS indexes are cheap and crash-safe)."""
+    db.execute("""CREATE TABLE IF NOT EXISTS loops (
+        id TEXT PRIMARY KEY, owner TEXT NOT NULL, conv_id TEXT NOT NULL,
+        prompt TEXT NOT NULL DEFAULT '', interval_secs INTEGER NOT NULL,
+        max_cycles INTEGER NOT NULL, cycles_done INTEGER NOT NULL DEFAULT 0,
+        next_fire REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+        created_at REAL NOT NULL, last_fire REAL, last_result TEXT,
+        lease_until REAL, lease_token TEXT)""")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS loops_one_active_per_conv"
+               " ON loops(conv_id) WHERE status='active'")
+    db.execute("CREATE INDEX IF NOT EXISTS loops_tick ON loops(status, next_fire)")
+
+def _u44_record(loop_id, lease_token, ok, res, when=None):
+    """Record a finished cycle. V16 lease-token discipline: the update rides
+    the claim's token, so a record that lands after the lease expired can
+    never stomp a newer fire's state. A LANDED record releases the lease —
+    the lease means 'a worker may still be running', not 'wait until expiry'
+    (a 10-second loop must not be fenced out of its own next cycle). Auto-
+    close at max_cycles OR on a terminal error ('conversation is gone' can
+    never succeed on retry). 'stopped' is NEVER written (user intent beats
+    a late cycle result — the whole record is dropped)."""
+    close = 1 if (res or "").startswith("conversation is gone") else 0
+    try:
+        with sqlite3.connect(DB_PATH) as db:
+            _u44_ensure(db)
+            db.execute(
+                "UPDATE loops SET last_fire=?, last_result=?, lease_until=NULL,"
+                " status=CASE WHEN status='active' AND (cycles_done>=max_cycles OR ?)"
+                " THEN 'done' ELSE status END"
+                " WHERE id=? AND lease_token=? AND status!='stopped'",
+                (when or time.time(),
+                 (res or "")[:400] + ("" if ok else " [error]"),
+                 close, loop_id, lease_token))
+            db.commit()
+    except Exception:
+        log.exception("U44: cycle record failed (loop %s; lease expiry self-heals)", loop_id)
+
+def _u44_cycle(L):
+    """One loop cycle = a real agent turn IN THE LOOP'S CONVERSATION. Returns
+    (ok, result_str). NEVER raises. Unlike _f18_task_turn the conversation
+    MUST exist (a loop is bound to a chat, it never silently spawns one) and
+    the turn carries U42 blocks. Label carries the cycle number as posted, so
+    history shows exactly which cycle spoke."""
+    owner = L["owner"]; conv_id = L["conv_id"]
+    # claim-before-fire already advanced cycles_done, so the row value at
+    # run time IS the cycle number being posted (never N+1).
+    cyc = max(1, int(L["cycles_done"] or 1)); mx = L["max_cycles"]
+    now = time.time()
+    try:
+        with sqlite3.connect(DB_PATH) as db:
+            row = db.execute("SELECT id FROM conversations WHERE id=? AND user_id=?",
+                             (conv_id, owner)).fetchone()
+            if row is None:
+                return False, "conversation is gone - loop closed"
+            label = "[Loop \u00b7 cycle %d/%d]\n\n%s" % (
+                cyc, mx, (L["prompt"] or "Continue."))
+            db.execute("INSERT INTO messages (id, conv_id, role, content, ts) VALUES (?,?,?,?,?)",
+                       (str(uuid.uuid4()), conv_id, "user", label, now))
+            db.row_factory = sqlite3.Row
+            history = db.execute(
+                "SELECT id, role, content, attachments, stopped FROM messages "
+                "WHERE conv_id=? AND role IN ('user','assistant') AND compacted_at IS NULL "
+                "AND length(trim(content)) > 0 ORDER BY ts, rowid",  # F28/C1 + U37a
+                (conv_id,)).fetchall()
+            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
+            db.commit()
+        cfg, err = model_config(owner)
+        if cfg is None:
+            return False, "model unavailable: " + (err or "?")
+        # Same fences as a scheduled task (P1-A/C1 + P1-C/F7): the cycle runs
+        # at the OWNER's privilege on an ACTIVE account, or it talks to no
+        # tools at all. A loop never mints power its owner lacks.
+        _tu = registry_get_user(owner)
+        _allow = (bool(_tu) and _tu["status"] == "active" and allow_tools_for(dict(_tu)))
+        tools = effective_tool_names(owner) if _allow else frozenset()
+        msgs = build_api_messages(conv_id, history, cfg, username=owner,
+                                  tool_names=tools, tools_allowed=_allow)
+        errs = []
+        def _sink(ev_type, data):
+            if ev_type == "error":
+                errs.append(str(data)[:200])
+        # U42 recorder: hand-built rec (never registered in _STREAMS — v1
+        # loops do not live-stream, the pill polls) so the cycle persists
+        # real chronology. Dispatch still takes _SSE_LOCK = correct.
+        rec = {"content": [], "reasoning": [], "tools": [], "listeners": [],
+               "owner": owner, "full": False, "blocks": [], "bmap": {}}
+        files = []
+        text, reasoning, tool_log = agent_loop(
+            msgs, cfg, lambda et, da: (_sink(et, da), _p1i_dispatch(rec, (et, da))),
+            username=owner, allow_tools=_allow, tool_names=tools,
+            conv_id=conv_id, files_sink=files)
+        blocks_json = None
+        try:
+            _bl = []
+            for _b in (rec.get("blocks") or []):
+                if _b.get("k") in ("t", "r"):
+                    if _b.get("x"):
+                        _bl.append(dict(_b))
+                elif _b.get("k") == "x" and 0 <= _b.get("i", -1) < len(tool_log):
+                    _bl.append({"k": "x", "i": _b["i"]})
+            if any(_b.get("k") == "x" for _b in _bl):
+                blocks_json = json.dumps(_bl)
+        except Exception:
+            blocks_json = None
+        with sqlite3.connect(DB_PATH) as db:
+            if text:
+                db.execute(
+                    "INSERT INTO messages (id, conv_id, role, content, reasoning,"
+                    " tool_calls, blocks, stopped, ts, attachments)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), conv_id, "assistant", text, reasoning or None,
+                     json.dumps(tool_log) if tool_log else None, blocks_json,
+                     0, time.time(), json.dumps(files) if files else None))
+            db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (time.time(), conv_id))
+            db.commit()
+        if not text:
+            return False, ("model error: " + errs[0]) if errs else "empty reply"
+        res = "ok | " + str(messages_token_count(msgs)) + " tok"
+        if errs:
+            res += " | model error: " + errs[0]
+        if tool_log:
+            res += " | tools: " + ",".join((x.get("name") or "?") for x in tool_log)[:120]
+        return True, res[:400]
+    except Exception as e:
+        log.exception("U44: loop cycle failed")
+        return False, "crashed: " + type(e).__name__ + ": " + str(e)[:180]
+
+def _u44_tick(now=None):
+    """Fire due loop cycles (claim before effect). Returns fired descriptors
+    ('pending' = handed to the pool). Every active loop with cycles left is
+    claimed at most once per instant; the lease holds while a cycle runs."""
+    now_e = time.time() if now is None else float(now)
+    due = []
+    with sqlite3.connect(DB_PATH) as db:
+        _u44_ensure(db)
+        cols = ("id", "owner", "name", "conv_id", "prompt", "interval_secs",
+                "max_cycles", "cycles_done", "next_fire", "status", "created_at")
+        rows = [dict(zip(cols, r)) for r in db.execute(
+            "SELECT id, owner, '', conv_id, prompt, interval_secs, max_cycles,"
+            " cycles_done, next_fire, status, created_at FROM loops"
+            " WHERE status='active' AND next_fire<=? ORDER BY next_fire LIMIT 16",
+            (now_e,)).fetchall()]
+        for L in rows:
+            if L["cycles_done"] >= L["max_cycles"]:
+                # closed bookkeeping (a crash between record and close must
+                # not strand a 'done' loop as 'active')
+                db.execute("UPDATE loops SET status='done',"
+                           " next_fire=0, lease_until=NULL WHERE id=? AND status='active'",
+                           (L["id"],))
+                db.commit()
+                continue
+            with _u44_inflight_lock:
+                if L["id"] in _u44_inflight:
+                    continue   # a live cycle of THIS loop suppresses refire
+            _tou = registry_get_user(L["owner"])
+            if not _tou or _tou["status"] != "active":
+                continue       # F7: a non-active account's agent stops talking
+            token = str(uuid.uuid4())
+            iv = max(int(L["interval_secs"] or U44_MIN_INTERVAL), U44_MIN_INTERVAL)
+            cur = db.execute(
+                "UPDATE loops SET next_fire=?, lease_until=?, lease_token=?,"
+                " cycles_done=cycles_done+1"
+                " WHERE id=? AND status='active' AND next_fire<=?"
+                " AND cycles_done<max_cycles"
+                " AND (lease_until IS NULL OR lease_until<=?)",
+                (now_e + iv, now_e + U44_LEASE_SECS, token,
+                 L["id"], now_e, now_e))
+            db.commit()
+            if cur.rowcount != 1:
+                continue
+            L["cycles_done"] += 1
+            L["lease_token"] = token
+            due.append(L)
+    fired = []
+    for L in due:
+        if _u44_pool is None:
+            ok, res = _u44_cycle(L)
+            _u44_record(L["id"], L["lease_token"], ok, res)
+            fired.append({"id": L["id"], "cycles_done": L["cycles_done"], "ok": ok})
+            continue
+        with _u44_inflight_lock:
+            if L["id"] in _u44_inflight:
+                continue
+            _u44_inflight.add(L["id"])
+        def _run(_L=L):
+            try:
+                ok, res = _u44_cycle(_L)
+            except Exception:
+                log.exception("U44: cycle worker failed")
+                ok, res = False, "worker crashed"
+            finally:
+                with _u44_inflight_lock:
+                    _u44_inflight.discard(_L["id"])
+            _u44_record(_L["id"], _L["lease_token"], ok, res)
+        try:
+            _u44_pool.submit(_run)
+            fired.append({"id": L["id"], "cycles_done": L["cycles_done"], "pending": True})
+        except Exception:
+            with _u44_inflight_lock:
+                _u44_inflight.discard(L["id"])
+            log.exception("U44 submit failed; lease expires, cycle stays spent (recoverable)")
+    return fired
+
+def _u44_start(pool):
+    """Called from _f18_start() on the success path ONLY: loops ride the
+    f18-scheduler thread, so if that thread dies loops die with it and say
+    so — no half-armed engine."""
+    global _u44_pool
+    _u44_pool = pool
+    try:
+        with sqlite3.connect(DB_PATH) as db:
+            _u44_ensure(db)
+            db.commit()
+        log.info("U44 loop scheduler armed (tick rides f18-scheduler,"
+                 " pool=%s)", "shared-f18" if pool is not None else "serial")
+    except Exception:
+        _u44_pool = None
+        log.exception("U44 loops failed to arm - loops will NOT fire (tasks unaffected)")
+
+# ── API (route elifs call these with the handler) ────────────────────────
+def _u44_guard(h):
+    """Loops are NOT the admin/owner task surface: any signed-in ACTIVE user
+    who OWNS the conversation runs them (a loop acts as that user, on their
+    model and tools — a guest or a stranger gets 403). The conversation gate
+    lives in start; get/stop filter by owner."""
+    u = h._auth_user()
+    if not u or u["status"] != "active":
+        h._json(401, {"error": "sign in required"})
+        return None
+    return u
+
+def _u44_api_get(h):
+    u = _u44_guard(h)
+    if u is None:
+        return
+    conv = (h._qs("conv") or "").strip() if hasattr(h, "_qs") else ""
+    if not conv:
+        try:
+            import urllib.parse as _up
+            conv = (_up.parse_qs(_up.urlparse(h.path).query).get("conv") or [""])[0].strip()
+        except Exception:
+            conv = ""
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        _u44_ensure(db)
+        rows = db.execute(
+            "SELECT id, owner, conv_id, prompt, interval_secs, max_cycles,"
+            " cycles_done, next_fire, status, created_at, last_fire, last_result"
+            " FROM loops WHERE conv_id=? AND owner=?"
+            " ORDER BY created_at DESC LIMIT 5", (conv, u["username"])).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["last_result"] = (d["last_result"] or "")[:200]
+        d["prompt"] = (d["prompt"] or "")[:200]
+        out.append(d)
+    h._json(200, {"loops": out, "now": time.time()})
+
+def _u44_api_start(h):
+    u = _u44_guard(h)
+    if u is None:
+        return
+    body = h._json_object_body()
+    if body is None:
+        return
+    conv = str(body.get("conv_id") or "").strip()
+    action = str(body.get("action") or "start").strip().lower()
+    if not conv:
+        h._json(400, {"error": "conv_id required"})
+        return
+    if action == "stop":
+        with sqlite3.connect(DB_PATH) as db:
+            _u44_ensure(db)
+            cur = db.execute(
+                "UPDATE loops SET status='stopped', next_fire=0, lease_until=NULL"
+                " WHERE conv_id=? AND owner=? AND status='active'",
+                (conv, u["username"]))
+            db.commit()
+            if cur.rowcount == 0:
+                h._json(404, {"error": "no active loop on this conversation"})
+                return
+        log_event(u["username"], "loop.stop", conv_id=conv)
+        h._json(200, {"ok": True, "stopped": cur.rowcount})
+        return
+    try:
+        iv = int(body.get("interval_secs"))
+    except (TypeError, ValueError):
+        h._json(400, {"error": "interval_secs must be a whole number of seconds"})
+        return
+    try:
+        mc = int(body.get("max_cycles", 10))
+    except (TypeError, ValueError):
+        h._json(400, {"error": "max_cycles must be a whole number"})
+        return
+    prompt = str(body.get("prompt") or "").strip() or "Continue."
+    if not (U44_MIN_INTERVAL <= iv <= U44_MAX_INTERVAL):
+        h._json(400, {"error": "interval_secs must be between %d and %d" % (U44_MIN_INTERVAL, U44_MAX_INTERVAL)})
+        return
+    if not (1 <= mc <= U44_MAX_CYCLES):
+        h._json(400, {"error": "max_cycles must be between 1 and %d" % U44_MAX_CYCLES})
+        return
+    if len(prompt) > U44_PROMPT_CHARS:
+        h._json(400, {"error": "prompt too long (max %d chars)" % U44_PROMPT_CHARS})
+        return
+    now_e = time.time()
+    with sqlite3.connect(DB_PATH) as db:
+        _u44_ensure(db)
+        crow = db.execute("SELECT user_id FROM conversations WHERE id=?", (conv,)).fetchone()
+        if crow is None:
+            h._json(404, {"error": "conversation not found"})
+            return
+        if crow[0] != u["username"]:
+            h._json(403, {"error": "loops run on the conversation owner's model and tools - only they may start one"})
+            return
+        nrow = db.execute("SELECT COUNT(*) FROM loops WHERE conv_id=? AND status='active'",
+                          (conv,)).fetchone()
+        if nrow and nrow[0] > 0:
+            h._json(409, {"error": "this chat is already looping - stop it first"})
+            return
+        mrow = db.execute("SELECT COUNT(*) FROM loops WHERE owner=? AND status='active'",
+                          (u["username"],)).fetchone()
+        if mrow and mrow[0] >= U44_MAX_LOOPS:
+            h._json(400, {"error": "loop cap is %d" % U44_MAX_LOOPS})
+            return
+        lid = str(uuid.uuid4())
+        try:
+            db.execute(
+                "INSERT INTO loops (id, owner, conv_id, prompt, interval_secs,"
+                " max_cycles, cycles_done, next_fire, status, created_at)"
+                " VALUES (?,?,?,?,?,?,0,?,'active',?)",
+                (lid, u["username"], conv, prompt, iv, mc, now_e + iv, now_e))
+            db.commit()
+        except sqlite3.IntegrityError:
+            # the one-active-per-chat partial index beat us to it (double-
+            # tap race) - the count check above just lost a coin flip.
+            h._json(409, {"error": "this chat is already looping - stop it first"})
+            return
+    log_event(u["username"], "loop.start", conv_id=conv, interval_secs=iv, max_cycles=mc)
+    h._json(200, {"ok": True, "id": lid})
+# U44-END
 # F22-BEGIN  (E2E extracts this block verbatim: shipped code, not a reimplementation)
 # ---------------------------------------------------------------------------
 # F22: full-box backup export/import (canon: MaraDen/f22-backup-installer-
@@ -14699,6 +15071,16 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .convpill.show{display:inline-flex}
 .convpill .cpt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;color:var(--text);font-weight:700;font-size:13px}
 .convpill .ctxmeter{margin-left:0;opacity:.8}
+/* PATCH61/U44: loop status pill (Agora parity) */
+.looppill{display:none;align-items:center;gap:8px;width:fit-content;max-width:100%;margin:0 auto 6px;padding:5px 12px;border-radius:999px;border:1px solid var(--border);background:var(--bg);font-size:12px;color:var(--text)}
+.looppill.show{display:flex}
+.lpico{opacity:.85}
+.lptxt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lpstop{margin-left:2px;padding:2px 10px;border-radius:999px;border:1px solid var(--border);background:transparent;color:var(--dim);font-size:11px;cursor:pointer}
+.lorow{display:flex;flex-direction:column;gap:4px;padding:8px 16px 0}
+.loerr{padding:6px 16px;font-size:12px;color:#e06060;min-height:16px}
+.loacts{display:flex;gap:8px;padding:10px 16px 16px}
+.loacts .btn{flex:1}
 .queuebar{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;color:var(--accent);background:var(--surface);border:1px dashed var(--border);border-radius:10px;cursor:pointer}
 .queuebar[hidden]{display:none}
 .chat-col{width:100%;max-width:820px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
@@ -14995,6 +15377,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
     <button id="qsCompact" class="cpop-item" title="fold this chat's older history into a continuity handoff, now"><svg viewBox="0 0 24 24"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg>Context Compact</button>
     <div class="cpop-head">switching one off restricts your next messages - it never grants</div>
   </div>
+  <div id="loopPill" class="looppill" hidden><span class="lpico">\u21c6</span><span id="loopPillTxt" class="lptxt"></span><button id="loopStop" class="lpstop" type="button">stop</button></div>
   <div class="composer-col">
     <button id="attachBtn" class="icon-btn" title="Attach">
       <svg viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
@@ -15020,6 +15403,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
   <button id="cmSearch" class="pop-item">Search in conversation</button>
   <button id="cmSys" class="pop-item">System prompt (this chat)</button>
   <button id="cmFork" class="pop-item">Fork conversation</button>
+  <button id="cmLoop" class="pop-item" title="repeat a prompt in this chat every N seconds (Agora-style loop)">Run loop (repeat this chat)</button>
   <a href="shares" class="pop-item" style="display:block;line-height:44px;text-decoration:none">Share (guest access)</a>
   <div class="cpop-head" style="padding:6px 18px">export</div>
   <button id="mdBtn" class="pop-item">Markdown (.md)</button>
@@ -15773,6 +16157,7 @@ async function renderMsgs47(id, data, fresh) {
 async function switchConv(id) {
   if (streaming || id === currentConv) { if (id === currentConv) closeDrawer(); return; }
   clearPending();
+  _u44State = null; u44renderPill(); u44Poll(true);  // PATCH61/U44: pill follows the chat
   currentConv = id;
   f21Label();
   pillRefresh();
@@ -15790,6 +16175,8 @@ function newChat() {
   chatCol.querySelectorAll('.msg, .toolrow, .thinking, .thinkcard').forEach((n) => n.remove());
   showEmpty();
   exportBtn.hidden = true;
+  $('cmLoop').hidden = true;
+  _u44State = null; u44renderPill();
   loadConversations();
   msgInput.focus();
 }
@@ -15803,6 +16190,7 @@ const convTitles = new Map();
 function pillRefresh() {
   const pill = $('convPill');
   if (!pill) return;
+  if ($('cmLoop')) $('cmLoop').hidden = !currentConv;  // PATCH61/U44: loops need a real chat
   if (!currentConv) { pill.classList.remove('show'); return; }
   $('convPillTitle').textContent = convTitles.get(currentConv) || 'New chat';
   pill.classList.add('show');
@@ -17192,6 +17580,97 @@ document.querySelectorAll('.chip').forEach((ch) => {
     autosize();
     msgInput.focus();
   });
+});
+
+/* ── PATCH61/U44: conversation loops (Agora parity) ─────────────────────
+   Owner-started repeat turns in THIS chat. Server tick runs the cycles;
+   this side shows the pill, counts the seconds down locally (clock-drift
+   tolerant: the display is pure next_fire - now), reloads the chat when a
+   cycle lands (never while this tab is streaming), and offers stop. v1:
+   cycles do not live-stream mid-turn — the pill polls and the messages
+   appear when the cycle completes (or the tab streams over them). */
+var _u44Timer = null, _u44State = null;
+function u44esc(s){ var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; }
+function cmLoopOpen() {
+  if (!currentConv) { flashNote('send a message first - a loop needs a chat to run in'); return; }
+  var bg = sheetBg(); bg.classList.add('on');
+  var b = document.getElementById('tsheetBody'); b.textContent = '';
+  b.appendChild(toolSheetEl('tsheet-title', 'Run loop \u2014 this chat'));
+  b.appendChild(toolSheetEl('tsheet-sub', 'Every interval the agent posts a turn in THIS conversation and continues the work. Runs on your model, your tools, while you are away. Stop anytime from the pill.'));
+  // NOTE: this hunk is a raw string - the \\u escapes below are SINGLE-
+  // backslash JS escapes and must stay that way (house style, P60 scar).
+  function lab(t){ var l = toolSheetEl('tlabel', t); l.style.marginTop = '10px'; return l; }
+  b.appendChild(lab('every (seconds, 10 - 604800)'));
+  var iv = document.createElement('input'); iv.id = 'loIv'; iv.type = 'number'; iv.min = '10'; iv.max = '604800'; iv.value = '60'; iv.style.width = '100%'; b.appendChild(iv);
+  b.appendChild(lab('max cycles (1 - 100)'));
+  var mc = document.createElement('input'); mc.id = 'loMc'; mc.type = 'number'; mc.min = '1'; mc.max = '100'; mc.value = '10'; b.appendChild(mc);
+  b.appendChild(lab('prompt each cycle (blank = "Continue.")'));
+  var pr = document.createElement('textarea'); pr.id = 'loPr'; pr.rows = 3; pr.placeholder = 'Continue.'; pr.style.width = '100%'; pr.style.boxSizing = 'border-box'; b.appendChild(pr);
+  var er = document.createElement('div'); er.className = 'loerr'; er.id = 'loErr'; b.appendChild(er);
+  var bar = document.createElement('div'); bar.className = 'loacts';
+  var go = document.createElement('button'); go.className = 'btn'; go.textContent = 'start loop';
+  var cx = document.createElement('button'); cx.className = 'btn'; cx.textContent = 'cancel';
+  go.addEventListener('click', function () {
+    var body = { conv_id: currentConv, interval_secs: Number(iv.value || 0), max_cycles: Number(mc.value || 0), prompt: pr.value || '' };
+    fetch('api/loops/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (x) {
+        if (!x.ok) { er.textContent = (x.j && x.j.error) || 'could not start loop'; return; }
+        closeSheet(); u44Poll(true); flashNote('loop started - first cycle in ' + body.interval_secs + 's');
+      }).catch(function () { er.textContent = 'network hiccup - loop not started'; });
+  });
+  cx.addEventListener('click', function () { closeSheet(); });
+  bar.appendChild(go); bar.appendChild(cx); b.appendChild(bar);
+}
+function u44fmt(iv) {
+  iv = Math.max(0, Math.round(iv));
+  var d = Math.floor(iv / 86400), h = Math.floor((iv % 86400) / 3600), m = Math.floor((iv % 3600) / 60), s = iv % 60;
+  if (d) return d + 'd ' + h + 'h';
+  if (h) return h + 'h ' + m + 'm';
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+function u44renderPill() {
+  var pill = $('loopPill'), tx = $('loopPillTxt');
+  if (!pill || !tx) return;
+  var L = _u44State && _u44State.status === 'active' ? _u44State : null;
+  if (!L) { pill.classList.remove('show'); pill.hidden = true; return; }
+  pill.hidden = false; pill.classList.add('show');
+  var left = Math.max(0, Math.round((L.next_fire || 0) - Date.now() / 1000));
+  tx.textContent = 'Next in ' + u44fmt(left) + ' \u00b7 Cycle ' + (L.cycles_done || 0) + '/' + L.max_cycles;
+  tx.title = 'prompt: ' + ((L.prompt || 'Continue.').slice(0, 200) + ((L.prompt || '').length > 200 ? '\u2026' : '')) + ' \u00b7 every ' + u44fmt(L.interval_secs) + ' \u00b7 last: ' + (L.last_result || 'not run yet');
+}
+async function u44Poll(force) {
+  if (!currentConv) { _u44State = null; u44renderPill(); return; }
+  try {
+    const r = await fetch('api/loops?conv=' + encodeURIComponent(currentConv));
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!j || !currentConv) return;
+    var act = (j.loops || []).filter(function (L) { return L.status === 'active'; })[0] || null;
+    var prev = _u44State; _u44State = act;
+    if (force || (act && (!prev || prev.id !== act.id))) u44renderPill();
+    if (act) {
+      // a cycle landed since the last look -> reload, but never stomp a live
+      // stream on this tab (the stream already paints the turn).
+      if (prev && prev.id === act.id && (act.cycles_done || 0) > (prev.cycles_done || 0) && !streaming) loadMessages(currentConv);
+    } else if (force) {
+      u44renderPill();
+    } else if (prev && prev.id && !streaming) {
+      // loop ended (done or stopped) while we watched -> one final reload so
+      // the last cycle's turn is on screen.
+      loadMessages(currentConv);
+    }
+  } catch (e) {}
+}
+setInterval(function () { u44renderPill(); }, 1000);      // pure clock math - cheap
+setInterval(function () { if (currentConv) u44Poll(false); }, 5000);
+if ($('cmLoop')) $('cmLoop').addEventListener('click', function () { exportPop.hidden = true; cmLoopOpen(); });
+if ($('loopStop')) $('loopStop').addEventListener('click', function () {
+  if (!_u44State) { u44Poll(true); return; }
+  fetch('api/loops/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conv_id: _u44State.conv_id, action: 'stop' }) })
+    .then(function (r) { return r.json(); })
+    .then(function () { _u44State = null; u44renderPill(); })
+    .catch(function () {});
 });
 
 /* ── export ── */
@@ -21437,6 +21916,8 @@ class MaraHandler(BaseHTTPRequestHandler):
             self._json(200, {"approvals": _ap})
         elif path == "/api/tasks":
             _f18_api_get(self)
+        elif path == "/api/loops":  # PATCH61/U44
+            _u44_api_get(self)
         elif path == "/api/memory":
             u = self._need_user()
             if not u:
@@ -22073,6 +22554,8 @@ class MaraHandler(BaseHTTPRequestHandler):
             _f18_api_post(self)
         elif path == "/api/tasks/delete":
             _f18_api_delete(self)
+        elif path == "/api/loops/start":  # PATCH61/U44
+            _u44_api_start(self)
         elif path == "/api/backup/export":
             _f22_api_export(self)
         elif path == "/api/backup/verify":
@@ -26404,6 +26887,8 @@ LOG_CATALOG["share.approval.requested"] = ("basic", "info", "A guest tool use pa
 LOG_CATALOG["share.approval.decided"] = ("basic", "info", "The share owner decided a pending approval", "share_id, tool, decision")
 LOG_CATALOG["task.fire"] = ("verbose", "info", "A background task fired (activity, not integrity - records only at verbose level)", "task_id, name, ok, duration_ms")
 LOG_CATALOG["task.save"] = ("basic", "info", "A background task was created or edited", "task_id, name, cron")
+LOG_CATALOG["loop.start"] = ("basic", "info", "A conversation loop was started (PATCH61/U44)", "conv_id, interval_secs, max_cycles")
+LOG_CATALOG["loop.stop"] = ("basic", "info", "A conversation loop was stopped (PATCH61/U44)", "conv_id")
 
 HELP_INDEX.append(("updates", "Updates", "how the signed updater works and what it will never do"))
 _HELP_TITLE.update({"updates": "Updates"})
