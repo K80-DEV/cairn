@@ -15784,14 +15784,19 @@ function attachSwipe(el, canStart, onEnd){
 }
 function closeSheet(){
   var bg = document.getElementById('tsheetBg');
-  openSheetSd = null;
+  openSheetSd = null; _thinkLive = null;
   if (!bg || !bg.classList.contains('on')) return;
   if (window.matchMedia && window.matchMedia('(min-width:720px)').matches) { bg.classList.remove('on'); bg.classList.remove('closing'); return; }
   bg.classList.add('closing');
   setTimeout(function(){ bg.classList.remove('on'); bg.classList.remove('closing'); }, 210);
 }
 function liveOff(){ document.querySelectorAll('.thinkcard.live').forEach(function(n){ n.classList.remove('live'); }); }
-function openThinkSheet(txt){
+/* U41 (patch58, K80 2026-10-08): the sheet is now LIVE for streaming cards -
+   bound to its card via _thinkLive and delta-appended on every add(). No more
+   collapse/reopen to see new thinking, and no more 12000-char wall. */
+var _thinkLive = null;
+function openThinkSheet(txt, card){
+  openSheetSd = null; openSheetRender = null; _thinkLive = null;
   var bg = document.getElementById('tsheetBg');
   if (!bg) {
     bg = document.createElement('div');
@@ -15809,8 +15814,12 @@ function openThinkSheet(txt){
   var b = document.getElementById('tsheetBody');
   b.textContent = '';
   b.appendChild(toolSheetEl('tsheet-title', 'Thinking'));
-  var t = String(txt || '');
-  b.appendChild(toolSheetEl('tprose', t.length > 12000 ? t.substring(0, 12000) + '…' : t));
+  var srcT = card ? String(card.parts.join('')) : String(txt || '');
+  var prose = toolSheetEl('tprose');
+  var tn = document.createTextNode(srcT);
+  prose.appendChild(tn);
+  b.appendChild(prose);
+  if (card) _thinkLive = { card: card, node: tn, shown: srcT.length };
   bg.classList.add('on');
 }
 function toolSheetEl(cls, txt){ var el = document.createElement('div'); el.className = cls; if (txt !== undefined) el.textContent = txt; return el; }
@@ -15839,7 +15848,7 @@ function sweepArgChips(){
   argChips = {};
 }
 function openToolSheet(name, kind, rawArgs, sd){
-  openSheetSd = sd;
+  openSheetSd = sd; _thinkLive = null;
   openSheetRender = function(){ renderToolSheet(name, kind, sd.rawArgs, sd); };
   renderToolSheet(name, kind, sd.rawArgs, sd);
 }
@@ -15940,8 +15949,8 @@ function mkThinkCard() {
   wrap.appendChild(ttl);
   wrap.appendChild(prev);
   const parts = [];
-  const c = { div: wrap, add: function (t) { parts.push(String(t)); var s = parts.join(''); prev.textContent = s.length > 160 ? String.fromCharCode(8230) + s.slice(-160) : s; } };
-  wrap.addEventListener('click', function () { openThinkSheet(parts.join('')); });
+  const c = { div: wrap, parts: parts, add: function (t) { parts.push(String(t)); var s = parts.join(''); prev.textContent = s.length > 160 ? String.fromCharCode(8230) + s.slice(-160) : s; if (_thinkLive && _thinkLive.card === c && s.length > _thinkLive.shown) { _thinkLive.node.appendData(s.slice(_thinkLive.shown)); _thinkLive.shown = s.length; var shx = document.querySelector('.tsheet-bg.on .tsheet'); if (shx && shx.scrollHeight - shx.scrollTop - shx.clientHeight < 64) shx.scrollTop = shx.scrollHeight; } } };
+  wrap.addEventListener('click', function () { openThinkSheet(null, c); });
   chatCol.appendChild(wrap);
   return c;
 }
