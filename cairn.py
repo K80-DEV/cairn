@@ -1029,6 +1029,7 @@ def init_db():
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             tool_calls TEXT,
+            blocks TEXT,
             ts REAL NOT NULL,
             FOREIGN KEY (conv_id) REFERENCES conversations(id)
         );
@@ -1155,6 +1156,13 @@ def init_db():
         if "stopped" not in cols:
             if _add_col(db, "messages", "stopped", "INTEGER DEFAULT 0"):
                 log.info("DB migration: added messages.stopped")
+        # One-time U42 migration: chronological turn blocks (K80 ruling
+        # 2026-10-08: CAIRN keeps every Agora feature). JSON list of blocks -
+        # {"k":"t"/"r","x":...} text/think, {"k":"x","i":n} tool_log index.
+        # NULL = legacy shape; the renderer falls back to the old layout.
+        if "blocks" not in cols:
+            if _add_col(db, "messages", "blocks", "TEXT"):
+                log.info("DB migration: added messages.blocks")
         # One-time P3.3 S2 migration: per-user ownership (backfill to owner)
         ccols = {r[1] for r in db.execute("PRAGMA table_info(conversations)")}
         if "user_id" not in ccols:
@@ -6312,7 +6320,8 @@ def _p1i_reserve_stream(cid, owner=""):
         if cid in _STREAMS:
             return None
         rec = _STREAMS[cid] = {"content": [], "reasoning": [], "tools": [],
-                               "listeners": [], "owner": owner, "full": False}
+                               "listeners": [], "owner": owner, "full": False,
+                               "blocks": [], "bmap": {}}  # U42
         return rec
 
 def _p1i_listener_add(rec):
@@ -6341,17 +6350,63 @@ def _p1i_dispatch(rec, evt):
         event_type, data = evt
         if event_type == "message" and data.get("content"):
             rec["content"].append(data["content"])
+            _u42c = str(data["content"])
+            if rec["blocks"] and rec["blocks"][-1].get("k") == "t":
+                rec["blocks"][-1]["x"] += _u42c
+            else:
+                rec["blocks"].append({"k": "t", "x": _u42c})
         elif event_type == "reasoning" and data.get("content"):
             rec["reasoning"].append(data["content"])
+            _u42c = str(data["content"])
+            if rec["blocks"] and rec["blocks"][-1].get("k") == "r":
+                rec["blocks"][-1]["x"] += _u42c
+            else:
+                rec["blocks"].append({"k": "r", "x": _u42c})
+        elif event_type == "tool_args":
+            # U42: progressive args open the card early; idx maps the eventual
+            # tool_call onto THIS block position. Same idx+name merges.
+            _u42j = data.get("idx")
+            if isinstance(_u42j, int) and _u42j in rec["bmap"] \
+                    and rec["bmap"][_u42j]["n"] == data.get("name", ""):
+                pass
+            else:
+                _u42b = {"k": "x", "i": -1, "n": data.get("name", "")}
+                rec["blocks"].append(_u42b)
+                if isinstance(_u42j, int):
+                    rec["bmap"][_u42j] = _u42b
         elif event_type == "tool_call":
             rec["tools"].append({"name": data.get("name", ""),
                                  "arguments": data.get("arguments", ""),
                                  "result": ""})
+            _u42i = len(rec["tools"]) - 1
+            _u42j = data.get("idx")
+            _u42b = None
+            if isinstance(_u42j, int) and _u42j in rec["bmap"]:
+                _u42b = rec["bmap"].pop(_u42j)
+                if _u42b["n"] != data.get("name", ""):
+                    _u42b = None
+            if _u42b is not None:
+                _u42b["i"] = _u42i
+            else:
+                for _u42k in range(len(rec["blocks"]) - 1, -1, -1):
+                    _u42p = rec["blocks"][_u42k]
+                    if _u42p.get("k") == "x" and _u42p.get("i", -1) < 0 \
+                            and _u42p.get("n", "") == data.get("name", ""):
+                        _u42p["i"] = _u42i
+                        break
+                else:
+                    rec["blocks"].append({"k": "x", "i": _u42i})
         elif event_type == "tool_result":
             for t in reversed(rec["tools"]):
                 if not t["result"] and (not data.get("name") or t["name"] == data["name"]):
                     t["result"] = data.get("result", "")
                     break
+            else:
+                # U42: a result with no preceding call (tier-denied, malformed
+                # args) gets a synthetic card - history always showed it.
+                rec["tools"].append({"name": data.get("name", ""),
+                                     "arguments": "", "result": data.get("result", "")})
+                rec["blocks"].append({"k": "x", "i": len(rec["tools"]) - 1})
         for entry in list(rec["listeners"]):
             if entry["dead"]:
                 continue
@@ -15474,9 +15529,10 @@ function addMsgDiv(cls, text) {
   return div;
 }
 
-function addAssistantMsg(text) {
+function addAssistantMsg(text, cont) {  // U42: cont = follow-on block in the same turn
   const div = document.createElement('div');
   div.className = 'msg assistant';
+  if (cont) div.classList.add('cont');
   const av = document.createElement('img');
   av.className = 'msg-avatar';
   av.alt = '';
@@ -15616,7 +15672,35 @@ async function renderMsgs47(id, data, fresh) {
       const sessArr = m.reasoning ? String(m.reasoning).split(TSEP16) : [];
       const tlArr = Array.isArray(m.tool_calls) ? m.tool_calls : [];
       if (!m.content && !tlArr.length && !sessArr.length) return;
-      if (sessArr.length > 1) {
+      const blArr = Array.isArray(m.blocks) && m.blocks.length ? m.blocks : null;
+      if (blArr) {
+        // PATCH59/U42 (Agora parity): daemon recorded the true chronology -
+        // replay it. Text/think/tool in the order they actually streamed.
+        let lastB = null;
+        blArr.forEach((bx) => {
+          if (bx.k === 't' && bx.x) {
+            lastB = addAssistantMsg(bx.x, !!lastB);
+            lastB.det.remove();
+          } else if (bx.k === 'r' && bx.x) {
+            const tcr = mkThinkCard(); tcr.add(bx.x);
+          } else if (bx.k === 'x' && tlArr[bx.i]) {
+            const tr = tlArr[bx.i];
+            const cr = addToolChip(tr.name, fmtToolArgs(tr.arguments), false, tr.arguments);
+            cr.addResult(String(tr.result || ''), false);
+          }
+        });
+        const _acB = attChipsFor(m);
+        if (_acB || m.stopped) {
+          if (!lastB) { lastB = addAssistantMsg('', true); lastB.det.remove(); }
+          if (_acB) lastB.body.parentElement.insertBefore(_acB, lastB.body);
+          if (m.stopped) {
+            const sm2 = document.createElement('span');
+            sm2.className = 'stoppedmark';
+            sm2.textContent = '\u23f9 stopped - incomplete';
+            lastB.body.appendChild(sm2);
+          }
+        }
+      } else if (sessArr.length > 1) {
         for (let sk = 0; sk < sessArr.length; sk++) {
           if (sessArr[sk].trim()) { const tcx = mkThinkCard(); tcx.add(sessArr[sk]); }
           tlArr.forEach((t) => {
@@ -15638,7 +15722,7 @@ async function renderMsgs47(id, data, fresh) {
           c.addResult(String(t.result || ''), false);
         });
       }
-      if (m.content) {
+      if (m.content && !blArr) {
         const b = addAssistantMsg(m.content);
         const acA = attChipsFor(m);
         if (acA) b.body.parentElement.insertBefore(acA, b.body); /* B-13: chips belong INSIDE the text column; as a bubble child they joined the flex row and stole ~210px of text width (K80 2026-09-26) */
@@ -15650,7 +15734,7 @@ async function renderMsgs47(id, data, fresh) {
         }
         if (m.reasoning && sessArr.length <= 1) { b.thoughts.textContent = m.reasoning; b.prev.textContent = String(m.reasoning).slice(0, 140); }
         else b.det.remove();
-      } else if (sessArr.length === 1 && String(m.reasoning).trim()) {
+      } else if (!blArr && sessArr.length === 1 && String(m.reasoning).trim()) {
         const tcx2 = mkThinkCard(); tcx2.add(sessArr[0]);
       }
     }
@@ -16698,11 +16782,14 @@ function send() {
   thinkAfter = false;
   scrollBottom(true);
 
-  let bubble = null;
+  let bubble = null; const bubbleArr = [];
   const ensureBubble = () => {
     if (bubble) return bubble;
     think.remove();
-    bubble = addAssistantMsg('');
+    // U42: a tool card closes the current text block; the next delta opens a
+    // fresh continuation bubble so DOM order equals what actually happened.
+    bubble = addAssistantMsg('', bubbleArr.length > 0);
+    bubbleArr.push(bubble);
     return bubble;
   };
   const chips = [];
@@ -16790,18 +16877,21 @@ function send() {
           const b = ensureBubble();
           if (payload.content) { b.body.textContent += payload.content; scrollBottom(); }
         } else if (cur === 'tool_args') {
+          bubble = null;  // U42
           thinkAfter = true; // patch16: next reasoning delta opens a new card
           var _ta = (payload.idx !== undefined) ? argChips[payload.idx] : null;
           if (_ta) { _ta.setArgs(String(payload.arguments || '')); }
           else if (payload.name) { var _nc = addToolChip(payload.name, fmtToolArgs(payload.arguments), true, payload.arguments); chips.push(_nc); if (payload.idx !== undefined) argChips[payload.idx] = _nc; }
           scrollBottom();
         } else if (cur === 'tool_call') {
+          bubble = null;  // U42
           thinkAfter = true; // patch16
           var _tc = (payload.idx !== undefined) ? argChips[payload.idx] : null;
           if (_tc) { _tc.setArgs(String(payload.arguments || '')); delete argChips[payload.idx]; }
           else { chips.push(addToolChip(payload.name, fmtToolArgs(payload.arguments), undefined, payload.arguments)); }
           scrollBottom();
         } else if (cur === 'tool_result') {
+          bubble = null;  // U42: denied/malformed paths emit ONLY a result; text after it starts a new block
           for (let i = chips.length - 1; i >= 0; i--) {
             const c = chips[i];
             if (c.running && (!payload.name || c.name === payload.name)) {
@@ -16881,9 +16971,13 @@ function send() {
       }
     }
     think.remove();  // U37b: zombie chip never survives a finished turn
-    liveOff(); if (bubble && bubble.body.textContent) mdInto(bubble.body);
-    if (bubble && !bubble.body.textContent && !bubble.thoughts.textContent) bubble.div.remove();
-    if (bubble && bubble.thoughts.textContent === '') bubble.det.remove();
+    liveOff();
+    // U42: markdown-render and prune EVERY block bubble, not just the last.
+    bubbleArr.forEach(function (bb) {
+      if (bb.body.textContent) mdInto(bb.body);
+      if (!bb.body.textContent && !bb.thoughts.textContent) { bb.div.remove(); return; }
+      if (bb.thoughts.textContent === '') bb.det.remove();
+    });
     abortCtrl = null;
     streaming = false;
     refreshSendFace();
@@ -16914,11 +17008,14 @@ async function attachStream(id) {
   thinkCur = null;
   thinkAfter = false;
   scrollBottom(true);
-  let bubble = null;
+  let bubble = null; const bubbleArr = [];
   const ensureBubble = () => {
     if (bubble) return bubble;
     think.remove();
-    bubble = addAssistantMsg('');
+    // U42: a tool card closes the current text block; the next delta opens a
+    // fresh continuation bubble so DOM order equals what actually happened.
+    bubble = addAssistantMsg('', bubbleArr.length > 0);
+    bubbleArr.push(bubble);
     return bubble;
   };
   const chips = [];
@@ -16951,10 +17048,12 @@ async function attachStream(id) {
           const b = ensureBubble();
           if (payload.content) { b.body.textContent += payload.content; scrollBottom(); }
         } else if (cur === 'tool_call') {
+          bubble = null;  // U42
           thinkAfter = true; // patch16
           chips.push(addToolChip(payload.name, fmtToolArgs(payload.arguments), undefined, payload.arguments));
           scrollBottom();
         } else if (cur === 'tool_result') {
+          bubble = null;  // U42: denied/malformed paths emit ONLY a result; text after it starts a new block
           for (let i = chips.length - 1; i >= 0; i--) {
             const c = chips[i];
             if (c.running && (!payload.name || c.name === payload.name)) {
@@ -17015,9 +17114,12 @@ async function attachStream(id) {
     setTimeout(() => { if (currentConv) loadMessages(currentConv); }, 800);
   }
   think.remove();  // U37b: same zombie-chip guard on the reattach path
-  liveOff(); if (bubble && bubble.body.textContent) mdInto(bubble.body);
-    if (bubble && !bubble.body.textContent && !bubble.thoughts.textContent) bubble.div.remove();
-  if (bubble && bubble.thoughts.textContent === '') bubble.det.remove();
+  liveOff();
+  bubbleArr.forEach(function (bb) {  // U42: same block-render pass on re-attach
+      if (bb.body.textContent) mdInto(bb.body);
+      if (!bb.body.textContent && !bb.thoughts.textContent) { bb.div.remove(); return; }
+      if (bb.thoughts.textContent === '') bb.det.remove();
+  });
   streaming = false;
   refreshSendFace();
   flushQueue();
@@ -20870,7 +20972,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                         except Exception:
                             pass  # junk cursor = first page, never a 500
                     rows = db.execute(
-                        "SELECT rowid AS _rid47, role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at "
+                        "SELECT rowid AS _rid47, role, content, ts, attachments, reasoning, tool_calls, blocks, stopped, compacted_at "
                         "FROM messages WHERE " + _w47 + " ORDER BY ts DESC, rowid DESC LIMIT ?",
                         _a47 + [_lim47 + 1]
                     ).fetchall()
@@ -20881,7 +20983,7 @@ class MaraHandler(BaseHTTPRequestHandler):
                         (conv_id,)).fetchone()[0]
                 else:
                     rows = db.execute(
-                        "SELECT role, content, ts, attachments, reasoning, tool_calls, stopped, compacted_at FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts, rowid",  # U10 + U37a
+                        "SELECT role, content, ts, attachments, reasoning, tool_calls, blocks, stopped, compacted_at FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY ts, rowid",  # U10 + U37a + U42
                         (conv_id,)
                     ).fetchall()
                 out = []
@@ -20902,6 +21004,13 @@ class MaraHandler(BaseHTTPRequestHandler):
                             d["tool_calls"] = None
                     else:
                         d["tool_calls"] = None
+                    if d.get("blocks"):
+                        try:
+                            d["blocks"] = json.loads(d["blocks"])
+                        except Exception:
+                            d["blocks"] = None
+                    else:
+                        d["blocks"] = None
                     if not d.get("reasoning"):
                         d["reasoning"] = None
                     out.append(d)
@@ -23988,11 +24097,29 @@ class MaraHandler(BaseHTTPRequestHandler):
             # Store assistant reply (skip empty so history stays clean)
             with sqlite3.connect(DB_PATH) as db:
                 if assistant_text:
+                    # U42: persist chronological blocks. Storing text/think in
+                    # the blocks themselves (not offsets) dodges Python/JS
+                    # index-encoding drift on emoji. Only tool-bearing turns
+                    # need it - a pure-text turn has exactly one layout.
+                    _u42_blocks = None
+                    try:
+                        _u42_bl = []
+                        for _u42_b in (rec.get("blocks") or []):
+                            if _u42_b.get("k") in ("t", "r"):
+                                if _u42_b.get("x"):
+                                    _u42_bl.append(dict(_u42_b))
+                            elif _u42_b.get("k") == "x" and 0 <= _u42_b.get("i", -1) < len(tool_log):
+                                _u42_bl.append({"k": "x", "i": _u42_b["i"]})
+                        if any(_u42_b.get("k") == "x" for _u42_b in _u42_bl):
+                            _u42_blocks = json.dumps(_u42_bl)
+                    except Exception:
+                        _u42_blocks = None
                     db.execute(
-                        "INSERT INTO messages (id, conv_id, role, content, reasoning, tool_calls, stopped, ts, attachments) VALUES (?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO messages (id, conv_id, role, content, reasoning, tool_calls, blocks, stopped, ts, attachments) VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (str(uuid.uuid4()), conv_id, "assistant", assistant_text,
                          (None if qs_off_think else (assistant_reasoning or None)),
                          json.dumps(tool_log) if tool_log else None,
+                         _u42_blocks,
                          stopped_flag,
                          time.time(),
                          json.dumps(turn_files) if turn_files else None))
@@ -24100,6 +24227,7 @@ class MaraHandler(BaseHTTPRequestHandler):
             snap = {"content": "".join(rec["content"]),
                     "reasoning": "".join(rec["reasoning"]),
                     "tools": [dict(t) for t in rec["tools"]],
+                    "blocks": [dict(b) for b in rec.get("blocks", [])],  # U42
                     "full": rec["full"]}
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -24110,14 +24238,28 @@ class MaraHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
             self.wfile.flush()
         try:
-            if snap["content"]:
-                emit("message", {"content": snap["content"]})
-            if snap["reasoning"]:
-                emit("reasoning", {"content": snap["reasoning"]})
-            for t in snap["tools"]:
-                emit("tool_call", {"name": t["name"], "arguments": t["arguments"]})
-                if t["result"]:
-                    emit("tool_result", {"name": t["name"], "result": t["result"]})
+            _u42bl = snap.get("blocks") or []
+            if _u42bl:
+                # U42: replay in the ORDER it happened, not content-then-tools.
+                for _u42b in _u42bl:
+                    if _u42b.get("k") == "t" and _u42b.get("x"):
+                        emit("message", {"content": _u42b["x"]})
+                    elif _u42b.get("k") == "r" and _u42b.get("x"):
+                        emit("reasoning", {"content": _u42b["x"]})
+                    elif _u42b.get("k") == "x" and 0 <= _u42b.get("i", -1) < len(snap["tools"]):
+                        _u42t = snap["tools"][_u42b["i"]]
+                        emit("tool_call", {"name": _u42t["name"], "arguments": _u42t["arguments"]})
+                        if _u42t["result"]:
+                            emit("tool_result", {"name": _u42t["name"], "result": _u42t["result"]})
+            else:
+                if snap["content"]:
+                    emit("message", {"content": snap["content"]})
+                if snap["reasoning"]:
+                    emit("reasoning", {"content": snap["reasoning"]})
+                for t in snap["tools"]:
+                    emit("tool_call", {"name": t["name"], "arguments": t["arguments"]})
+                    if t["result"]:
+                        emit("tool_result", {"name": t["name"], "result": t["result"]})
             if snap["full"]:
                 # The generation ended around our arrival; _close_stream_rec
                 # has marked the recorder and is putting (or has put) the
