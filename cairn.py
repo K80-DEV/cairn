@@ -14559,10 +14559,18 @@ def agent_loop(messages: list, model_cfg: dict, send_event, cancel=None, usernam
                     tool_log.append({"name": tc["name"], "arguments": tc["arguments"][:4000], "result": result[:cap], "s": tseq})
                     # Notify client of tool result
                     _f24_payload = {"name": tc["name"], "result": result[:cap]}
-                    if tc["name"] == "send_file" and files_sink is not None and len(files_sink) > _f24_pre:
+                    # PATCH60/U43 (Agora parity): per-call file attribution for
+                    # ANY tool that grew the turn's files_sink (F24 covered
+                    # send_file only; generated media arrived via `done` and its
+                    # tool sheet never knew). The same dict rides the persisted
+                    # tool_log row ("file") so history reloads rebuild previews.
+                    if files_sink is not None and len(files_sink) > _f24_pre:
                         _f24_f = files_sink[-1]
-                        _f24_payload["sent_file"] = {"id": _f24_f["id"], "name": _f24_f["name"],
-                                                     "size": _f24_f["size"], "kind": _f24_f["kind"]}
+                        _u43_f = {"id": _f24_f["id"], "name": _f24_f["name"],
+                                  "size": _f24_f["size"], "kind": _f24_f["kind"]}
+                        _f24_payload["sent_file"] = _u43_f
+                        if tool_log and tool_log[-1].get("name") == tc["name"]:
+                            tool_log[-1]["file"] = _u43_f
                     send_event("tool_result", _f24_payload)
                     # Add tool result to messages
                     messages.append({
@@ -14767,6 +14775,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
 .tval{font-size:13.5px;color:var(--text);white-space:pre-wrap;word-break:break-word;margin:0 0 10px}
 .tstat-chip{background:var(--accent2);border-color:var(--accent2);color:#fff}
 .tout{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;background:var(--tool);border:1px solid var(--border);border-radius:12px;padding:12px;white-space:pre-wrap;word-break:break-word;max-height:50vh;overflow:auto}
+.tsheet-img{display:block;max-width:100%;border:1px solid var(--border);border-radius:12px;margin:0 0 10px;background:rgba(255,255,255,.03)}
 .tstatrow{margin-bottom:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 @media (min-width:720px){.tsheet-bg{align-items:center}.tsheet{border-radius:18px;animation:sheetpop .22s ease}}
 .tsheet-title{border-bottom:1px solid var(--border);padding-bottom:10px}
@@ -15687,6 +15696,7 @@ async function renderMsgs47(id, data, fresh) {
             const tr = tlArr[bx.i];
             const cr = addToolChip(tr.name, fmtToolArgs(tr.arguments), false, tr.arguments);
             cr.addResult(String(tr.result || ''), false);
+            if (tr.file && cr.setFile) cr.setFile(tr.file); // U43
           }
         });
         const _acB = attChipsFor(m);
@@ -15707,6 +15717,7 @@ async function renderMsgs47(id, data, fresh) {
             if ((typeof t.s === 'number' ? t.s : 0) === sk) {
               const c = addToolChip(t.name, fmtToolArgs(t.arguments), false, t.arguments);
               c.addResult(String(t.result || ''), false);
+              if (t.file && c.setFile) c.setFile(t.file); // U43
             }
           });
         }
@@ -15714,12 +15725,14 @@ async function renderMsgs47(id, data, fresh) {
           if ((typeof t.s === 'number' ? t.s : 0) >= sessArr.length) {
             const c = addToolChip(t.name, fmtToolArgs(t.arguments), false, t.arguments);
             c.addResult(String(t.result || ''), false);
+            if (t.file && c.setFile) c.setFile(t.file); // U43
           }
         });
       } else if (tlArr.length) {
         tlArr.forEach((t) => {
           const c = addToolChip(t.name, fmtToolArgs(t.arguments), false, t.arguments);
           c.addResult(String(t.result || ''), false);
+          if (t.file && c.setFile) c.setFile(t.file); // U43
         });
       }
       if (m.content && !blArr) {
@@ -15960,6 +15973,24 @@ function renderToolSheet(name, kind, rawArgs, sd){
     }
   }
   b.appendChild(toolSheetEl('tslab', 'Result:'));
+  /* PATCH60/U43 (Agora parity, Katy screenshot 2026-10-08): the Result section
+     previews the delivered file (inline image like Agora's view_image sheet;
+     download link for other kinds) and renders structured JSON results as
+     key/value chip rows instead of one raw blob. */
+  if (sd.file && sd.file.id) {
+    var fsrc = '/api/attachments/' + encodeURIComponent(String(sd.file.id));
+    if (String(sd.file.kind || '') === 'image') {
+      var im = document.createElement('img');
+      im.className = 'tsheet-img'; im.loading = 'lazy'; im.alt = String(sd.file.name || 'image');
+      im.src = fsrc; im.onerror = function(){ if (im.parentNode) im.parentNode.removeChild(im); };
+      b.appendChild(im);
+    } else {
+      var fa = document.createElement('a');
+      fa.className = 'tval'; fa.href = fsrc; fa.target = '_blank'; fa.rel = 'noopener';
+      fa.textContent = '📎 ' + String(sd.file.name || 'file') + (sd.file.size ? ' (' + fmtSize(sd.file.size) + ')' : '');
+      b.appendChild(fa);
+    }
+  }
   var row = document.createElement('div');
   row.className = 'tstatrow';
   row.appendChild(toolSheetEl('tchip tstat-chip', toolVerb(sd)));
@@ -15967,7 +15998,18 @@ function renderToolSheet(name, kind, rawArgs, sd){
   b.appendChild(row);
   if (!sd.running) {
     var t = String(sd.res || '');
-    b.appendChild(toolSheetEl('tout', t.length > 8000 ? t.substring(0, 8000) + '\u2026' : (t || '-')));
+    var robj = null;
+    try { var rp = JSON.parse(t); if (rp && typeof rp === 'object' && !Array.isArray(rp)) robj = rp; } catch (e) { robj = null; }
+    if (robj) {
+      Object.keys(robj).forEach(function(k){
+        b.appendChild(toolSheetEl('tchip', k));
+        var v = robj[k];
+        var vs = typeof v === 'string' ? v : JSON.stringify(v);
+        b.appendChild(toolSheetEl('tval', vs.length > 4000 ? vs.substring(0, 4000) + '\u2026' : vs));
+      });
+    } else {
+      b.appendChild(toolSheetEl('tout', t.length > 8000 ? t.substring(0, 8000) + '\u2026' : (t || '-')));
+    }
   }
   bg.classList.add('on');
 }
@@ -16040,7 +16082,7 @@ function mkThinkCard() {
 }
 function addToolChip(name, args, open, raw) {
   var rawArgs = (raw === undefined || raw === null) ? String(args) : String(raw);
-  var sheetData = { res: null, running: true, rawArgs: rawArgs };
+  var sheetData = { res: null, running: true, rawArgs: rawArgs, file: null };
   const wrap = document.createElement('div');
   wrap.className = 'toolrow';
   const chip = document.createElement('div');
@@ -16073,6 +16115,10 @@ function addToolChip(name, args, open, raw) {
   }};
   c.setArgs = function(s){
     sheetData.rawArgs = String(s);
+    if (openSheetSd === sheetData) refreshToolSheet();
+  };
+  c.setFile = function(f){ // U43: delivered-file preview source for the sheet
+    sheetData.file = f || null;
     if (openSheetSd === sheetData) refreshToolSheet();
   };
   c.discard = function(){
@@ -16896,6 +16942,7 @@ function send() {
             const c = chips[i];
             if (c.running && (!payload.name || c.name === payload.name)) {
               c.addResult(String(payload.result || ''));
+              if (payload.sent_file && c.setFile) c.setFile(payload.sent_file); // U43
               if (payload.name === 'send_file' && payload.sent_file) {
                 const acT = attChipsFor({ attachments: [payload.sent_file] });
                 if (acT) c.wrap.appendChild(acT);
@@ -17058,6 +17105,7 @@ async function attachStream(id) {
             const c = chips[i];
             if (c.running && (!payload.name || c.name === payload.name)) {
               c.addResult(String(payload.result || ''));
+              if (payload.sent_file && c.setFile) c.setFile(payload.sent_file); // U43
               if (payload.name === 'send_file' && payload.sent_file) {
                 const acT = attChipsFor({ attachments: [payload.sent_file] });
                 if (acT) c.wrap.appendChild(acT);
