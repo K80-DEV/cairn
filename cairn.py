@@ -7974,7 +7974,328 @@ def _u46_task_tool(name, args, username):
     if code >= 400:
         return _u46_err(code, payload)
     return _u46_json(payload)
-# U46-END
+# U47-BEGIN (PATCH64: agent skill-file tools - Agora parity, K80 2026-10-09)
+# ---------------------------------------------------------------------------
+# U47: the B-15 skills plane behind the agent door. Same core discipline as
+# U45/U46: every fence lives in PURE CORES (_u47_*_core) returning (code,
+# payload); the REST handlers are thin adapters and the agent tool front
+# rides the exact same validation (basename rules, per-file cap, R11-03
+# total ceiling, selection bookkeeping, reload_identity). One set of
+# fences, no REST-vs-agent drift, by construction.
+# Agora semantics mirrored from SkillToolProvider.kt + SkillManager.kt
+# (read 2026-10-09): create refuses existing names; patch requires a
+# NON-EMPTY, UNIQUE old_string; rename refuses existing targets and a
+# same-name rename is a no-op; success strings are "Created X" / "Updated X"
+# / "Deleted X" / "No changes made.". CAIRN deviations, owned and documented
+# (not hidden): skill files carry NO separate description metadata - the
+# catalog line agents see is DERIVED from each file's first content line, so
+# create's "description" arg is accepted-and-noted (U46 model-param
+# precedent) and edit operation "describe" explains instead of pretending.
+# Errors with a REST counterpart ride _u47_err (the U46 HTTP-shaped error
+# strings); Agora-only semantics get plain Agora-worded errors.
+_u47_json = _u46_json
+_u47_err = _u46_err
+U47_READ_MAX_NAMES = 10  # CAIRN context-budget habit: one read reads <= 10
+
+
+def _u47_list_core(u):
+    """REST GET /api/skills parity: my files + my selection. Pure given u."""
+    who = u["username"]
+    sel = _skills_selected(who)
+    files = _skills_list(who)
+    names = set(f["name"] for f in files)
+    sel = files if sel is None else [n for n in sel if n in names]
+    return 200, {"files": files, "selected": sel}
+
+
+def _u47_read_core(u, fname):
+    """REST GET /api/skills/<name> parity: basename fence + 64000-char slice.
+    An invalid name and a missing file answer alike (the fence never leaks
+    which one it was), same as the handler this core came from."""
+    fpath = _skill_file_path(fname, u["username"])
+    if fpath is not None and fpath.exists():
+        return 200, {"name": fname, "content": fpath.read_text()[:64000]}
+    return 404, {"error": "not found"}
+
+
+def _u47_delete_core(u, name):
+    """B-15 delete: unlink, prune selection, reload. REST-identical strings."""
+    who = u["username"]
+    p = _skill_file_path(name, who)
+    if not p:
+        return 400, {"error": "invalid skill file name (basename only, must end in .md)"}
+    if not p.exists():
+        return 404, {"error": "not found"}
+    with _SKILLS_LOCK:
+        p.unlink()
+    sel = _skills_selected(who)
+    if sel is not None and name in sel:
+        _skills_set_selected(who, [n for n in sel if n != name])
+    reload_identity()
+    return 200, {"ok": True, "deleted": name}
+
+
+def _u47_save_core(u, name, content):
+    """B-15 save (upsert): name fence, per-file cap, R11-03 total ceiling,
+    0600 write, brand-new skills auto-enable, reload_identity. Every message
+    and every byte of logic lifted from _handle_skills_post unchanged."""
+    who = u["username"]
+    p = _skill_file_path(name, who)
+    if not p:
+        return 400, {"error": "invalid skill file name (basename only, must end in .md)"}
+    if content is None:
+        return 400, {"error": "provide content (or action: delete / select)"}
+    content = str(content)
+    size = len(content.encode("utf-8"))
+    if size > SKILL_FILE_CAP:
+        return 400, {"error": "skill files are capped at %d bytes (got %d) - trim and retry" % (SKILL_FILE_CAP, size)}
+    existed = p.exists()
+    with _SKILLS_LOCK:
+        # R11-03 (M26): per-principal total ceiling across all skills.
+        if _store_total_bytes(p.parent, exclude=p.name) + size > SKILL_TOTAL_CAP:
+            return 413, {"error": "skill store would exceed %d bytes total for this account - delete or trim other skills first" % SKILL_TOTAL_CAP}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.parent.chmod(0o700)
+        p.write_text(content)
+        p.chmod(0o600)
+    sel = _skills_selected(who)
+    sel = [f["name"] for f in _skills_list(who)] if sel is None else sel
+    if not existed:
+        sel.append(name)  # a brand-new skill starts enabled
+    _skills_set_selected(who, sel)
+    reload_identity()
+    return 200, {"ok": True, "name": name, "size": size}
+
+
+def _u47_select_core(u, want):
+    """B-15 select: foreign/ghost names dropped (unchanged REST rule)."""
+    who = u["username"]
+    allnames = set(f["name"] for f in _skills_list(who))
+    if not isinstance(want, list):
+        return 400, {"error": "selected must be a list of skill file names"}
+    chosen = [str(x) for x in want if str(x) in allnames]  # foreign/ghost names dropped
+    _skills_set_selected(who, chosen)
+    reload_identity()
+    return 200, {"ok": True, "selected": sorted(chosen)}
+
+
+def _u47_post_core(u, body):
+    """REST POST /api/skills parity. Original action order preserved exactly:
+    select branch, then name fence, then delete, then content check, then
+    save. The outer except is the handler's own (log + 500 string)."""
+    try:
+        act = str(body.get("action") or "save")
+        if act == "select":
+            return _u47_select_core(u, body.get("selected"))
+        name = str(body.get("name") or "").strip()
+        if not _skill_file_path(name, u["username"]):
+            return 400, {"error": "invalid skill file name (basename only, must end in .md)"}
+        if act == "delete":
+            return _u47_delete_core(u, name)
+        if body.get("content") is None:
+            return 400, {"error": "provide content (or action: delete / select)"}
+        return _u47_save_core(u, name, str(body["content"]))
+    except Exception as e:
+        log.exception("B-15: skills POST failed")
+        return 500, {"error": "skill operation failed: %s" % e}
+
+
+def _u47_user_gate(username):
+    """Mirror of the REST skills fence (_need_user) for principals with no
+    HTTP request: an ACTIVE registry account, and NEVER a share clone (B-15:
+    share clones never get the skills plane - _skills_block_for already
+    refuses them the injection). Deny by default; a registry that throws is
+    a denial, not a pass. Wider than the U46 task gate on purpose: the REST
+    door this mirrors was always open to every signed-in principal for their
+    OWN namespace, so no privilege is gained through the agent door."""
+    if not username:
+        return None, "Error: skill tools need a signed-in principal"
+    try:
+        u = registry_get_user(username)
+    except Exception:
+        return None, "Error: user registry unavailable"
+    if u is None or (u["status"] or "") != "active":
+        return None, "Error (HTTP 403): skill tools need an active signed-in account"
+    if str(u["username"]).startswith("share-"):
+        return None, "Error: skill tools are not available inside share clones"
+    return u, None
+
+
+def _u47_desc(p):
+    """CAIRN's catalog line, DERIVED (no sidecar metadata): the first content
+    line of the file, heading hashes off, 120 chars. Honest fallbacks beat
+    invented summaries."""
+    try:
+        head = p.read_text(errors="replace")[:4096]
+    except Exception:
+        return "(unreadable)"
+    for line in head.splitlines():
+        t = line.strip().lstrip("#").strip()
+        if t:
+            return t[:120]
+    return "(no description in file)"
+
+
+def _u47_rename_core(u, old_name, new_name):
+    """Agent-side rename (no REST counterpart - the UI never renamed skills).
+    Agora rules: target must not exist (refuse, never clobber); same name is
+    a no-op. CAIRN adds what Agora can't: the bytes move THROUGH the save
+    core so the cap/total fences always bite, and the old file's SELECTION
+    STATE travels with it (a disabled skill stays disabled after rename -
+    renames must not smuggle a skill into the injected context)."""
+    who = u["username"]
+    src = _skill_file_path(old_name, who)
+    if not src or not src.exists():
+        return 404, {"error": "not found"}
+    dst = _skill_file_path(new_name, who)
+    if not dst:
+        return 400, {"error": "invalid skill file name (basename only, must end in .md)"}
+    if dst.name == src.name:
+        return 200, {"ok": True, "renamed": src.name, "noop": True}
+    if dst.exists():
+        return 409, {"error": "Target file already exists: %s" % new_name}
+    try:
+        content = src.read_text()
+    except Exception:
+        return 500, {"error": "could not read %s" % old_name}
+    before = _skills_selected(who)
+    was_sel = before is None or old_name in before
+    code, payload = _u47_save_core(u, new_name, content)
+    if code >= 400:
+        return code, payload
+    with _SKILLS_LOCK:
+        try:
+            src.unlink()
+        except OSError:
+            pass
+    after = _skills_selected(who)
+    if after is not None:
+        fixed = [n for n in after if n not in (old_name, new_name)]
+        if was_sel:
+            fixed.append(new_name)
+        _skills_set_selected(who, fixed)
+    reload_identity()
+    return 200, {"ok": True, "renamed": new_name}
+
+
+def _u47_edit_tool(u, args, arg):
+    """edit_skill_file: replace/patch/rename/describe (Agora's operation
+    set). Every op requires the file to exist (Agora editFile rule) and every
+    write rides _u47_save_core, so no edit path escapes a fence."""
+    fname = arg("name").strip()
+    code, payload = _u47_read_core(u, fname)
+    if code >= 400:
+        return _u47_err(code, payload)
+    cur = payload["content"]
+    op = arg("operation").strip().lower()
+    if op == "replace":
+        code, payload = _u47_save_core(u, fname, arg("content"))
+        if code >= 400:
+            return _u47_err(code, payload)
+        return "Updated %s" % fname
+    if op == "patch":
+        old = arg("old_string")
+        if not old:
+            return "Error: patch requires a non-empty old_string."
+        hits = cur.count(old)
+        if hits == 0:
+            return "Error: old_string not found in %s" % fname
+        if hits > 1:
+            return "Error: old_string matches %d times in %s; it must be unique" % (hits, fname)
+        code, payload = _u47_save_core(u, fname, cur.replace(old, arg("new_string"), 1))
+        if code >= 400:
+            return _u47_err(code, payload)
+        return "Updated %s" % fname
+    if op == "rename":
+        nn = arg("new_name").strip()
+        if not nn:
+            return "Error: rename requires a non-blank new_name."
+        code, payload = _u47_rename_core(u, fname, nn)
+        if code >= 400:
+            return _u47_err(code, payload)
+        return "No changes made." if payload.get("noop") else "Updated %s" % payload["renamed"]
+    if op == "describe":
+        # Schema honesty (U46 model-param precedent): CAIRN stores no
+        # description sidecar, so we say so instead of faking success.
+        return ("note: CAIRN skill files carry no separate description metadata "
+                "and nothing was changed; the catalog line agents see is derived "
+                "from the file's first content line - use operation patch (or "
+                "replace) to edit that line itself.")
+    return "Error: operation must be replace, patch, rename, or describe."
+
+
+def _u47_skill_tool(name, args, username):
+    """Agent tool front for the B-15 skills surface (Agora parity). Every
+    failure returns a clean string - the turn survives, the fence stays shut."""
+    u, err = _u47_user_gate(username)
+    if u is None:
+        return err
+    args = args if isinstance(args, dict) else {}
+
+    def arg(key):
+        v = args.get(key)
+        if v is None:
+            return ""
+        return v if isinstance(v, str) else str(v)
+
+    if name == "list_skill_files":
+        code, payload = _u47_list_core(u)
+        if code >= 400:
+            return _u47_err(code, payload)
+        d = _user_skills_dir(u["username"])
+        out = [{"name": f["name"], "size": f["size"],
+                "description": _u47_desc(d / f["name"]) if d else ""}
+               for f in payload["files"]]
+        return _u47_json({"files": out})
+    if name == "read_skill_file":
+        ns = args.get("names")
+        names = []
+        if isinstance(ns, list):
+            names = [str(x).strip() for x in ns
+                     if x is not None and not isinstance(x, (dict, list)) and str(x).strip()]
+        if not names and arg("name").strip():
+            names = [arg("name").strip()]
+        if not names:
+            return "Error: Provide name or names."
+        clipped = names[U47_READ_MAX_NAMES:]
+        names = names[:U47_READ_MAX_NAMES]
+        parts = []
+        for fn in names:
+            code, payload = _u47_read_core(u, fn)
+            body = _u47_err(code, payload) if code >= 400 else payload["content"]
+            parts.append("--- %s ---\n%s" % (fn, body) if len(names) > 1 else body)
+        if clipped:
+            parts.append("(not read this call, only first %d names honored: %s)"
+                         % (U47_READ_MAX_NAMES, ", ".join(clipped)))
+        return "\n\n".join(parts)
+    if name == "create_skill_file":
+        fname = arg("name").strip()
+        if not _skill_file_path(fname, u["username"]):
+            return _u47_err(400, {"error": "invalid skill file name (basename only, must end in .md)"})
+        if args.get("content") is None:
+            return "Error: content required."
+        if _skill_file_path(fname, u["username"]).exists():
+            # Agora rule: create never clobbers; use edit replace to rewrite.
+            return "Error: File already exists: %s" % fname
+        code, payload = _u47_save_core(u, fname, arg("content"))
+        if code >= 400:
+            return _u47_err(code, payload)
+        out = "Created %s" % fname
+        if arg("description").strip():
+            out += (" (note: CAIRN skill files carry no separate description "
+                    "metadata; the catalog line is derived from the file's "
+                    "first content line)")
+        return out
+    if name == "edit_skill_file":
+        return _u47_edit_tool(u, args, arg)
+    if name == "delete_skill_file":
+        code, payload = _u47_delete_core(u, arg("name").strip())
+        if code >= 400:
+            return _u47_err(code, payload)
+        return "Deleted %s" % payload["deleted"]
+    return "Error: unknown skill tool " + str(name)
+# U47-END
+
 # U44-BEGIN  (PATCH61: conversation loops — Agora parity, K80 2026-10-08)
 # ---------------------------------------------------------------------------
 # U44: conversation LOOPS. An owner starts a loop on ONE conversation; every
@@ -12382,6 +12703,79 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_skill_files",
+            "description": "List saved skill files with their names and compact descriptions.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_skill_file",
+            "description": "Read one or more saved skill files. Read a relevant skill before applying it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "One skill file name."},
+                    "names": {"type": "array", "description": "Multiple skill file names.",
+                              "items": {"type": "string", "description": "A skill file name."}}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill_file",
+            "description": "Create a saved Markdown skill file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The skill file name."},
+                    "content": {"type": "string", "description": "The complete Markdown instructions."},
+                    "description": {"type": "string", "description": "A compact catalog description."}
+                },
+                "required": ["name", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_skill_file",
+            "description": "Edit one aspect of a saved skill file. operation must be replace, patch, rename, or describe.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The current file name."},
+                    "operation": {"type": "string", "description": "One of: replace, patch, rename, describe."},
+                    "content": {"type": "string", "description": "Complete replacement content for replace. May be empty."},
+                    "old_string": {"type": "string", "description": "Exact non-empty unique text to replace for patch."},
+                    "new_string": {"type": "string", "description": "Replacement text for patch. May be empty to delete the match."},
+                    "new_name": {"type": "string", "description": "The target file name for rename."},
+                    "description": {"type": "string", "description": "The new compact description for describe. May be empty to remove it."}
+                },
+                "required": ["name", "operation"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_skill_file",
+            "description": "Delete a saved skill file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The skill file name to delete."}
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
 "name": "send_file",
             "description": "Deliver a completed file INTO this chat as an attachment the user can see and download (images render inline on the chip). Use after producing output files: transcripts, OCR text, exports, generated images. Max 12 MB, up to 8 files per reply.",
             "parameters": {
@@ -13218,6 +13612,12 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
             # fence lives in the cores/gate — the same rules the REST API has
             # always used. Unknown principals fail closed inside.
             return _u46_task_tool(name, args, username)
+        elif name in ("list_skill_files", "read_skill_file", "create_skill_file",
+                      "edit_skill_file", "delete_skill_file"):
+            # U47 (PATCH64): agent-facing skill-file tools (Agora parity).
+            # The B-15 fences are the cores'; REST stayed byte-equivalent
+            # (parity suite proves it). Unknown principals fail closed inside.
+            return _u47_skill_tool(name, args, username)
         elif name in ("start_loop", "stop_loop", "list_loops"):
             # U45 (PATCH62): agent-facing loop tools (Agora parity). Every
             # fence lives in the cores - the same ones the REST API has
@@ -22167,21 +22567,15 @@ class MaraHandler(BaseHTTPRequestHandler):
             u = self._need_user()
             if not u:
                 return
-            sel = _skills_selected(u["username"])
-            files = _skills_list(u["username"])
-            names = set(f["name"] for f in files)
-            sel = files if sel is None else [n for n in sel if n in names]
-            self._json(200, {"files": files, "selected": sel})
+            code, payload = _u47_list_core(u)
+            self._json(code, payload)
         elif path.startswith("/api/skills/"):
             u = self._need_user()
             if not u:
                 return
             fname = urllib.parse.unquote(path[len("/api/skills/"):])
-            fpath = _skill_file_path(fname, u["username"])
-            if fpath is not None and fpath.exists():
-                self._json(200, {"name": fname, "content": fpath.read_text()[:64000]})
-            else:
-                self._json(404, {"error": "not found"})
+            code, payload = _u47_read_core(u, fname)
+            self._json(code, payload)
         elif path == "/manifest.webmanifest":
             # T-A6: PWA identity is per-base - an installed /alice/ clone must
             # not collide with the same box's /bob/ one.
@@ -22508,65 +22902,8 @@ class MaraHandler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             self._json(400, {"error": "JSON body must be an object"})
             return
-        who = u["username"]
-        act = str(body.get("action") or "save")
-        try:
-            if act == "select":
-                allnames = set(f["name"] for f in _skills_list(who))
-                want = body.get("selected")
-                if not isinstance(want, list):
-                    self._json(400, {"error": "selected must be a list of skill file names"})
-                    return
-                chosen = [str(x) for x in want if str(x) in allnames]  # foreign/ghost names dropped
-                _skills_set_selected(who, chosen)
-                reload_identity()
-                self._json(200, {"ok": True, "selected": sorted(chosen)})
-                return
-            name = str(body.get("name") or "").strip()
-            p = _skill_file_path(name, who)
-            if not p:
-                self._json(400, {"error": "invalid skill file name (basename only, must end in .md)"})
-                return
-            if act == "delete":
-                if not p.exists():
-                    self._json(404, {"error": "not found"})
-                    return
-                with _SKILLS_LOCK:
-                    p.unlink()
-                sel = _skills_selected(who)
-                if sel is not None and name in sel:
-                    _skills_set_selected(who, [n for n in sel if n != name])
-                reload_identity()
-                self._json(200, {"ok": True, "deleted": name})
-                return
-            if body.get("content") is None:
-                self._json(400, {"error": "provide content (or action: delete / select)"})
-                return
-            content = str(body["content"])
-            size = len(content.encode("utf-8"))
-            if size > SKILL_FILE_CAP:
-                self._json(400, {"error": "skill files are capped at %d bytes (got %d) - trim and retry" % (SKILL_FILE_CAP, size)})
-                return
-            existed = p.exists()
-            with _SKILLS_LOCK:
-                # R11-03 (M26): per-principal total ceiling across all skills.
-                if _store_total_bytes(p.parent, exclude=p.name) + size > SKILL_TOTAL_CAP:
-                    self._json(413, {"error": "skill store would exceed %d bytes total for this account - delete or trim other skills first" % SKILL_TOTAL_CAP})
-                    return
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.parent.chmod(0o700)
-                p.write_text(content)
-                p.chmod(0o600)
-            sel = _skills_selected(who)
-            sel = [f["name"] for f in _skills_list(who)] if sel is None else sel
-            if not existed:
-                sel.append(name)  # a brand-new skill starts enabled
-            _skills_set_selected(who, sel)
-            reload_identity()
-            self._json(200, {"ok": True, "name": name, "size": size})
-        except Exception as e:
-            log.exception("B-15: skills POST failed")
-            self._json(500, {"error": "skill operation failed: %s" % e})
+        code, payload = _u47_post_core(u, body)
+        self._json(code, payload)
     def _handle_memory_post(self):
         u = self._need_user()
         if not u:
