@@ -13518,7 +13518,7 @@ def _mcp_offer(username):
         return out
     except Exception:
         return []
-def _mcp_execute(name, args, username):
+def _mcp_execute(name, args, username, conv_id=None, files_sink=None):
     parts = str(name or "").split("__")
     if len(parts) != 3 or parts[0] != "mcp" or not parts[1] or not parts[2]:
         return "Error: malformed mcp tool name"
@@ -13543,14 +13543,46 @@ def _mcp_execute(name, args, username):
             return "MCP tool error: " + str(em)[:300]
         res = r.get("result")
         res = res if isinstance(res, dict) else {}
-        bits = []
+        bits, imgs, notes = [], [], []
         for b in res.get("content") or []:
-            if isinstance(b, dict) and b.get("type") == "text":
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
                 bits.append(str(b.get("text") or ""))
+            elif b.get("type") == "image":
+                imgs.append(b)
         txt = (chr(10).join(bits)).strip()
         if res.get("isError"):
             return "MCP tool reported failure: " + (txt[:300] or "no detail")
-        return txt[:MCP_RESULT_CAP] if txt else "(mcp call completed with no text content)"
+        # U49/PATCH66 (Agora parity): image content blocks were silently
+        # dropped before. Third-party server = hostile input: length-bound
+        # BEFORE decoding, real magic sniff with no png-fallback (unknown
+        # types refused outright, matching Agora's unknown-media-type
+        # stance), then delivery through the proven F17 contract which
+        # carries the conv-owner guard + owner-only file + attach row.
+        for b in imgs:
+            data = str(b.get("data") or "")
+            cap = _f17_media_max()
+            if not data or len(data) > cap * 4 // 3 + 1024:
+                notes.append("image block refused (empty or over %d MB cap)"
+                             % (cap // (1024 * 1024)))
+                continue
+            try:
+                raw = _f17_b64.b64decode(data)
+            except Exception:
+                notes.append("image block refused (invalid base64)")
+                continue
+            ext, mime = _f17_sniff(raw, None)
+            if not mime:
+                notes.append("image block refused (not PNG/JPEG/WEBP/GIF)")
+                continue
+            notes.append(_f17_deliver("mcp-" + uuid.uuid4().hex[:8] + "." + ext,
+                                      raw, mime, "image", username,
+                                      conv_id, files_sink))
+        txt = txt[:MCP_RESULT_CAP]
+        if notes:
+            txt = (txt + "\n" if txt else "") + "\n".join(notes)
+        return txt if txt else "(mcp call completed with no text content)"
     out, err = _mcp_session(defn, MCP_TIMEOUT_CALL, call_work)
     if err:
         _MCP_TOOL_CACHE.pop(username, None)
@@ -13631,7 +13663,8 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
         elif name.startswith("mcp__"):
             # U14 (patch22): MCP call. Every failure inside returns a clean
             # string - the turn survives a dead or rude server.
-            return _mcp_execute(name, args, username)
+            return _mcp_execute(name, args, username,
+                        conv_id=conv_id, files_sink=files_sink)
         else:
             return f"Error: unknown tool '{name}'"
     except Exception as e:
