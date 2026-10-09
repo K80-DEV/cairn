@@ -12156,12 +12156,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_shell",
-            "description": "Execute a shell command on CAIRN (Linux, Pi 4B). Returns stdout/stderr.",
+            "description": "Execute a shell command on CAIRN (Linux, Pi 4B). Returns stdout/stderr. Set background=true for a durable detached job that survives the turn and even a daemon restart - it returns a job id to check with get_shell_job/wait_for_job.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The shell command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 30, max 120)"}
+                    "timeout": {"type": "integer", "description": "Foreground timeout in seconds (default 30, max 120). The command is KILLED at timeout; use background=true for anything longer."},
+                    "workdir": {"type": "string", "description": "Working directory (optional, must exist)."},
+                    "background": {"type": "boolean", "description": "Start a durable detached job and return its job id immediately (optional, default false)."}
                 },
                 "required": ["command"]
             }
@@ -12208,7 +12210,8 @@ TOOLS = [
                 "properties": {
                     "path": {"type": "string", "description": "Absolute path to the file"},
                     "old_string": {"type": "string", "description": "Exact text to find"},
-                    "new_string": {"type": "string", "description": "Replacement text"}
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace all occurrences (optional, default false = first only)."}
                 },
                 "required": ["path", "old_string", "new_string"]
             }
@@ -12223,7 +12226,8 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Glob pattern (e.g. '*.py')"},
-                    "path": {"type": "string", "description": "Base directory (default: the CAIRN data dir)"}
+                    "path": {"type": "string", "description": "Base directory (default: the CAIRN data dir)"},
+                    "depth": {"type": "integer", "description": "Max directory levels below path: 1 = base only, higher recurses, 0 = unlimited (default 0)."}
                 },
                 "required": ["pattern"]
             }
@@ -12238,9 +12242,61 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Regex pattern"},
-                    "path": {"type": "string", "description": "File or directory to search (default: the CAIRN data dir/mara)"}
+                    "path": {"type": "string", "description": "File or directory to search (default: the CAIRN data dir/mara)"},
+                    "glob": {"type": "string", "description": "Filter files by glob pattern (optional, e.g. '*.py')."}
                 },
                 "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_shell_jobs",
+            "description": "List your durable background shell jobs on this CAIRN host.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_shell_job",
+            "description": "Get status and bounded output for a durable shell job. Prefer wait_for_job for blocking use.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job id returned by execute_shell(background=true)."}
+                },
+                "required": ["job_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wait_for_job",
+            "description": "Block until a durable shell job finishes or timeout_ms elapses; output snapshots are bounded. A timed-out result includes the current output and leaves the job running; call again to keep waiting.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job id."},
+                    "timeout_ms": {"type": "integer", "description": "Required. Max time to block in milliseconds. Hard ceiling 295000ms per call; larger values are clamped. To wait longer, call again."}
+                },
+                "required": ["job_id", "timeout_ms"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_shell_job",
+            "description": "Stop a running durable shell job and its process tree.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job id."}
+                },
+                "required": ["job_id"]
             }
         }
     },
@@ -14117,7 +14173,15 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
                 return "this tool only exists inside share clones"
             return _share_ask_execute(username, args)
         if name == "execute_shell":
-            return _tool_shell(args)
+            return _tool_shell(args, username)
+        elif name == "list_shell_jobs":
+            return _tool_list_shell_jobs(args, username)
+        elif name == "get_shell_job":
+            return _tool_get_shell_job(args, username)
+        elif name == "wait_for_job":
+            return _tool_wait_for_job(args, username)
+        elif name == "stop_shell_job":
+            return _tool_stop_shell_job(args, username)
         elif name == "read_file":
             return _tool_read_file(args)
         elif name == "write_file":
@@ -14189,11 +14253,18 @@ def execute_tool(name: str, args: dict, username=None, conv_id=None, files_sink=
         log.error("Tool %s failed: %s", name, e)
         return f"Error: {e}"
 
-def _tool_shell(args: dict) -> str:
+def _tool_shell(args: dict, username=None) -> str:
     import subprocess
     cmd = args["command"]
+    wd = str(args.get("workdir") or "").strip() or None
+    if wd and not os.path.isdir(wd):
+        return "Error: workdir %r does not exist." % wd[:200]
+    bg = str(args.get("background") or "").strip().lower() in ("1", "true", "yes", "on")
+    if bg:
+        return _sjob_start(cmd, wd, username)
     timeout = _p1i_bint(args.get("timeout"), 1, 120, 30)   # P1-I/B02
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                       timeout=timeout, cwd=wd)
     out = r.stdout[:50000] if r.stdout else ""
     err = r.stderr[:10000] if r.stderr else ""
     return f"exit_code: {r.returncode}\nstdout: {out}\nstderr: {err}"
@@ -14228,18 +14299,39 @@ def _tool_edit_file(args: dict) -> str:
     content = p.read_text()
     if old not in content:
         return f"Error: old_string not found in {path}"
-    content = content.replace(old, new, 1)
+    _ra52 = str(args.get("replace_all") or "").strip().lower() in ("1", "true", "yes", "on")
+    hits = content.count(old) if _ra52 else 1
+    content = content.replace(old, new, hits)
     p.write_text(content)
-    return f"Edited {path} (replaced {len(old)} chars with {len(new)} chars)"
+    if hits == 1:
+        return f"Edited {path} (replaced {len(old)} chars with {len(new)} chars)"
+    return f"Edited {path} (replaced {hits} occurrence(s), {len(old)} chars with {len(new)} chars each)"
 
 def _tool_glob(args: dict) -> str:
     import glob as globmod
     pattern = args["pattern"]
     base = args.get("path", str(BASE))
-    matches = sorted(globmod.glob(os.path.join(base, "**", pattern), recursive=True))[:200]
+    # U52: depth parity (1 = base only, N = exactly N levels down, 0/absent =
+    # unlimited = the old production pattern verbatim). NEVER stack "**"
+    # segments: "/**/**/x" expands pathologically and hung this box during
+    # the U52 unit run. Plain "*" components per level; one recursive
+    # pattern only for the unlimited case.
+    _d52 = _p1i_bint(args.get("depth"), 0, 64, 0)
+    if _d52 == 0:
+        _full52 = os.path.join(base, "**", pattern)     # production verbatim
+    elif _d52 == 1:
+        _full52 = os.path.join(base, pattern)
+    else:
+        _full52 = os.path.join(base, *(["*"] * (_d52 - 1)), pattern)
+    matches = sorted(globmod.glob(_full52, recursive=True))[:201]
+    _tr52 = len(matches) > 200
+    matches = matches[:200]
     if not matches:
         return "No matches found."
-    return "\n".join(matches)
+    out = "\n".join(matches)
+    if _tr52:
+        out += "\n(truncated at 200 matches - narrow the pattern, set path, or lower depth)"
+    return out
 
 def _tool_grep(args: dict) -> str:
     import subprocess
@@ -14250,13 +14342,312 @@ def _tool_grep(args: dict) -> str:
     # re-granted command execution even after the owner DISABLED the shell
     # tool. The tool-toggle boundary depends on this staying a list. And
     # "head -100" now happens in Python, because a pipe means sh.
+    _inc52 = "*"
+    _g52 = str(args.get("glob") or "").strip()
+    if _g52 and len(_g52) <= 200:
+        _inc52 = _g52
     r = subprocess.run(
-        ["grep", "-rn", "--include=*", "-E", "-e", str(pattern), "--", str(path)],
+        ["grep", "-rn", "--include=" + _inc52, "-E", "-e", str(pattern), "--", str(path)],
         capture_output=True, text=True, timeout=30
     )
-    out = "\n".join(r.stdout.splitlines()[:100])
-    return out[:50000] if out else "No matches found."
+    _l52 = r.stdout.splitlines()
+    out = "\n".join(_l52[:100])[:50000]
+    if not out:
+        return "No matches found."
+    if len(_l52) > 100:
+        out += "\n(truncated at 100 matching lines - narrow the pattern, path, or glob)"
+    return out
 
+# ---------------------------------------------------------------------------
+# U52 (patch69): DURABLE SHELL JOBS (Agora ShellToolProvider cluster parity).
+# CAIRN's execute_shell was foreground-only, killed at <=120s - the agent
+# could not start anything that outlives a turn. Agora's answer is durable
+# Conch jobs; CAIRN's analog is the same philosophy on one host: launch via
+# start_new_session (the F20 house idiom), stdout/err to state/shell-jobs,
+# meta.json on disk. Jobs survive the turn, the session, AND a daemon
+# restart (the process is its own session leader; a job orphaned by a daemon
+# death reports exit code honestly as "unknown" - never a lie).
+# Rulings, plainly:
+#  (1) Tool names are Agora's EXACT (list_shell_jobs, get_shell_job,
+#      wait_for_job, stop_shell_job) MINUS the per-device "server" param -
+#      CAIRN is one host. Owned deviation.
+#  (2) FOREGROUND TIMEOUT STILL KILLS (subprocess.run semantics unchanged,
+#      P1-I/B02 intact). Agora's durable-foreground ("never killed") would
+#      orphan processes with no reaper on this box. background=true is the
+#      supported path for long work. Owned deviation.
+#  (3) Ownership: jobs belong to the launching username; only that
+#      principal can list/get/wait/stop. job_id is 24 hex chars validated
+#      by regex - path containment by construction.
+#  (4) User tier and share plane do NOT get these (they never join the
+#      tier frozenset or the share floor; share principals fail closed a
+#      second time inside each tool). Same belt-and-suspenders as U51.
+#  (5) Caps: 16 live jobs box-wide, 64KB of output returned per read,
+#      finished job dirs swept after 7 days.
+# ---------------------------------------------------------------------------
+SHELL_JOB_DIR = STATE / "shell-jobs"
+SHELL_JOB_MAX_LIVE = 16
+SHELL_JOB_OUT_CAP = 65536
+SHELL_JOB_TTL = 7 * 86400
+_SJID_RE = None  # compiled lazily
+_SJ_LOCK = None  # threading.Lock, created lazily (module imports threading at top)
+def _sjob_id_ok(jid):
+    global _SJID_RE
+    if _SJID_RE is None:
+        import re as _re52
+        _SJID_RE = _re52.compile(r"^[0-9a-f]{24}$")
+    return bool(_SJID_RE.match(jid or ""))
+def _sjob_dir(jid):
+    return SHELL_JOB_DIR / jid
+def _sjob_load(jid):
+    try:
+        with open(_sjob_dir(jid) / "meta.json") as f:
+            return json.load(f)
+    except Exception:
+        return None
+def _sjob_save(m):
+    try:
+        m.pop("_st", None)  # derived state never persists
+        d = _sjob_dir(m["id"])
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+        with open(d / "meta.json", "w") as f:
+            json.dump(m, f)
+        _p1i_owner_only_file(d / "meta.json")
+    except Exception:
+        pass
+def _sjob_pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+def _sjob_is_zombie(pid):
+    # kill(zombie,0) succeeds; /proc state 'Z' is the honest answer. Unreadable
+    # is treated as not-zombie and the waitpid path decides.
+    try:
+        with open("/proc/%d/stat" % int(pid), "rb") as f:
+            return f.read().rsplit(b")", 1)[-1].split()[0] == b"Z"
+    except (OSError, ValueError, TypeError, IndexError):
+        return False
+def _sjob_refresh(m):
+    # Derive live state; persist terminal state when first observed.
+    if m.get("ended") is not None:
+        m["_st"] = "finished"
+        return m
+    _pid52 = m.get("pid")
+    if _sjob_pid_alive(_pid52) and not _sjob_is_zombie(_pid52):
+        m["_st"] = "running"
+        return m
+    code = None
+    try:
+        _p52, _st52 = os.waitpid(int(m["pid"]), os.WNOHANG)
+        if _p52 == 0:
+            m["_st"] = "running"  # zombie: dead but still our child to reap
+            return m
+        try:
+            code = os.waitstatus_to_exitcode(_st52)
+        except (AttributeError, ValueError):
+            code = None
+    except (ChildProcessError, OSError, ValueError, TypeError):
+        code = None  # not our child (daemon restarted) - exit code unknowable
+    m["ended"] = time.time()
+    m["exit"] = code
+    if code is None:
+        m["note"] = "exit code unknown (daemon restarted since launch)"
+    _sjob_save(m)
+    m["_st"] = "finished"
+    return m
+def _sjob_sweep(live_check=True):
+    # Drop finished job dirs older than TTL; return count of live jobs.
+    live = 0
+    try:
+        if not SHELL_JOB_DIR.is_dir():
+            return 0
+        for d in SHELL_JOB_DIR.iterdir():
+            m = _sjob_load(d.name) if _sjob_id_ok(d.name) else None
+            if m is None:
+                continue
+            if live_check:
+                m = _sjob_refresh(m)
+            if m.get("ended") is None:
+                live += 1
+                continue
+            if time.time() - float(m.get("ended") or 0) > SHELL_JOB_TTL:
+                try:
+                    import shutil as _sh52
+                    _sh52.rmtree(d)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return live
+def _sjob_start(cmd, wd, username):
+    global _SJ_LOCK
+    import subprocess, threading
+    if _is_share_principal(username or ""):
+        return "Error: durable shell jobs are not available on share clones."
+    if _SJ_LOCK is None:
+        _SJ_LOCK = threading.Lock()
+    with _SJ_LOCK:
+        live = _sjob_sweep()
+        if live >= SHELL_JOB_MAX_LIVE:
+            return ("Error: too many live shell jobs (%d/%d) - stop one with "
+                    "stop_shell_job or wait for it to finish." % (live, SHELL_JOB_MAX_LIVE))
+        jid = os.urandom(12).hex()
+        d = _sjob_dir(jid)
+        try:
+            d.mkdir(parents=True, exist_ok=False)
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
+            fo = open(d / "out", "wb")
+            fe = open(d / "err", "wb")
+            try:
+                p = subprocess.Popen(["/bin/sh", "-c", cmd],
+                                     stdout=fo, stderr=fe, stdin=subprocess.DEVNULL,
+                                     cwd=wd, start_new_session=True, close_fds=True)
+            finally:
+                fo.close()
+                fe.close()
+        except Exception as e:
+            return "Error: could not start job: %.200s" % str(e)
+        m = {"id": jid, "username": username or "-", "cmd": str(cmd)[:400],
+             "workdir": wd or "", "pid": p.pid, "started": time.time(),
+             "ended": None, "exit": None}
+        _sjob_save(m)
+    return ("Job %s started (background, detached; pid %s). Output and status: "
+            "get_shell_job / wait_for_job; stop with stop_shell_job. The job "
+            "survives this turn; foreground output caps do not apply to it on disk."
+            % (jid, p.pid))
+def _sjob_output_block(m):
+    d = _sjob_dir(m["id"])
+    parts = []
+    for name in ("out", "err"):
+        try:
+            size = (d / name).stat().st_size
+            with open(d / name, "rb") as f:
+                raw = f.read(SHELL_JOB_OUT_CAP)
+        except Exception:
+            size, raw = 0, b""
+        txt = raw.decode("utf-8", errors="replace")
+        if size > SHELL_JOB_OUT_CAP:
+            txt += "\n(truncated: %d bytes on disk, showing first %d - read_file the path for more)" % (
+                size, SHELL_JOB_OUT_CAP)
+        parts.append("%s (%d bytes on disk):\n%s" % (name, size, txt))
+    return "\n".join(parts)
+def _sjob_status_line(m):
+    st = m.get("_st") or "unknown"
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m.get("started") or 0))
+    if st == "running":
+        tail = "running (pid %s)" % m.get("pid")
+    else:
+        tail = "finished, exit_code=%s%s" % (
+            m.get("exit"), (" - " + m["note"]) if m.get("note") else "")
+    return "job %s | %s | %r | started %s | %s" % (
+        m["id"], m.get("username") or "-", (m.get("cmd") or "")[:70], when, tail)
+def _sjob_get(args, username, wait_ms=None):
+    if not username:
+        return "Error: no user context for this job tool."
+    if _is_share_principal(username):
+        return "Error: shell jobs are not available on share clones."
+    jid = str(args.get("job_id") or "").strip()
+    if not _sjob_id_ok(jid):
+        return "Error: job_id must be the 24-hex-char id from execute_shell(background=true)."
+    m = _sjob_load(jid)
+    if m is None or (m.get("username") or "-") != username:
+        return "Error: job %s not found (or not yours)." % jid
+    budget = 0
+    if wait_ms is not None:
+        budget = _p1i_bint(args.get("timeout_ms"), 1, 295000, 30000)
+        deadline = time.time() + budget / 1000.0
+        while True:
+            m = _sjob_refresh(m)
+            if m.get("ended") is not None or time.time() >= deadline:
+                break
+            time.sleep(0.5)
+    else:
+        m = _sjob_refresh(m)
+    timed = m.get("ended") is None
+    head = _sjob_status_line(m)
+    if timed:
+        head += "\n(still running after %dms - call wait_for_job again; the job keeps running)" % budget
+    return head + "\n" + _sjob_output_block(m)
+def _tool_list_shell_jobs(args: dict, username=None) -> str:
+    if not username:
+        return "Error: no user context for list_shell_jobs."
+    if _is_share_principal(username):
+        return "Error: shell jobs are not available on share clones."
+    _sjob_sweep()
+    rows = []
+    try:
+        if SHELL_JOB_DIR.is_dir():
+            for d in sorted(SHELL_JOB_DIR.iterdir()):
+                if not _sjob_id_ok(d.name):
+                    continue
+                m = _sjob_load(d.name)
+                if m is None or (m.get("username") or "-") != username:
+                    continue
+                m = _sjob_refresh(m)
+                rows.append((float(m.get("started") or 0), _sjob_status_line(m)))
+    except Exception as e:
+        return "Error: could not list jobs: %.200s" % str(e)
+    rows.sort(key=lambda t: -t[0])
+    if not rows:
+        return "No shell jobs for %s. Start one with execute_shell(background=true)." % username
+    shown = rows[:50]
+    out = ["Shell jobs: %d (showing %d, newest first):" % (len(rows), len(shown))]
+    out += [ln for _, ln in shown]
+    return "\n".join(out)
+def _tool_get_shell_job(args: dict, username=None) -> str:
+    return _sjob_get(args, username, wait_ms=None)
+def _tool_wait_for_job(args: dict, username=None) -> str:
+    return _sjob_get(args, username, wait_ms=True)
+def _tool_stop_shell_job(args: dict, username=None) -> str:
+    if not username:
+        return "Error: no user context for stop_shell_job."
+    if _is_share_principal(username):
+        return "Error: shell jobs are not available on share clones."
+    jid = str(args.get("job_id") or "").strip()
+    if not _sjob_id_ok(jid):
+        return "Error: job_id must be the 24-hex-char id from execute_shell(background=true)."
+    m = _sjob_load(jid)
+    if m is None or (m.get("username") or "-") != username:
+        return "Error: job %s not found (or not yours)." % jid
+    m = _sjob_refresh(m)
+    if m.get("ended") is not None:
+        return "Job %s already finished (exit_code=%s) - nothing to stop." % (jid, m.get("exit"))
+    try:
+        os.killpg(int(m["pid"]), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    for _i52 in range(20):
+        if not _sjob_pid_alive(m["pid"]) or _sjob_is_zombie(m["pid"]):
+            break
+        time.sleep(0.1)
+    if _sjob_pid_alive(m["pid"]) and not _sjob_is_zombie(m["pid"]):
+        try:
+            os.killpg(int(m["pid"]), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    m["ended"] = time.time()
+    m["exit"] = None
+    m["note"] = "stopped by user (SIGTERM->SIGKILL to process group)"
+    try:
+        _p52, _st52 = os.waitpid(int(m["pid"]), os.WNOHANG)
+        if _p52:
+            try:
+                m["exit"] = os.waitstatus_to_exitcode(_st52)
+                m["note"] = "stopped by user (signal to process group; exit recorded)"
+            except (AttributeError, ValueError):
+                pass
+    except (ChildProcessError, OSError):
+        pass
+    _sjob_save(m)
+    return "Job %s stopped (process group signalled)." % jid
 # ─── S4e: model provider BYOK (staged 2026-09-17) ───────────────────────────
 # ONE resolver, ONE OpenAI-compat adapter, ONE small Anthropic-native adapter.
 # The shared file key is no longer the default path: provider + write-only key
