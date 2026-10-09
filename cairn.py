@@ -15959,13 +15959,22 @@ def _search_tavily(query, n, key):
     st, _f, body = _web_request(url, method="POST",
                                 headers={"Authorization": "Bearer " + key,
                                          "Content-Type": "application/json"},
-                                body_bytes=json.dumps({"query": query, "max_results": n}).encode(),
+                                body_bytes=json.dumps({"query": query, "max_results": n,  # U53/PATCH70: Agora parity (kt:212-218) — advanced depth + answer.
+                                                            "search_depth": "advanced",
+                                                            "include_answer": True}).encode(),
                                 same_origin_only=True)  # P1-H/N-01
     if st != 200:
         raise WebError(_provider_http_error("Tavily", st, body))
     data = _json_body(body)
     items = data.get("results") or []
-    return [x for x in (_norm_item(i) for i in items) if x][:n]
+    # U53/PATCH70: Agora surfaces Tavily's top-level answer (kt:252,268).
+    # Tuple return is daemon-internal — _tool_web_search is the only
+    # caller (call-site sweep 2026-10-09; u53 unit re-proves dispatch).
+    answer = ""
+    _ans = data.get("answer")
+    if isinstance(_ans, str) and _ans.strip():
+        answer = _ans.strip()
+    return [x for x in (_norm_item(i) for i in items) if x][:n], answer
 
 
 def _walk_path(data, path):
@@ -16081,13 +16090,14 @@ def _tool_web_search(args: dict, username=None) -> str:
         default_n = SEARCH_N_DEFAULT
     n = _p1i_bint(args.get("num_results"), 1, SEARCH_N_MAX, default_n)   # P1-I/B02
     prov, key, cfg = _load_search_cfg(username)
+    tavily_answer = ""  # U53 (only the tavily branch can fill it)
     try:
         if prov == "brave":
             results = _search_brave(query, n, key)
         elif prov == "serper":
             results = _search_serper(query, n, key)
         elif prov == "tavily":
-            results = _search_tavily(query, n, key)
+            results, tavily_answer = _search_tavily(query, n, key)
         elif prov in ("custom", "custom_json"):
             results = _search_custom(query, n, key, cfg)
         else:
@@ -16100,6 +16110,10 @@ def _tool_web_search(args: dict, username=None) -> str:
     if not results:
         return "No results for: " + query
     lines = []
+    if tavily_answer:
+        # U53/PATCH70: Agora parity — Tavily answer above the list.
+        # 1200-char cap = CAIRN budget guard (owned; Agora does not cap).
+        lines.append("Answer: %s\n" % tavily_answer[:1200])
     for i, r in enumerate(results, 1):
         lines.append("%d. %s\n   URL: %s\n   %s" % (i, r["title"], r["url"], r["snippet"]))
     return "\n".join(lines)
@@ -16118,10 +16132,10 @@ class _TextExtractor(HTMLParser):
         # rest of the document. Depth counter: skip while > 0.
         self._skip = 0
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "nav", "footer", "header"):
+        if tag in ("script", "style", "nav", "footer", "header", "aside", "svg", "noscript", "head"):
             self._skip += 1
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "nav", "footer", "header"):
+        if tag in ("script", "style", "nav", "footer", "header", "aside", "svg", "noscript", "head"):
             self._skip = max(0, self._skip - 1)
         if tag in ("p", "div", "br", "h1", "h2", "h3", "h4", "li"):
             self.text.append("\n")
@@ -16141,7 +16155,14 @@ def _tool_web_fetch(args: dict, username=None) -> str:
     url = (args.get("url") or "").strip()
     if not url:
         return "Error: url is empty."
-    max_chars = _p1i_bint(args.get("max_chars"), 200, FETCH_CHARS_MAX, FETCH_CHARS_DEFAULT)
+    _mc_raw = args.get("max_chars")
+    if _mc_raw is None:
+        # U53/PATCH70: Agora's web_fetch param is camelCase maxChars
+        # (WebSearchToolProvider.kt:317). Accept it as an alias so models
+        # primed on either schema hit the same clamp. Both present ->
+        # native snake_case wins. Floor 200 stays (owned budget guard).
+        _mc_raw = args.get("maxChars")
+    max_chars = _p1i_bint(_mc_raw, 200, FETCH_CHARS_MAX, FETCH_CHARS_DEFAULT)
     try:
         st, final, body = _web_request(url)
     except WebError as e:
@@ -16149,8 +16170,12 @@ def _tool_web_fetch(args: dict, username=None) -> str:
     text = re.sub(r"\n{3,}", "\n\n", _html_to_text(body)).strip()
     note = ""
     if len(text) > max_chars:
+        # U53/PATCH70: Agora hands back truncated+totalChars (kt:332-333);
+        # carry the total and the re-call hint so the model knows a
+        # bigger fetch is worth asking for.
+        _total = len(text)
         text = text[:max_chars]
-        note = " [truncated at %d chars]" % max_chars
+        note = " [truncated at %d of %d chars — re-call with larger max_chars for more]" % (max_chars, _total)
     return "HTTP %d | %s | %d bytes\n%s%s" % (st, final, len(body), text, note)
 
 # ─── Agent Loop (with tool calling, live streaming, visible reasoning) ───────
