@@ -14276,10 +14276,22 @@ def _tool_read_file(args: dict) -> str:
     p = Path(path)
     if not p.exists():
         return f"Error: {path} not found"
-    with open(p, "r", errors="replace") as f:
+    # U54/PATCH71: byte-true read + honest envelope (Agora boundedFileReadJson
+    # parity: returned bytes/total/truncated). Text mode read(limit) returned
+    # limit CHARACTERS while the schema promises bytes, and arbitrary seek
+    # cookies were semi-undefined; binary makes the docs AND the model honest.
+    # A codepoint cut at the slice edge decodes via errors="replace" - the
+    # Pythonic twin of Agora's surrogate-safe binary search.
+    total = p.stat().st_size
+    with open(p, "rb") as f:
         f.seek(offset)
-        content = f.read(limit)
-    return f"({len(content)} bytes, offset {offset})\n{content}"
+        raw = f.read(limit)
+    content = raw.decode("utf-8", "replace")
+    _hdr = "(%d bytes, offset %d, of %d total" % (len(raw), offset, total)
+    if offset + len(raw) < total:
+        _hdr += ", TRUNCATED - call again with offset=%d for more" % (offset + len(raw))
+    _hdr += ")"
+    return _hdr + "\n" + content
 
 def _tool_write_file(args: dict) -> str:
     path = args["path"]
